@@ -1,0 +1,46 @@
+# DGX Spark 适配版编排：正常机器，无沙箱特例
+#
+# 启动：
+#   docker compose -f docker-compose.spark.yml up -d
+#   docker compose -f docker-compose.spark.yml exec ros2_sim bash
+#
+# 与沙箱版的差异：
+#   1. GPU 渲染已启用（Gazebo / 相机传感器走宿主机 NVIDIA 驱动）
+#   2. 网络用 host（DDS 跨机发现最省事；Spark 是正常机器，bridge 也可用，
+#      但 host 模式下 RDK-X3 小车与容器内节点互通最简单）
+#   3. 无需任何 iptables/bridge 禁用特例；不需要 --network host 之外的 hack
+#   4. GUI 直接走宿主机 X11（有显示器就 `xhost +local:` 后开 gzclient/rviz2）
+
+services:
+  ros2_sim:
+    build:
+      context: .
+      args:
+        USE_CN_MIRROR: "1"          # 海外网络构建改 "0"
+    image: vla-ros2-sim:humble
+    container_name: vla_ros2_sim
+    network_mode: host              # 与小车/RDK-X3 同网段直连最简
+    ipc: host
+    privileged: false
+    environment:
+      - TURTLEBOT3_MODEL=burger     # 换 waffle_pi 出相机话题
+      - DISPLAY=${DISPLAY:-}
+      - QT_X11_NO_MITSHM=1
+      - USE_XVFB=0
+      # 跨机 DDS（与 RDK-X3 联调时去掉下面这行；单机仿真可保留）
+      - ROS_LOCALHOST_ONLY=0
+      - ROS_DOMAIN_ID=0             # 与小车保持一致
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw        # GUI
+      - ../../ros2_ws:/ros2_ws:rw               # VLA 五节点工作区
+      - ../../deliver_v1:/deliver_v1:ro         # 推理服务与模型（如需容器内跑）
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, graphics]   # graphics → 容器内 OpenGL
+    stdin_open: true
+    tty: true
+    command: bash

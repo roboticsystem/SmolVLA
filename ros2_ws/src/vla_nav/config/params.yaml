@@ -1,0 +1,11 @@
+vla_bridge:
+  ros__parameters:
+    server: "http://192.168.1.100:8000/infer"
+    instruction: "go to the red chair"
+    st_mean: [0.0, 0.0, 0.0, 0.0, 0.0]
+    st_std: [1.0, 1.0, 1.0, 1.0, 1.0]
+control_node:
+  ros__parameters:
+    v_max: 0.35
+    w_max: 1.60
+    v_min_rev: -0.10

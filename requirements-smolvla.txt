@@ -1,0 +1,13 @@
+# SmolVLA 环境（lerobot 0.6.2）
+# 目标环境：Python 3.12.x / NVIDIA 驱动 550.100 / RTX 4090 D
+#
+# 安装步骤：
+#   python3.12 -m venv .venv_smolvla
+#   .venv_smolvla/bin/pip install -r requirements-smolvla.txt
+#   cd lerobot && ../.venv_smolvla/bin/pip install -e ".[smolvla]" -c ../requirements-smolvla.txt
+#
+# ==== 关键约束：torch 必须锁在 2.10.x（cu12）====
+# torch 2.11+ 依赖 nvidia-*-cu13，需要驱动 >= 580；
+# 本机驱动 550.100（对应 CUDA 12.4）只能跑 cu12 构建。
+# 不加此约束时，pip 解析 lerobot 的 torch<2.12 会自动升到 2.11 → CUDA 不可用。
+torch==2.10.0

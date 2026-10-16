@@ -1,0 +1,65 @@
+# =============================================================================
+# robot.yaml —— 真机全部可调参数（唯一入口）
+#
+# 约定：带 ⚠ 的项**必须在真机上实测后修改**，当前值是仿真值，仅作占位。
+# 修改后请同步到 docs/已知问题与告警.md 的「参数台账」。
+# =============================================================================
+
+robot:
+  name: follow-cam-rdkx3
+  notes: "RDK-X3 / 差速底盘 / 单目相机 + 120 线激光"
+
+camera:
+  device: 0                  # /dev/video 编号或路径
+  width: 640                 # 采集分辨率（推理会 resize，采集尽量高）
+  height: 480
+  fps: 30
+  hfov_deg: 64.5             # ⚠ 仿真值。用 tools/calibrate_camera.py 实测
+  cam_h: 0.35                # ⚠ 镜头离地高度（米）。卷尺实测
+  color_order: bgr           # OpenCV 默认；infer_server 会转 RGB 喂模型
+  # ⚠ 仿真相机地面测距的饱和下限 = f*cam_h/(H - H/2)；真机内参不同，
+  #   饱和点不同，用 calibrate_camera.py 算出后填到下面备查：
+  mono_range_floor_m: null   # 实测后填写（仿真为 0.752）
+
+lidar:
+  topic: /scan
+  beams: 120                 # 统一重采样到训练口径（120 束，车头为 0 逆时针）
+  max_range: 12.0            # 与训练一致；超出按 12.0 处理
+
+control:
+  rate_hz: 10
+  v_max: 0.35                # 与训练动作分布一致（不要放大！模型没学过更快的速度）
+  w_max: 1.60
+  v_min_rev: -0.10
+  # 动作物理口径：v (m/s)，ω (rad/s)。与训练数据 actions 列一致。
+
+navigation:
+  success_standoff_m: 0.30   # 仿真判据。真机初期建议放宽到 0.5 观察（见告警 ②）
+  max_steps: 200
+
+detection:
+  # HSV 参考色（H:0-179, S:0-255, V:0-255）。
+  # ⚠⚠ 下面是占位值！真机光照/白平衡与仿真渲染完全不同，
+  #    务必先用 tools/perception_smoke.py --measure 对着真实目标测一轮再填。
+  refs:
+    red:    [0, 200, 120]
+    green:  [60, 200, 120]
+    blue:   [110, 200, 120]
+    yellow: [25, 200, 120]
+    purple: [140, 200, 120]
+    orange: [12, 220, 160]
+  hsv_tol: [12, 90, 90]      # H/S/V 容差
+
+inference:
+  mode: server               # server = 笔电推理（D2 路线，本包默认）
+  server_url: http://192.168.1.100:8000/infer   # 与 ros2 params.yaml 保持一致
+  timeout_s: 0.35
+  # chunk 执行方式：模型一次预测 50 步，每步推理则执行第 0 步；
+  # k>1 = 一次推理连发 k 步（E8：k=10 省 90% 推理、SR 无显著代价）。
+  chunk_execute_k: 1
+
+recording:
+  out_dir: data_recorded
+  image_size: [160, 120]     # 与训练一致（H,W）？注意是 [高,宽]
+  teleop:
+    keymap: "wasd/jl：前后左右/转向，空格急停，q 结束并保存"

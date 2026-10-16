@@ -1,0 +1,59 @@
+# ===== 模型与数据（大文件，一律不入库）=====
+*.pt
+*.pth
+*.onnx
+*.safetensors
+*.h5
+*.hdf5
+models/
+export/
+data*/
+datasets/
+
+# ===== 打包产物 =====
+*.tar.gz
+*.zip
+*.whl
+
+# ===== Python =====
+__pycache__/
+*.pyc
+.venv*/
+venv/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+# ===== ROS2 / colcon =====
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
+
+# ===== 运行时输出 =====
+*.log
+logs/
+results_raw/
+trajectories/
+*.png
+!docs/**/*.png
+!docker/**/*.png
+
+# ===== 训练/评测产物 =====
+ckpts/
+checkpoints/
+wandb/
+mlruns/
+
+# ===== 隐私与个人材料 =====
+*324070400*
+开题报告*
+学位论文*
+
+# ===== 系统与 IDE =====
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+nohup.out

@@ -1,0 +1,43 @@
+# ROS2 仿真容器编排（在非嵌套沙箱的机器上使用）
+# 常规启动：
+#   docker compose up -d
+#   docker compose exec ros2_sim bash
+#
+# 三个常用仿真入口（容器内执行）：
+#   # 1. TurtleBot3 世界 + RViz（需要宿主机 X11：Linux 上先 `xhost +local:`）
+#   ros2 launch turtlebot3_gazebo turtlebot3_world.launch.py
+#   # 2. 纯无头 Gazebo（服务器上跑，不开 GUI）
+#   ros2 launch turtlebot3_gazebo turtlebot3_world.launch.py headless:=True
+#   # 3. Nav2 导航栈全量 bring-up
+#   ros2 launch nav2_bringup navigation_launch.py use_sim_time:=True
+#
+# 键盘遥操（验证 /cmd_vel 链路，对齐真机桥接接口）：
+#   ros2 run teleop_twist_keyboard teleop_twist_keyboard
+
+services:
+  ros2_sim:
+    build: .
+    image: vla-ros2-sim:humble
+    container_name: vla_ros2_sim
+    network_mode: host          # 与真机桥接（vla_bridge HTTP）同机直连
+    ipc: host
+    privileged: false
+    environment:
+      - TURTLEBOT3_MODEL=burger
+      - DISPLAY=${DISPLAY:-}
+      - QT_X11_NO_MITSHM=1
+      - USE_XVFB=0
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw        # GUI（无 X11 的服务器上删掉本行）
+      - ../../ros2_ws:/ros2_ws:rw               # VLA 的 5 节点工作区
+    # GPU 加速渲染（有 nvidia-container-toolkit 时取消注释）：
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    stdin_open: true
+    tty: true
+    command: bash

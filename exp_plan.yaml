@@ -1,0 +1,317 @@
+# 实验事前登记表（Pre-registration）
+#
+# 目的（大纲 §3.2 最后一条）：
+#   每个实验**开跑前**写下变量、种子、判据，避免事后挑选（HARKing / p-hacking）。
+#   本项目已经吃过这个亏 —— §4.20 的「L3 是瓶颈」假设一度写进结论，
+#   后来按层拆分把**它自己否定**了（L3 反而是最好的一层）；§4.21 又把主结论的
+#   因果归因从「数据」修正为「架构」。事前登记不能阻止这类错误，
+#   但能让「改过什么」有据可查。
+#
+# 用法：
+#   1. 复制 `experiments:` 下任一条目，改成新实验；
+#   2. 跑之前先填 `hypothesis` / `variables` / `decision` / `analysis`；
+#   3. 跑完只填 `outcome`，**不要回头改上面的字段**；
+#   4. 若确实要改假设，新建一条并把旧的 `status` 置为 `superseded`。
+#
+# 机器可读：`python -m sim.plot_results --plan exp_plan.yaml`（见文件末尾说明）
+
+meta:
+  project: 基于 VLA 模型的室内跟随摄像机器人
+  student_note: >
+    全部实验只使用现有 BOM（无新增/更换/改装硬件，大纲 §2.3）。
+  statistics:                      # 大纲 §3.2，全项目统一
+    seeds: [42, 123, 456, 789, 1024]
+    bootstrap_resamples: 10000
+    paired_test: mcnemar_exact      # 配对二分结果用精确 McNemar
+    ci_method: wilson               # 单比例区间用 Wilson
+    ratio_ci: paired_bootstrap      # 保留率等比值用**按回合索引**的配对 bootstrap
+    multiple_comparison: holm       # 跨全部配对比较统一 Holm 校正
+    multiple_comparison_done: >-
+      已实现 holm_correction.py（2026-09-27）：全项目 24 项检验分 5 族做族内
+      step-down，p 值全部由评测数据现场重算（主文件+追加批次，与 load 同口径）。
+      校正后存活 5 项：A1 架构主效应 / A3 架构-数据效应分离 / A4 记忆效应31k
+      (p=3.7e-4 与结果表逐位吻合) / B-从未接近(sf31k) / C1 LoRA>expert(+3.4pp)。
+      §4.26 逐项「只差一点」未过校正 → 以三模型合并检验表述（p=4.1e-5，注明 post-hoc）。
+      详见 export/holm_correction.md 与 结果表 表 9。
+    report: [mean_pm_sd, p_value, ci95, effect_size_pp, effect_size_relative]
+  decision_rules:
+    significance: "Holm 校正后 p < 0.05"
+    equivalence: "差值 95% CI 完全落在 ±3 pp 内"
+    min_episodes_per_cell: 200      # 少于 200 回合不得作为主结论
+
+experiments:
+
+  - id: E4
+    name: 场景化增强模块消融（跟随任务）
+    status: done
+    hypothesis: >
+      卡尔曼速度外推能缩短「丢失后重捕获」时间；自适应图像增强能挽回
+      光照突变下的感知失效；空间约束因子 γ 能在窄道提高安全性。
+    variables:
+      modules:
+        kalman: [off, on]
+        depth: [off, on]
+        gamma: [off, on]
+        enhance: [off, on]
+      scenario: [normal, short_occl, long_occl, light_shift, narrow, dim, backlight]
+      fixed: {want_dist_m: 1.5, target_speed_mps: 0.22, camera_augment: 0.25, steps: 300}
+    seeds: {episode_base: 3000, stride: 17}
+    endpoints:
+      primary: TCR
+      secondary: [rec_ms_median, err_mean_m, bearing_mean_deg]
+    decision: >
+      逐模块判定：某模块在「正常」场景不掉点（≥ −1 pp）且在
+      「光照突变 / 遮挡」场景显著改善 → 保留；否则从创新点撤下并诚实报告。
+    analysis: 每格 30 回合，TCR 报均值；恢复时间报中位数。
+    outcome: >
+      已完成（`export/e4_ablation.json`，结果表 表 8）。
+      **kalman 与 enhance 有效**（光照突变 +11.9 / +14.2 pp，恢复 4–6 倍）；
+      **depth 无效**；**gamma 有害**（全场景 −2~−2.6 pp，已从创新点撤下）。
+      全开组合：正常 +2.9 pp、光照突变 +16.7 pp。
+
+  - id: E5
+    name: IDAS 辅助监督（小论文纳入）
+    status: done
+    seed_expansion: "5组种子: none 22.3±1.7 / v1 23.2±3.4 / v2 22.9±1.9 / random 22.9±2.2; v2-vs-random p=1.0000（种子层面零差异，阴性结论稳健）"
+    progress:
+      variant_comparison: done          # 表 1h
+      label_p_and_lambda_sweep: done    # 表 1h：p=0.2 时 +3.5 pp（方向符合预期，n.s.）
+      outcome_note: >
+        两段式结论：标签充足（p=1.0）时无效且与随机对照无差异（p=1.00）；
+        标签稀缺时增益单调增大（p=0.5 +2.5 pp、p=0.2 +3.5 pp，均未达显著）。
+        λ 敏感性：0.05 > 0.1 ≈ 0.2，弱辅助监督更好。
+    hypothesis: >
+      在 VLM 前缀特征上接逆动力学头、以 λ_id 加权加入总损失，
+      能在低标签比例下提升导航成功率（相对 none 基线）。
+    variables:
+      variant: [none, idas_v1, idas_v2, random_ctrl]
+      lam_id: [0.05, 0.1, 0.2]
+      label_p: [1.0, 0.5, 0.2]
+      fixed: {steps: 10000, batch: 8, chunk: 50, mode: expert, det_features: true}
+    seeds: [0]
+    endpoints:
+      primary: closed_loop_sr
+      secondary: [mae_after, L_idas_curve]
+    decision: >
+      `random_ctrl` 是关键对照 —— 若 IDAS 与 random_ctrl 无差异，
+      则增益来自「多一项正则」而非「学到了动力学」，方法不成立。
+    analysis: 配对 McNemar（同回合集 200 回合）+ Holm 校正。
+    outcome: >
+      第一轮结果**作废**：`_ensure_idas_head` 里 `opt.param_groups = []`
+      把主模型参数从优化器清空，主干从未更新（三个变体 checkpoint 字节相同、
+      SR 全部 10.5% = 未训练水平）。已修复并重跑中。
+    note: >
+      本轮只跑变体对照（λ=0.1）；λ 与标签比例扫描待变体对照出结果后择优补做。
+
+  - id: E7-partial
+    name: INT8 量化灵敏度（精度半边）
+    status: done
+    hypothesis: 权重-only INT8 的动作相对误差 ≤ 3%。
+    variables: {method: pytorch_weight_only_int8_perchannel, layers: 动作专家全部 Linear}
+    endpoints:
+      primary: rel_err
+      secondary: [mae, cos]
+    decision: "相对误差 ≤ 3% 记通过；> 5% 需转 QAT。"
+    outcome: >
+      已完成（`export/int8_e7/quant_report.json`，结果表 表 8b）：
+      **相对误差 1.51%，余弦相似度 0.99994 → 通过**。
+      顺带发现 `denoise.onnx` 在 ORT CPU EP 不可跑（bf16 + CumSum 收 bool），
+      E6 手册应补「上板前 ORT 冒烟」检查项。
+
+  - id: E8-partial
+    name: chunk 缓存 × 反应性权衡
+    status: done
+    outcome: |
+      已实现 `smolvla_e8_chunk.py`（独立副本，不动主评测路径）并完成
+      k=1/5/10/20 × 100 回合：推理次数 2600/520/260/130（省 0/80/90/95%），
+      SR 14.0/12.0/13.0/19.0%。**k=10~20 可省 90~95% 推理且 SR 变化在噪声内**
+      （n=100 的 1σ≈3.5pp；k=20 的 +5pp≈1.4σ 不显著，方向为正）。
+      与 E6 互补：E6 压单次延迟（14.4×），E8 压次数（10×），合计 ~140×。
+    hypothesis: >
+      一次推理执行 k 步动作可使推理次数降为 1/k，
+      但 TCR 随 k 下降（反应性变差），存在一个可接受的 k。
+    variables: {exec_steps: [1, 5, 10, 20]}
+    endpoints:
+      primary: TCR
+      secondary: [inference_count, latency_p95]
+    decision: "取「TCR 相对 k=1 下降 ≤ 1 pp」的最大 k。"
+    outcome: >
+      **已设计、未实施**。曾写过一版实现，自查发现批量评测里各 slot 是
+      锁步推进的，正确实现需给每个 slot 维护动作队列并同步改
+      step / min_dsurf / ever_found 三处记账 —— 半成品会静默产错，已回退。
+      实施要点已写在 `smolvla_finetune_sim.py` 的回退注释里。
+
+  - id: E2-paradigm
+    name: 微调范式三档对照（A1）
+    status: done
+    seed_expansion: "5组种子: expert 22.3±1.7 / lora 25.1±1.6 / full 19.9±2.2; lora-expert +2.8pp p=0.069, full-expert -2.4pp p=0.074（均边缘）"
+    hypothesis: >
+      LoRA 在「除动作专家外只加 1~2% 可训参数」的代价下，
+      能达到接近全参微调的效果；在数据量 ≤ 60% 时性价比最优。
+    variables:
+      paradigm:
+        expert: 仅动作专家（成本基线）—— 可训 99.85 M，已完成（ft_detf）
+        lora:   专家 + VLM 注意力 LoRA（r=8, α=16）—— 可训 101.07 M（**仅多 1.26 M ≈ 1.2%**）
+        full:   全参微调 —— 可训 451.26 M（算力上界）
+      fixed: {steps: 10000, chunk: 50, det_features: true, data: nav_detf 100%}
+    endpoints:
+      primary: closed_loop_sr
+      secondary: [trainable_params, mae_after, wallclock]
+    decision: >
+      按「闭环 SR / 可训参数量」的性价比排序；
+      若 LoRA 与 expert 无差异 → 说明本任务上主干适配没有增益（诚实报告）。
+    analysis: 配对 McNemar（同回合集 200 回合）+ Holm 校正。
+    outcome: >
+      实现已完成（`smolvla_lora.py`），训练已启动（GPU7 串行跑 lora → full）。
+      实现要点与两个已验证的性质见文件头注释：
+      ① `LoRALinear` **继承 `nn.Linear`**（库代码会访问 `q_proj.weight.dtype`）；
+      ② 保存前**合并** LoRA（否则 `--eval-only` 用 `strict=False` 加载会静默丢弃）；
+      实测校验：**初始化等价偏差 0.000e+00、合并前后偏差 0.000e+00**。
+
+  - id: E2-datafrac
+    name: 范式 × 数据量（LoRA 性价比的关键一维）
+    status: done
+    outcome_note: >
+      expert 在 40% 数据下**零掉点**（24.5% = 100% 水平）→ 任务在 ~38k 样本已饱和，
+      与 §4.23「31k+记忆追平 96k」一致。因此「LoRA 低数据量更优」这一预期
+      **在本任务上无法检验**（数据量不是有效变量）。
+    hypothesis: >
+      大纲 §5 E2 预期：LoRA 在数据量 ≤ 60% 时性价比最优。
+      即随数据量下降，lora 相对 expert 的优势**增大**。
+    variables:
+      paradigm: [expert, lora]      # full 只在 40% 补 1 格作上界参考
+      data_frac: [1.0, 0.6, 0.4]
+      fixed: {steps: 10000, chunk: 50, det_features: true}
+    seeds: [0]
+    endpoints:
+      primary: closed_loop_sr
+      secondary: [sr_per_trainable_param, mae_after]
+    decision: >
+      看「lora − expert 的差值」是否随 frac 下降而**增大**；
+      若在 40% 时差值反而缩小，则大纲的预期不成立，如实报告。
+    analysis: 配对 McNemar（同回合集）× 3 个 frac 层，统一 Holm 校正。
+    outcome: >
+      已实现 `--data-frac`（`SimDemoData.set_data_fraction`）并启动扫描。
+      **关键设计：按回合内取前 frac 比例，而不是全局随机抽** ——
+      实测校验覆盖回合数保持 816 不变，只有每回合帧数减少，
+      因此「数据减少」不会同时改变**场景/任务分布**（否则两个效应分不开）。
+      扫描由 `run_e2_sweep.py` 执行，自动等待空闲 GPU。
+
+  - id: E2-action-repr
+    name: 动作表示对照（chunk 50 vs 直接回归 1）
+    status: done
+    outcome: |
+      direct(chunk=1) 25.5% vs chunk(50) 24.5%，配对 McNemar p=0.871（20:18）→ 等价。
+      注意训练损失差一个量级（0.03 vs 0.52）不可比——预测 1 步与 50 步难度不同，
+      唯一可比的闭环成功率等价。再次印证任务是反应式的（§4.26），
+      长时域预测无收益；waypoint+PID 未实现（直接回归已证明更简表示不更差）。
+    hypothesis: LoRA 在数据量 ≤ 60% 时性价比最优；chunk 回归平滑性优于单步。
+    variables:
+      paradigm: [full, lora, freeze_vision]
+      action_repr: [direct, chunk, waypoint_pid]
+      pretrained: [base_only, sim_pretrain]
+      data_fraction: [1.0, 0.6, 0.4]
+    endpoints:
+      primary: closed_loop_sr
+      secondary: [mae_after, gpu_hours, steps_to_target_sr]
+    decision: 按「达到基线 SR − 3 pp 所需的最小数据量」排序。
+    outcome: >
+      **未实施** —— 当前主线（观测完备性）的结论已比 A1 原设想更深入；
+      该矩阵是 54 格的正交实验，需在主线收口后统一跑。
+      注意：**LoRA / waypoint-PID 两条路径在本仓库尚无实现**，需先补代码。
+
+  - id: E3-migration
+    name: 跨任务跨域迁移（A2：机械臂域 → 导航域）
+    status: blocked_design
+    blocker: |
+      设计层面不可行（非「没来得及做」）：大纲设定的源域是机械臂（PushT），
+      但 PushT 是 2D 状态输入、**无视觉**，与目标域（RGB + 激光 + 语言指令）
+      的观测空间**零重叠** —— MMD 域自适应需要对齐**同分布的特征空间**，
+      而这里连特征空间都不共享，MMD/双映射无从定义。
+      要做真正的跨任务迁移需要先有「带视觉的源域任务」数据管线
+      （大纲 W5-W6 的机械臂采集，受 BOM 限制未采购机械臂）。
+    realized_instead: |
+      大纲 §8 的风险预案「迁移增益不显著则转向」**已触发**，转向的是
+      「观测完备性」主线（§4.12 感知特征、§4.23 时序记忆），并已完成
+      **域内泛化**（§4.25：标定 → 多房间 + 2 行人，记忆效应跨域保持）。
+      这是当前 BOM 下能做的、与 A2 动机（「数据高效的域适应」）最接近的实现。
+    what_would_unblock: "带视觉的源域数据集（任意操作任务均可，如桌面整理）；或 RDK-X3 + 机械臂采购"
+    hypothesis: >
+      MMD 域自适应 + 双映射机制可使目标域数据量减少 ≥ 60% 而成功率损失 ≤ 3 pp。
+    variables:
+      strategy: [direct_ft, plus_distill, plus_mmd, dual_mapping]
+      source_data: [target_only, source_plus_target]
+    endpoints:
+      primary: data_efficiency
+      secondary: [mmd_distance_curve, closed_loop_sr]
+    decision: >
+      若迁移增益不显著 → 诚实报告并转向「动作空间重构 + 观测完备性」为主线
+      （大纲 §8 已预设此分支，且本仓库实际已走到该分支）。
+    outcome: >
+      **未实施**。现状是「目标域内域泛化」（§4.25）已做完并给出正面结果；
+      真正的**跨任务**迁移（用机械臂数据做源域）需要先有机械臂域的演示数据管线。
+      大纲 §8 的风险预案「迁移增益不显著则转向」**事实上已经发生**，
+      论文中应把这一转折作为方法选择来叙述，而不是当作失败。
+
+  - id: E11-sim
+    name: 视觉跟随（仿真版，任务与指标建立）
+    status: done
+    hypothesis: >
+      在「目标已在视野内、期望距离 1.5 m」的良定义初始条件下，
+      反应式基线（检测马甲 + PID 直连 + 激光局部避障）应显著优于随机，
+      但显著差于使用真值目标位置的 oracle —— 差值即**感知瓶颈**。
+    variables:
+      policy: [random, reactive, oracle]
+      scenario: [normal, short_occl, long_occl, light_shift, narrow]
+      fixed:                        # 控制变量
+        want_dist_m: 1.5
+        band_m: [0.9, 2.6]
+        target_speed_mps: 0.22      # **必须 < 机器人 V_MAX = 0.35**，否则跟不住是物理必然
+        camera_augment: 0.25
+        steps: 300
+    seeds: {episode_base: 3000, stride: 17, per_cell: [42, 123, 456, 789, 1024]}
+    endpoints:
+      primary: TCR                  # 跟踪连续率：可见 **且** 在距离带内的步数占比
+      secondary: [err_mean_m, bearing_mean_deg, vis_rate, n_loss,
+                  rec_ms_median, rec_ms_p90]
+    decision: >
+      主判据：reactive 的 TCR 显著高于 random；oracle 显著高于 reactive。
+      若 oracle 与 reactive 无差异 → 说明**感知不是瓶颈**，转攻控制。
+      若三者皆低 → 任务定义或速度配比有问题，不可作为结论。
+    analysis: >
+      配对 McNemar（回合级二值：该回合是否达到 TCR ≥ 0.8）；
+      误差类指标报 mean ± sd 且做配对 bootstrap 10000 次；
+      跨 5 场景 × 3 策略共 15 项对比统一 Holm 校正。
+    outcome: >
+      已完成（30 回合/格 × 15 格）。oracle 显著优于 random；
+      reactive 显著优于 random 但显著低于 oracle；
+      「丢失-恢复」在遮挡场景下明显劣化。**但绝对水平偏低，
+      原因是初始设计缺陷已修正三次**（速度配比、目标出生点、专用人体感知），
+      详见 `E11_跟随任务说明.md`。
+
+  - id: E11-real
+    name: 视觉跟随（真机验证，大纲主体）
+    status: blocked                    # 阻塞原因见 §3 部署可行性
+    hypothesis: >
+      同一指标定义下，端侧压缩模型的实际 TCR 相对仿真下降不超过 10 pp，
+      遮挡恢复时间 ≤ 250 ms（大纲 §5 E11 预期）。
+    variables:
+      platform: [服务器教师模型, 端侧压缩模型]
+      interference: [开阔区正常, 短时遮挡1-2s, 长时遮挡>3s, 光照突变, 狭窄通道]
+      fixed: {trials_per_condition: 10}
+    seeds: {trials: 50}                # 真机不做种子，做重复试验
+    endpoints:
+      primary: TCR
+      secondary: [follow_err_m, n_loss, recover_ms, jitter, latency_ms,
+                  cmd_smoothness]
+    decision: >
+      TCR 达标（待定，需先做 10 次预试验定基线）且恢复时间 ≤ 250 ms 记为通过。
+    analysis: >
+      无深度相机，目标距离用「针孔模型 + 已知人体高度」反推，
+      **必须先标定测距误差并报告区间**（大纲 §8 风险表已列此项）。
+      > 仿真中发现该假设需要修正：相机高 0.35 m、人体高 1.70 m 时，
+      > 2 m 处头顶已超出画面上沿，**像素高不可用**；实现改用
+      > **色块底边接地法** `d = f·cam_h/(r1 − horizon)`（跟随距离带内准确，
+      > 误差 −0.11 ± 0.40 m）。论文中应如实说明这一修正。
+    outcome: "未开始 —— 阻塞于硬件：无 RDK-X3、无容器运行时、地平线工具链源不可达"
+    blocked_by: [no_rdkx3_hardware, no_container_runtime, horizon_toolchain_unreachable]
