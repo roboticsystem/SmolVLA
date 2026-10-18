@@ -59,8 +59,33 @@ def main():
     ap.add_argument("--out", default="data_recorded/session_$(date +%m%d_%H%M).h5")
     ap.add_argument("--img-size", default="640x480", help="落盘分辨率 WxH（原图直存）")
     ap.add_argument("--max-episodes", type=int, default=50)
+    ap.add_argument("--instruction", default="",
+                    help="本批次所有回合的语言指令（写入 ep_instr；不填则 <manual>，微调前需回填）")
+    ap.add_argument("--config", default="../config/robot.yaml",
+                    help="robot.yaml 路径：自动读取已标定的相机内参写入 h5 attrs")
+    ap.add_argument("--hfov", type=float, default=None, help="覆盖 config 中的 hfov_deg")
+    ap.add_argument("--cam-h", type=float, default=None, help="覆盖 config 中的 cam_h")
     a = ap.parse_args()
     a.out = a.out.replace("$(date +%m%d_%H%M)", time.strftime("%m%d_%H%M"))
+
+    # 相机内参：优先命令行 > robot.yaml > -1（未标定）
+    hfov, cam_h = -1.0, -1.0
+    if os.path.exists(a.config):
+        try:
+            import yaml
+            cfg = yaml.safe_load(open(a.config)) or {}
+            cam = cfg.get("camera", {})
+            hfov = float(cam.get("hfov_deg", -1.0))
+            cam_h = float(cam.get("cam_h", -1.0))
+            print(f"[config] 从 {a.config} 读到内参：hfov={hfov} cam_h={cam_h}")
+        except ImportError:
+            print(f"[WARN] 未装 pyyaml（pip3 install pyyaml），内参不自动回填")
+        except Exception as e:                                # noqa: BLE001
+            print(f"[WARN] 读 config 失败（{e}），内参不自动回填")
+    else:
+        print(f"[WARN] 找不到 {a.config}，内参不自动回填")
+    if a.hfov is not None:  hfov = a.hfov
+    if a.cam_h is not None: cam_h = a.cam_h
 
     use_ros = False
     node = None
@@ -179,17 +204,20 @@ def main():
         f["states"] = np.asarray(sts, np.float32)
         f["ep_offset"] = np.asarray(offs, np.int64)
         dt2 = h5py.special_dtype(vlen=str)
-        f["ep_instr"] = np.asarray(instrs if instrs else ["<manual>"] * e, dtype=dt2)
+        instr_final = a.instruction if a.instruction else "<manual>"
+        f["ep_instr"] = np.asarray(instrs if instrs else [instr_final] * e, dtype=dt2)
         f["ep_success"] = np.full(e, -1.0, np.float32)   # 遥操后回填 1/0
         f.attrs.update({
             "schema": "nav_v1", "ros_mode": int(use_ros),
             "img_w": W, "img_h": H,
-            "camera_hfov_deg": -1.0,                     # ← 标定后回填
-            "camera_h_m": -1.0,                          # ← 标定后回填
+            "camera_hfov_deg": hfov,                     # 自动来自 robot.yaml / 命令行
+            "camera_h_m": cam_h,
+            "instruction": instr_final,
             "note": "动作=遥操指令（无 ROS 模式含航位死推误差）；det_feat 需回工作站重算",
             "recorded_at": time.strftime("%Y-%m-%d %H:%M:%S")})
     sz = os.path.getsize(a.out) / 2**20
     print(f"\n已保存 {a.out}: {e} 回合 / {n} 帧 / {sz:.1f} MB")
+    print(f"指令: {instr_final} | 内参: hfov={hfov} cam_h={cam_h}")
     print(f"下一步：python3 tools/verify_dataset.py --h5 {a.out}")
 
 

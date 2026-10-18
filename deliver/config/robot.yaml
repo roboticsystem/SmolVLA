@@ -10,16 +10,16 @@ robot:
   notes: "RDK-X3 / 差速底盘 / 单目相机 + 120 线激光"
 
 camera:
-  device: 0                  # /dev/video 编号或路径
+  device: /dev/video8        # C70/C100 USB 免驱（2026-10 实测；MV.py 同款 src=8）
   width: 640                 # 采集分辨率（推理会 resize，采集尽量高）
   height: 480
   fps: 30
-  hfov_deg: 64.5             # ⚠ 仿真值。用 tools/calibrate_camera.py 实测
-  cam_h: 0.35                # ⚠ 镜头离地高度（米）。卷尺实测
+  hfov_deg: 69.4             # 2026-10-13 实测：纸盒标定 f≈926px@1280×720（宽/高两法互证 <1%）
+  cam_h: 0.08                # 2026-10-13 实测：镜头上沿 9cm / 下沿 7cm，光轴取 8cm
   color_order: bgr           # OpenCV 默认；infer_server 会转 RGB 喂模型
   # ⚠ 仿真相机地面测距的饱和下限 = f*cam_h/(H - H/2)；真机内参不同，
   #   饱和点不同，用 calibrate_camera.py 算出后填到下面备查：
-  mono_range_floor_m: null   # 实测后填写（仿真为 0.752）
+  mono_range_floor_m: 0.15   # 2026-10-13 实测 @640×480（f=463, cam_h=0.08）：低于此距离以激光为准
 
 lidar:
   topic: /scan
@@ -32,6 +32,18 @@ control:
   w_max: 1.60
   v_min_rev: -0.10
   # 动作物理口径：v (m/s)，ω (rad/s)。与训练数据 actions 列一致。
+  chassis:
+    port: /dev/ttyS3         # CK 协议串口（CK_simple.py 实测）
+    baud: 115200
+    pwm_per_v: 123.2         # 2026-10-13 标定：pwm25 → 0.203 m/s
+    pwm_per_w: 7.64          # 2026-10-13 实测：pwm12 → 1.571 rad/s（450°/5s，逆时针）
+    pwm_cap: 25              # ⚠ PCB 保护边界（实测 30 偶发重置、43+ 必重置）
+    # 注意：底盘实际最大速度 0.203 m/s < 训练分布 0.35 m/s。
+    # /cmd_vel 发布的是「实际达到的速度」，里程计不会失真；
+    # 模型以 0.203 动态运行属于降速保守策略（告警④：只能低于训练速度）
+    # ⚠ 协议是 mode 型（前进/倒车/左转/右转四选一），不支持弧线转弯：
+    #   |v| 够大走 1/2，否则 |ω| 够大原地转 3/4。左转=ω>0（ROS 右手系），
+    #   方向反了改 control_node._map_action 的一行。
 
 navigation:
   success_standoff_m: 0.30   # 仿真判据。真机初期建议放宽到 0.5 观察（见告警 ②）
@@ -42,13 +54,17 @@ detection:
   # ⚠⚠ 下面是占位值！真机光照/白平衡与仿真渲染完全不同，
   #    务必先用 tools/perception_smoke.py --measure 对着真实目标测一轮再填。
   refs:
-    red:    [0, 200, 120]
-    green:  [60, 200, 120]
-    blue:   [110, 200, 120]
-    yellow: [25, 200, 120]
-    purple: [140, 200, 120]
-    orange: [12, 220, 160]
-  hsv_tol: [12, 90, 90]      # H/S/V 容差
+    red:    [176, 105, 142]   # 2026-10-13 实测红盒（H 在 175~177，带 wrap 注意）
+    green:  [60, 200, 120]    # ⚠ 仿真占位值，未实测
+    blue:   [104, 137, 135]   # 2026-10-13 实测蓝盒
+    yellow: [24, 174, 230]    # 2026-10-13 实测黄圆柱（默认容差即无干扰）
+    purple: [140, 200, 120]   # ⚠ 仿真占位值，未实测
+    orange: [12, 220, 160]    # ⚠ 仿真占位值，未实测
+  hsv_tol: [12, 90, 90]      # 默认 H/S/V 容差
+  # 每色容差覆盖：蓝色场景里有同色系货架（S 仅 61~80），
+  # 靠饱和度区分——蓝盒 S=113~142，货架 S≤80
+  hsv_tol_overrides:
+    blue: [6, 40, 90]
 
 inference:
   mode: server               # server = 笔电推理（D2 路线，本包默认）
@@ -60,6 +76,8 @@ inference:
 
 recording:
   out_dir: data_recorded
-  image_size: [160, 120]     # 与训练一致（H,W）？注意是 [高,宽]
+  image_size: [120, 160]     # 训练口径 [高,宽]：训练 h5 实测 images (N,120,160,3)。
+                             # 注意：--ros 模式原图直存（640x480），推理时统一 resize，
+                             # 此字段仅作口径备忘。
   teleop:
     keymap: "wasd/jl：前后左右/转向，空格急停，q 结束并保存"
