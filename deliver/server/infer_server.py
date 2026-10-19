@@ -38,6 +38,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import numpy as np
+import cv2
 
 # 必须在任何 HF/transformers 导入之前：离线环境下联网重试会把启动卡死几分钟
 # （实测：无 HF_HUB_OFFLINE=1 时 HEAD 请求重试 5 次阻塞启动）。
@@ -145,10 +146,18 @@ def make_handler(policy, data, meta, dev, project, detector="real", config=None)
             t0 = time.time()
             n = int(self.headers.get("Content-Length", 0))
             try:
+                import base64
                 req = json.loads(self.rfile.read(n))   # 截断/坏包也走统一 500 路径
-                img = np.frombuffer(bytes.fromhex(req["image_bgr"]), np.uint8)
-                h, w = int(req["h"]), int(req["w"])
-                img_bgr = img.reshape(h, w, 3)
+                if "jpg_b64" in req:
+                    # 车侧 JPEG 全尺寸（q≈80）：payload ~37KB 且检出率无损
+                    # （实测 640x480 原始 66.5% vs JPEG q80 68.3%）
+                    _buf = np.frombuffer(base64.b64decode(req["jpg_b64"]), np.uint8)
+                    img_bgr = cv2.imdecode(_buf, cv2.IMREAD_COLOR)
+                    assert img_bgr is not None, "JPEG 解码失败"
+                else:
+                    _raw = np.frombuffer(bytes.fromhex(req["image_bgr"]), np.uint8)
+                    img_bgr = _raw.reshape(int(req["h"]), int(req["w"]), 3)
+                h, w = img_bgr.shape[:2]
                 img = img_bgr[:, :, ::-1]                       # BGR→RGB（训练口径）
                 scan = np.asarray(req["scan"], np.float32)
                 st_in = np.asarray(req["state"], np.float32)[:5]  # [x,y,θ,v,ω]

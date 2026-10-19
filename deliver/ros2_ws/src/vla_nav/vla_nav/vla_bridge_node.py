@@ -82,18 +82,11 @@ class VLABridge(Node):
 
     # ---- 传感器回调：只缓存最新一帧 ----
     def _img(self, msg: Image):
-        img = np.frombuffer(msg.data, dtype=np.uint8).reshape(
+        # 保留原始分辨率：检测口径（min_px=150 等）按 480x640 标定，
+        # 缩小会让远处目标掉出阈值（实测 120x160 检出率 66.5%→31%）。
+        # 传输体积由 JPEG 压缩解决（见 tick 的 payload 组装）。
+        self.last_img = np.frombuffer(msg.data, dtype=np.uint8).reshape(
             msg.height, msg.width, -1)[:, :, :3]
-        # 缩到训练分辨率 120×160 再上传：480×640 原始 hex ≈1.84MB/请求，
-        # 经热点+SSH 隧道就是 8s 级延迟的元凶；缩后 ≈57KB（32 倍缩减），
-        # 且与训练/评测口径完全一致。 SmolVLM 内部自会再做适配。
-        if img.shape[0] != 120 or img.shape[1] != 160:
-            try:
-                import cv2
-                img = cv2.resize(img, (160, 120), interpolation=cv2.INTER_AREA)
-            except ImportError:
-                pass                    # 无 cv2 则原样发送（慢，但能跑）
-        self.last_img = img
 
     def _scan(self, msg: LaserScan):
         n = len(msg.ranges)
@@ -136,9 +129,20 @@ class VLABridge(Node):
             return
         try:
             import urllib.request
+            # 图像传输：优先 JPEG 全尺寸（q=80，实测 ~37KB 且检出率无损）；
+            # 无 cv2 时退回原始 hex（1.8MB，慢但能跑）
+            import base64
+            try:
+                import cv2
+                ok, buf = cv2.imencode(".jpg", self.last_img,
+                                       [cv2.IMWRITE_JPEG_QUALITY, 80])
+                img_field = {"jpg_b64": base64.b64encode(buf.tobytes()).decode()}
+            except ImportError:
+                img_field = {"image_bgr": self.last_img.tobytes().hex(),
+                             "h": int(self.last_img.shape[0]),
+                             "w": int(self.last_img.shape[1])}
             payload = json.dumps({
-                "image_bgr": self.last_img.tobytes().hex(),
-                "h": int(self.last_img.shape[0]), "w": int(self.last_img.shape[1]),
+                **img_field,
                 "scan": self.last_scan.tolist(),
                 "state": self.build_state().tolist(),
                 "instruction": self.instr,
