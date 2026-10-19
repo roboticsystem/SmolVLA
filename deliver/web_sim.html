@@ -1,0 +1,73 @@
+<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">
+<title>SmolVLA 室内语义导航 · 仿真演示系统</title><style>
+body{font-family:system-ui,'Microsoft YaHei';background:#111;color:#eee;margin:0;padding:16px}
+h1{font-size:20px;margin:0 0 12px} .row{display:flex;gap:14px;flex-wrap:wrap}
+canvas,img{background:#000;border:1px solid #444}
+#map{width:640px;height:480px}#cam{width:320px;height:240px}
+.panel{background:#1b1b1b;border:1px solid #333;border-radius:8px;padding:10px;margin-bottom:12px}
+button,select,input{background:#2a2a2a;color:#eee;border:1px solid #555;border-radius:6px;padding:6px 10px;font-size:14px}
+button{cursor:pointer}button:hover{background:#3a3a3a}
+#status{font-size:15px;line-height:1.7} .ok{color:#6f6;font-weight:bold}.bad{color:#f66;font-weight:bold}
+table{border-collapse:collapse;font-size:13px}td,th{border:1px solid #444;padding:4px 10px}
+.big{font-size:18px;font-weight:bold}
+</style></head><body>
+<h1>SmolVLA 室内语义导航 · 仿真演示系统（E1 标定场地，与论文实验同环境）</h1>
+<div class="panel">
+策略 <select id="policy">
+<option value="oracle">oracle 全知规划（上界）</option>
+<option value="sweep" selected>sweep 扫描检测（论文基线）</option>
+<option value="random_target">random_target 随机游走（下界）</option>
+<option value="random">random 纯随机</option>
+<option value="vla">SmolVLA 真模型（需推理服务:8000）</option></select>
+任务层级 <select id="level"><option value="">混合 L1-L3</option>
+<option value="L1">L1 类别</option><option value="L2">L2 属性</option>
+<option value="L3">L3 空间关系</option></select>
+起始种子 <input id="seed" type="number" value="9000" style="width:90px">
+<button onclick="start()">▶ 单回合演示</button>
+回合数 <input id="n" type="number" value="20" style="width:70px">
+<button onclick="batch()">📊 批量评测</button>
+<button onclick="stopB()">⏹ 停止</button>
+</div>
+<div class="row">
+<div class="panel"><b>俯视地图</b><br><canvas id="map" width="640" height="480"></canvas></div>
+<div><div class="panel"><b>车载相机</b><br><img id="cam"><br>
+<div id="status" class="panel" style="margin-top:10px;min-width:320px">等待开始…</div></div></div>
+<div class="panel" style="min-width:280px"><b>批量评测结果</b><div id="batch">—</div></div>
+</div>
+<script>
+let meta=null;
+async function post(u,d){const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d||{})});return r.json()}
+function start(){post('/api/start',{policy:policy.value,seed:+seed.value,level:level.value||null})}
+function batch(){post('/api/batch',{policy:policy.value,n:+n.value,level:level.value||null})}
+function stopB(){post('/api/stop')}
+function draw(s){const c=map.getContext('2d');c.fillStyle='#111';c.fillRect(0,0,640,480);
+ if(!s.map_meta)return;const m=s.map_meta;
+ if(mapImg.src!==s.map&&s.map){mapImg.onload=()=>{c.drawImage(mapImg,0,0,640,480)};mapImg.src=s.map}
+ const X=x=>(x-m.b[0])/(m.b[1]-m.b[0])*640, Y=y=>480-(y-m.b[2])/(m.b[3]-m.b[2])*480;
+ if(s.goal){c.fillStyle='#2f2';c.beginPath();c.arc(X(s.goal[0]),Y(s.goal[1]),7,0,7);c.fill();
+  c.fillStyle='#fff';c.font='11px sans-serif';c.fillText('目标',X(s.goal[0])+9,Y(s.goal[1])-6)}
+ c.strokeStyle='#f9933b';c.lineWidth=1;
+ for(const p of s.lidar){c.beginPath();c.moveTo(X(s.pose[0]),Y(s.pose[1]));c.lineTo(X(p[0]),Y(p[1]));c.stroke()}
+ if(s.traj.length>1){c.strokeStyle='#4af';c.lineWidth=2;c.beginPath();
+  s.traj.forEach((p,i)=>i?c.lineTo(X(p[0]),Y(p[1])):c.moveTo(X(p[0]),Y(p[1])));c.stroke()}
+ if(s.pose){c.save();c.translate(X(s.pose[0]),Y(s.pose[1]));c.rotate(-s.pose[2]);
+  c.fillStyle='#4af';c.beginPath();c.moveTo(12,0);c.lineTo(-8,-7);c.lineTo(-8,7);c.closePath();c.fill();c.restore()}}
+async function loop(){try{const s=await(await fetch('/api/state')).json();draw(s);
+ if(s.image)cam.src='data:image/jpeg;base64,'+s.image;
+ const r=s.result;let st='指令: '+(s.instruction||'—')+'<br>层级: '+s.level+' | 步数: '+s.step+
+  ' | 策略: '+s.policy+' | seed: '+s.seed;
+ if(s.mode==='running')st+='<br><span class="big" style="color:#4af">▶ 运行中…</span>';
+ if(s.mode==='done'&&r)st+='<br>'+(r.success?'<span class="ok big">✔ 成功到达</span>':
+  '<span class="bad big">✘ 未成功</span>')+'<br>剩余距离 NE: '+r.ne.toFixed(2)+
+  ' m | SPL: '+r.spl.toFixed(3)+' | 全程最小距离: '+r.min_dist.toFixed(2)+' m';
+ if(s.mode==='error')st+='<br><span class="bad">错误: '+(r&&r.error||'')+'</span>';
+ status.innerHTML=st;
+ let b='—';if(s.batch.n)b='进度 '+s.batch.done+'/'+s.batch.n+'<br>SR '+s.batch.sr+'% | SPL '+
+  s.batch.spl+' | NE '+s.batch.ne+' m';
+ if(s.batch.rows&&s.batch.rows.length){b+='<table><tr><th>#</th><th>指令</th><th>SR</th><th>NE</th></tr>'+
+  s.batch.rows.map((r,i)=>'<tr><td>'+(s.batch.done-s.batch.rows.length+i+1)+'</td><td>'+r.instruction+
+  '</td><td>'+(r.success?'✔':'✘')+'</td><td>'+r.ne.toFixed(2)+'</td></tr>').join('')+'</table>'}
+ batch.innerHTML=b}catch(e){}setTimeout(loop,120)}
+const mapImg=new Image();
+loop();
+</script></body></html>
