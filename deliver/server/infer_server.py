@@ -46,6 +46,9 @@ os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
 STATE_DIM = 32
 LOCK = threading.Lock()
+CHUNK_OUT = 10           # 每次推理返回的动作步数（chunk=50 中取前 K 步开环执行）
+ACT_MIN = [-0.35, -1.6]  # 与车侧 clip 口径一致
+ACT_MAX = [0.35, 1.6]
 
 
 def _load_model(project, ckpt_dir, dev):
@@ -141,8 +144,8 @@ def make_handler(policy, data, meta, dev, project, detector="real", config=None)
         def do_POST(self):
             t0 = time.time()
             n = int(self.headers.get("Content-Length", 0))
-            req = json.loads(self.rfile.read(n))
             try:
+                req = json.loads(self.rfile.read(n))   # 截断/坏包也走统一 500 路径
                 img = np.frombuffer(bytes.fromhex(req["image_bgr"]), np.uint8)
                 h, w = int(req["h"]), int(req["w"])
                 img_bgr = img.reshape(h, w, 3)
@@ -191,9 +194,13 @@ def make_handler(policy, data, meta, dev, project, detector="real", config=None)
                 with LOCK, torch.no_grad():   # 推理必须 no_grad（否则 numpy() 报错）
                     pred = policy.model.sample_actions(images, img_masks,
                                                        lang_t, lang_m, state_p)
-                a = (pred[0, 0].float().cpu().numpy() * data.act_std
-                     + data.act_mean)                     # 反归一化 → 物理量
-                out = {"action": [float(a[0]), float(a[1])],
+                # 反归一化 → 物理量，取 chunk 前 K 步（与 chunk_execute_k 设计一致）：
+                # 车侧 10Hz 逐步执行 K 步（约 1s），期间不再请求，网络/推理压力降 K 倍
+                chunk = pred[0].float().cpu().numpy() * data.act_std + data.act_mean
+                k = int(min(CHUNK_OUT, chunk.shape[0]))
+                acts = np.clip(chunk[:k], ACT_MIN, ACT_MAX)
+                out = {"action": [float(acts[0, 0]), float(acts[0, 1])],
+                       "actions": [[float(x[0]), float(x[1])] for x in acts],
                        "latency_ms": round((time.time() - t0) * 1000, 1)}
                 self.send_response(200)
             except Exception as e:                        # noqa: BLE001

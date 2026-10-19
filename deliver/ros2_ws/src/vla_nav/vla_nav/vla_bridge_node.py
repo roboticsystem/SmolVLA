@@ -60,6 +60,11 @@ class VLABridge(Node):
         self.st_mean = np.array(self.get_parameter("st_mean").value, dtype=np.float32)
         self.st_std = np.array(self.get_parameter("st_std").value, dtype=np.float32)
         self.normalize_state = bool(self.get_parameter("normalize_state").value)
+        # chunk 批量执行（服务端每次推理返回前 K 步动作）：队列非空时 10Hz 逐步执行，
+        # 取空才发起新请求——网络/推理压力降 K 倍，闭环期间请求频率 ~1Hz。
+        self.declare_parameter("chunk_execute", True)
+        self.chunk_execute = bool(self.get_parameter("chunk_execute").value)
+        self.action_queue = []
 
         self.last_img = None
         self.last_scan = None
@@ -113,6 +118,12 @@ class VLABridge(Node):
         if self.last_img is None or self.last_scan is None or self.last_odom is None:
             return
         cmd = Twist()
+        # chunk 批量执行：队列里还有上一次推理的动作就直接执行，不发请求
+        if self.chunk_execute and self.action_queue:
+            a = self.action_queue.pop(0)
+            cmd.linear.x, cmd.angular.z = float(a[0]), float(a[1])
+            self.pub.publish(cmd)
+            return
         try:
             import urllib.request
             payload = json.dumps({
@@ -128,8 +139,17 @@ class VLABridge(Node):
             with urllib.request.urlopen(req, timeout=TIMEOUT_S) as r:
                 out = json.loads(r.read())
             self.lat_ms = (time.time() - t0) * 1000
-            a = np.clip(np.asarray(out["action"], dtype=np.float32), [-0.35, -1.6],
-                        [0.35, 1.6])
+            if self.chunk_execute and out.get("actions"):
+                acts = out["actions"]
+                a = np.clip(np.asarray(acts[0], dtype=np.float32),
+                            [-0.35, -1.6], [0.35, 1.6])
+                self.action_queue = [
+                    np.clip(np.asarray(x, dtype=np.float32), [-0.35, -1.6],
+                            [0.35, 1.6]) for x in acts[1:]]
+            else:
+                self.action_queue = []
+                a = np.clip(np.asarray(out["action"], dtype=np.float32),
+                            [-0.35, -1.6], [0.35, 1.6])
             self.last_action = a
             cmd.linear.x, cmd.angular.z = float(a[0]), float(a[1])
             if self.fail_streak:
