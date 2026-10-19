@@ -47,7 +47,7 @@ def load_student(device="cpu"):
 
     用部署包里的 `expert.pt`（学生专家权重），它与 `denoise.onnx` 同源。
     """
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))  # 项目根
     from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
     pol = SmolVLAPolicy.from_pretrained("models/smolvla_base").to(device)
     ck = torch.load("export/deploy_4x1/expert.pt", map_location=device)

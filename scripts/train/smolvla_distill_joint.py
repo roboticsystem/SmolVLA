@@ -21,6 +21,10 @@ KV 复用：prefill 是逐层顺序的，前 N 层的 KV 与总层数无关，
         --configs "16:1,12:2,8:2,8:1,4:1" --steps 600
 """
 
+import os as _os, sys as _sys  # noqa: E402
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))  # 项目根（scripts/<类>/ 上一级），保证 import sim/ smolvla_* 可用
+
+
 import argparse
 import copy
 import json

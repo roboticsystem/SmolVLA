@@ -19,6 +19,10 @@
         --layers 4 --student-steps 1 --distill-steps 600 --out export/deploy_4x1
 """
 
+import os as _os, sys as _sys  # noqa: E402
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))  # 项目根（scripts/<类>/ 上一级），保证 import sim/ smolvla_* 可用
+
+
 import argparse
 import json
 import os

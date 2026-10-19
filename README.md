@@ -29,9 +29,10 @@ SmolVLA/
 │   ├── train/                 # LoRA / IDAS / 蒸馏 / chunk / DAgger
 │   ├── deploy/                # ONNX 导出 / INT8 量化 / 基准 / 算子普查
 │   ├── experiments/           # E2/E5 扫描与多种子驱动
+│   ├── real/                  # E10 sim→real：真机数据回填 / 共训合并 / 受控评测 / 统计量导出
 │   └── stats/                 # Holm 多重比较校正
 ├── ros2_ws/                   # ROS2 五节点（camera/lidar/odom/vla_bridge/control）
-├── deliver/                   # 真机交付包（server/tools/config/docs；模型不入库）
+├── deliver/                   # 真机交付包（README/server/tools/config/ros2_ws/docs；模型不入库）
 ├── docker/
 │   ├── ros2_sim/              # ROS2 Humble + Gazebo + TurtleBot3 + Nav2 容器
 │   │   └── README_Spark.md    # DGX Spark (ARM64) 适配说明

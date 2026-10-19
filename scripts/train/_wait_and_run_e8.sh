@@ -6,7 +6,7 @@ while true; do
     f=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i $g)
     if [ "$f" -ge 12000 ]; then
       echo "GPU$g free ${f} MiB -> start E8"
-      .venv_smolvla/bin/python -u smolvla_e8_chunk.py --gpu $g --episodes 100
+      .venv_smolvla/bin/python -u scripts/train/smolvla_e8_chunk.py --gpu $g --episodes 100
       exit 0
     fi
   done

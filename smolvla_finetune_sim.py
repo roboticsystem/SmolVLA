@@ -517,6 +517,11 @@ def closed_loop_sr(policy, data, episodes=12, seed=9000, max_steps=400, level=No
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", default="export/nav_demos.h5")
+    ap.add_argument("--stats-from", default=None,
+                    help="冻结归一化统计量：从该 h5（如纯仿真 nav_detf.h5）复算 "
+                         "st/act 均值方差并覆盖 --data 的重算值。用于共训场景："
+                         "训练/评测/部署全程用 sim 口径统计量，真机数据当作"
+                         "「略带偏移的增广」，避免统计量被 real 帧拉偏（E10）")
     ap.add_argument("--steps", type=int, default=3000)
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--lr", type=float, default=1e-4)
@@ -680,6 +685,30 @@ def main():
                        chunk_size=a.chunk, max_action_dim=2, n_frames=a.n_frames,
                        with_lidar=a.lidar_in_state, with_det=a.det_features)
     print("  " + data.summary().replace("\n", "\n  "))
+    if a.stats_from:
+        # 冻结统计量：从参考 h5 直接复算（不建第二个 SimDemoData——images 会整块
+        # 进内存，白吃 ~5.5GB）。拼装口径必须与 SimDemoData.__init__ 完全一致：
+        # states → [+lidar] → [+det_feat]，mean/std 同 lines 115-118。
+        import h5py as _h5
+        with _h5.File(a.stats_from, "r") as _f:
+            _st = _f["states"][()].astype(np.float32)
+            _act = _f["actions"][()].astype(np.float32)
+            if a.lidar_in_state:
+                if "lidar" not in _f:
+                    raise ValueError(f"{a.stats_from} 缺 lidar，无法对齐状态维度")
+                _st = np.concatenate([_st, _f["lidar"][()].astype(np.float32)], axis=1)
+            if a.det_features:
+                if "det_feat" not in _f:
+                    raise ValueError(f"{a.stats_from} 缺 det_feat，无法对齐状态维度")
+                _st = np.concatenate([_st, _f["det_feat"][()].astype(np.float32)], axis=1)
+        data.act_mean = _act.mean(0)
+        data.act_std = _act.std(0) + 1e-6
+        data.st_mean = _st.mean(0)
+        data.st_std = _st.std(0) + 1e-6
+        print(f"  [统计量冻结] 来自 {a.stats_from}（sim 口径）：")
+        print(f"    act_mean={np.round(data.act_mean, 4).tolist()} "
+              f"act_std={np.round(data.act_std, 4).tolist()}")
+        print(f"    st_mean[:5]={np.round(data.st_mean[:5], 4).tolist()}")
     rng = np.random.default_rng(a.seed)
 
     # 仅评测：加载已训练的 checkpoint，用**统一口径**重评（便于修正指标后回溯既有结果）
@@ -700,6 +729,11 @@ def main():
         # 评测结果无效（实测踩过：ω 标准差 0.556 vs 0.870 差 1.57 倍，
         # 同一模型评出 8.3% 与 25.0% 两个数）。
         ck_data = ck.get("data")
+        # 若训练时冻结了统计量（stats_from），传入该 h5 即视为口径一致，
+        # 不触发下面的「自动改用训练数据」——那会把 sim 冻结统计量换回混合统计量。
+        _sf = ck.get("stats_from")
+        if _sf and os.path.abspath(a.data) == os.path.abspath(_sf):
+            ck_data = a.data
         if ck_data and os.path.abspath(ck_data) != os.path.abspath(a.data):
             print(f"\n  [!! 警告 !!] --data 与训练数据不一致：")
             print(f"      本次传入 : {a.data}")
@@ -902,7 +936,8 @@ def main():
                 "det_features_mode": str(a.det_features_mode or "none"),
                 "mem_ttl": int(a.mem_ttl),             # 感知档位/记忆参数：评测必须一致
                 "num_steps": int(cfg.num_steps),
-                "data": os.path.abspath(a.data)},      # 训练数据：评测必须对齐其归一化统计量
+                "data": os.path.abspath(a.data),       # 训练数据：评测必须对齐其归一化统计量
+                "stats_from": (os.path.abspath(a.stats_from) if a.stats_from else None)},
                f"{a.out}/policy.pt")
     print(f"\n  已保存 {a.out}/policy.pt（在最终评测**之前**）")
 

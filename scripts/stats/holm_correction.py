@@ -30,7 +30,7 @@ import sys
 
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))  # 项目根
 from sim.plot_results import mcnemar_exact, _ep_records          # noqa: E402
 
 ALPHA = 0.05

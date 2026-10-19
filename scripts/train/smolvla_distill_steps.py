@@ -18,6 +18,10 @@
     CUDA_VISIBLE_DEVICES=5 .venv_smolvla/bin/python smolvla_distill_steps.py --steps 400
 """
 
+import os as _os, sys as _sys  # noqa: E402
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))  # 项目根（scripts/<类>/ 上一级），保证 import sim/ smolvla_* 可用
+
+
 import argparse
 import copy
 import os

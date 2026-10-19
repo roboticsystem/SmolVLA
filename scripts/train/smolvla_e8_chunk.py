@@ -14,7 +14,7 @@ import time
 import numpy as np
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))  # 项目根
 from smolvla_finetune_sim import (DEV, IMG_KEYS, STATE_KEY, _slot_noise,
                                   build_state, truncate_action_head)
 from smolvla_sim_data import SimDemoData
