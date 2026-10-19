@@ -166,6 +166,7 @@ def make_handler(policy, data, meta, dev, project, detector="real", config=None)
                 instr = str(req["instruction"])
 
                 # 感知特征：真机帧必须走 robot.yaml HSV 检测器（与训练 det_feat 同口径）
+                det_dist = None
                 if use_det and real_det:
                     beam_step = 360.0 / max(1, len(scan))
 
@@ -181,6 +182,28 @@ def make_handler(policy, data, meta, dev, project, detector="real", config=None)
                     dets = RP.to_detections(blobs, lidar_beam_deg=lidar_at)
                     dfeat = np.asarray(
                         features_from_dets(dets, instr, mode=det_mode), np.float32)
+                    # det_dist：指令所指目标的距离，供车侧近距护栏使用。
+                    # 正常：单目几何 d = f·cam_h/(r1-horizon)（detect 内已算 d_mono_m）；
+                    # [SAT] 目标底沿贴住画面下缘（r1 ≥ H-2）：地面接触点已出画，
+                    # 单目严重低估 → 改用车头 ±18° 最小激光距离。
+                    # 未检出/指令解析失败：None（车侧自动只用激光）。
+                    try:
+                        from sim.baselines import parse_instruction
+                        _wc, _wcls, _, _ = parse_instruction(instr)
+                    except Exception:
+                        _wc = None
+                    cand = [b for b in blobs if b["color"] == _wc] if _wc else []
+                    if cand:
+                        b0 = max(cand, key=lambda z: z["n_px"])
+                        _x, _y, _bw, _bh = b0["bbox"]
+                        r1 = int(_y + _bh)
+                        if r1 >= img_bgr.shape[0] - 2:
+                            i0 = int(round((-b0["bearing_deg"]) % 360.0 / beam_step)) % len(scan)
+                            seg = scan[max(0, i0 - 6):min(len(scan), i0 + 7)]
+                            seg = seg[np.isfinite(seg) & (seg < 12.0)]
+                            det_dist = float(seg.min()) if seg.size else None
+                        elif np.isfinite(b0["d_mono_m"]):
+                            det_dist = float(b0["d_mono_m"])
                 elif use_det:
                     dfeat = target_features(img, instr, lidar=scan,
                                             pose=st_in[:3], mode=det_mode)
@@ -210,6 +233,7 @@ def make_handler(policy, data, meta, dev, project, detector="real", config=None)
                 acts = np.clip(chunk[:k], ACT_MIN, ACT_MAX)
                 out = {"action": [float(acts[0, 0]), float(acts[0, 1])],
                        "actions": [[float(x[0]), float(x[1])] for x in acts],
+                       "det_dist": det_dist,
                        "latency_ms": round((time.time() - t0) * 1000, 1)}
                 # 每请求一行日志（远程排障用）：尺寸 / 耗时 / 目标检出
                 _hit = bool(use_det and dfeat is not None and float(dfeat[0]) > 0.5)
