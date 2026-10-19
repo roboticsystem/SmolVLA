@@ -40,7 +40,7 @@ from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Twist
 
 STATE_DIM = 32          # 与训练一致（max_state_dim）
-SERVER = "http://100.92.217.51:8000/infer"   # 服务器侧推理地址（推理机 GPU 服务器）
+SERVER = "http://10.252.18.70:8000/infer"   # 服务器侧推理地址（热点网段入口；若 NAT 只转发 22，见 README_Spark 隧道方案）
 TIMEOUT_S = 1.0         # 实测服务端 ~0.5 s/请求（4090），0.35 会全部超时进 degraded
 
 
