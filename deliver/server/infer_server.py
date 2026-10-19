@@ -109,7 +109,7 @@ class DataShim:
                 enc["attention_mask"].to(self.device).bool())
 
 
-def make_handler(policy, data, meta, dev, project):
+def make_handler(policy, data, meta, dev, project, detector="real", config=None):
     sys.path.insert(0, project)
     import torch
     from smolvla_finetune_sim import IMG_KEYS, STATE_KEY
@@ -118,8 +118,21 @@ def make_handler(policy, data, meta, dev, project):
     n_frames = int(meta["n_frames"] or 1)
     use_det = bool(meta["with_det"])
     det_mode = str(meta["det_features_mode"] or "none")
-    if use_det:
-        from sim.perception import target_features
+    real_det = False
+    if use_det and detector == "real":
+        # 真机口径感知：robot.yaml 标定 HSV refs → backfill_real 检测器
+        # （与训练真机帧 det_feat 的算法**完全相同**——仿真 detect() 的
+        # KD-tree 参考色是仿真渲染模型，真机相机图像不匹配，绝不能混用）。
+        from sim.perception import features_from_dets  # noqa: F401  (handler 内使用)
+        sys.path.insert(0, os.path.join(project, "scripts", "real"))
+        import backfill_real as RP
+        _refs, _tol, _ovr, _hfov, _cam_h, use_refs = RP.load_cfg(config)
+        print(f"[感知] 真机口径 detector=real：检测色={list(use_refs.keys())} "
+              f"tol={_tol} 覆盖={_ovr} hfov={_hfov} cam_h={_cam_h} "
+              f"（robot.yaml: {config}）")
+        real_det = True
+    elif use_det:
+        from sim.perception import target_features  # 仿真口径（仅评测用）
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *a):        # 静默逐请求日志
@@ -132,13 +145,31 @@ def make_handler(policy, data, meta, dev, project):
             try:
                 img = np.frombuffer(bytes.fromhex(req["image_bgr"]), np.uint8)
                 h, w = int(req["h"]), int(req["w"])
-                img = img.reshape(h, w, 3)[:, :, ::-1]          # BGR→RGB（训练口径）
+                img_bgr = img.reshape(h, w, 3)
+                img = img_bgr[:, :, ::-1]                       # BGR→RGB（训练口径）
                 scan = np.asarray(req["scan"], np.float32)
-                st_in = np.asarray(req["state"], np.float32)    # [x,y,θ,v,ω]
+                st_in = np.asarray(req["state"], np.float32)[:5]  # [x,y,θ,v,ω]
+                # 训练口径 state 是 5 维原始量（pad 到 max_state_dim 发生在归一化后），
+                # 客户端若按旧契约发 32 维也兼容（只取前 5 维）。
                 instr = str(req["instruction"])
 
-                # 感知特征（与训练同一函数、同一口径；目标 HSV 需已按真机标定）
-                if use_det:
+                # 感知特征：真机帧必须走 robot.yaml HSV 检测器（与训练 det_feat 同口径）
+                if use_det and real_det:
+                    beam_step = 360.0 / max(1, len(scan))
+
+                    def lidar_at(bdeg, _s=scan, _st=beam_step):
+                        i = int(round((-bdeg) % 360.0 / _st)) % len(_s)
+                        lo, hi = max(0, i - 1), min(len(_s), i + 2)
+                        seg = _s[lo:hi]
+                        seg = seg[np.isfinite(seg) & (seg < 12.0)]
+                        return float(seg.min()) if seg.size else float("nan")
+
+                    blobs = RP.detect_blobs_bboxes(img_bgr, use_refs, _tol, _ovr,
+                                                   _hfov, _cam_h)
+                    dets = RP.to_detections(blobs, lidar_beam_deg=lidar_at)
+                    dfeat = np.asarray(
+                        features_from_dets(dets, instr, mode=det_mode), np.float32)
+                elif use_det:
                     dfeat = target_features(img, instr, lidar=scan,
                                             pose=st_in[:3], mode=det_mode)
                     dfeat = np.asarray(dfeat, np.float32)
@@ -184,7 +215,14 @@ def main():
     ap.add_argument("--stats", default="../models/ft_detf/norm_stats.json")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument("--detector", default="real", choices=["real", "sim"],
+                    help="感知口径：real=robot.yaml HSV 检测（真机部署必须）；"
+                         "sim=仿真调色板检测（仅离线评测）")
+    ap.add_argument("--config", default=None,
+                    help="robot.yaml 路径（detector=real 时必读；默认 <project>/deliver_v1/config/robot.yaml）")
     a = ap.parse_args()
+    if a.config is None:
+        a.config = os.path.join(a.project, "deliver_v1", "config", "robot.yaml")
 
     here = os.path.dirname(os.path.abspath(__file__))
     a.ckpt = a.ckpt if os.path.isabs(a.ckpt) else os.path.normpath(os.path.join(here, a.ckpt))
@@ -195,7 +233,7 @@ def main():
     policy, meta = _load_model(a.project, a.ckpt, dev)
     data = DataShim(a.stats, int(meta["tokenizer_max_length"] or 200), dev)
     srv = ThreadingHTTPServer((a.host, a.port), make_handler(
-        policy, data, meta, dev, a.project))
+        policy, data, meta, dev, a.project, detector=a.detector, config=a.config))
     print(f"[服务] http://{a.host}:{a.port}/infer  设备={dev}")
     srv.serve_forever()
 
