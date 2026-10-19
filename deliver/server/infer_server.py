@@ -202,9 +202,14 @@ def make_handler(policy, data, meta, dev, project, detector="real", config=None)
                 out = {"action": [float(acts[0, 0]), float(acts[0, 1])],
                        "actions": [[float(x[0]), float(x[1])] for x in acts],
                        "latency_ms": round((time.time() - t0) * 1000, 1)}
+                # 每请求一行日志（远程排障用）：尺寸 / 耗时 / 目标检出
+                _hit = bool(use_det and dfeat is not None and float(dfeat[0]) > 0.5)
+                print(f"[req] {w}x{h} {out['latency_ms']}ms "
+                      f"det={'Y' if _hit else 'N'}", flush=True)
                 self.send_response(200)
             except Exception as e:                        # noqa: BLE001
                 out = {"error": f"{type(e).__name__}: {e}"}
+                print(f"[req] 异常 {type(e).__name__}: {e}", flush=True)
                 self.send_response(500)
             body = json.dumps(out).encode()
             self.send_header("Content-Type", "application/json")

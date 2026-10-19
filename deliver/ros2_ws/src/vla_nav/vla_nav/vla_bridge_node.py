@@ -82,8 +82,18 @@ class VLABridge(Node):
 
     # ---- 传感器回调：只缓存最新一帧 ----
     def _img(self, msg: Image):
-        self.last_img = np.frombuffer(msg.data, dtype=np.uint8).reshape(
+        img = np.frombuffer(msg.data, dtype=np.uint8).reshape(
             msg.height, msg.width, -1)[:, :, :3]
+        # 缩到训练分辨率 120×160 再上传：480×640 原始 hex ≈1.84MB/请求，
+        # 经热点+SSH 隧道就是 8s 级延迟的元凶；缩后 ≈57KB（32 倍缩减），
+        # 且与训练/评测口径完全一致。 SmolVLM 内部自会再做适配。
+        if img.shape[0] != 120 or img.shape[1] != 160:
+            try:
+                import cv2
+                img = cv2.resize(img, (160, 120), interpolation=cv2.INTER_AREA)
+            except ImportError:
+                pass                    # 无 cv2 则原样发送（慢，但能跑）
+        self.last_img = img
 
     def _scan(self, msg: LaserScan):
         n = len(msg.ranges)
