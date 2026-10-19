@@ -60,11 +60,22 @@ class VLABridge(Node):
         self.st_mean = np.array(self.get_parameter("st_mean").value, dtype=np.float32)
         self.st_std = np.array(self.get_parameter("st_std").value, dtype=np.float32)
         self.normalize_state = bool(self.get_parameter("normalize_state").value)
+        # 语音换目标：voice_node 发布 /vla/instruction 即时更新指令
+        # （std_msgs/String；只有 ok=True 的归一化指令才会被发布）
+        from std_msgs.msg import String as _Str
+        self.create_subscription(_Str, "/vla/instruction", self._voice_instr, 10)
         # chunk 批量执行（服务端每次推理返回前 K 步动作）：队列非空时 10Hz 逐步执行，
         # 取空才发起新请求——网络/推理压力降 K 倍，闭环期间请求频率 ~1Hz。
         self.declare_parameter("chunk_execute", True)
         self.chunk_execute = bool(self.get_parameter("chunk_execute").value)
         self.action_queue = []
+
+    def _voice_instr(self, msg):
+        if msg.data and msg.data != self.instr:
+            self.instr = msg.data
+            # 换目标后清空旧 chunk，避免用旧目标的动作继续走
+            self.action_queue = []
+            self.get_logger().info(f"[voice] 指令切换 → {self.instr!r}")
 
         self.last_img = None
         self.last_scan = None
