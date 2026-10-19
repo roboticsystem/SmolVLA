@@ -25,6 +25,8 @@ table{border-collapse:collapse;font-size:13px}td,th{border:1px solid #444;paddin
 任务层级 <select id="level"><option value="">混合 L1-L3</option>
 <option value="L1">L1 类别</option><option value="L2">L2 属性</option>
 <option value="L3">L3 空间关系</option></select>
+场景 <select id="scn"><option value="apartment" selected>三室两厅公寓（演示）</option>
+<option value="lab">标定实验场景（论文）</option></select>
 遮挡场景 <select id="scen" style="display:none"><option value="normal">normal 常规</option>
 <option value="short_occl">short_occl 短遮挡 1.6s</option>
 <option value="long_occl">long_occl 长遮挡 3.8s</option>
@@ -51,8 +53,8 @@ table{border-collapse:collapse;font-size:13px}td,th{border:1px solid #444;paddin
 let meta=null;
 async function post(u,d){const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d||{})});return r.json()}
 policy.onchange=()=>{scen.style.display=policy.value.startsWith('follow')?'':'none'};
-function start(){post('/api/start',{policy:policy.value,seed:+seed.value,level:level.value||null,scenario:scen.value})}
-function batch(){post('/api/batch',{policy:policy.value,n:+n.value,level:level.value||null})}
+function start(){post('/api/start',{policy:policy.value,seed:+seed.value,level:level.value||null,scenario:scen.value,scene:scn.value})}
+function batch(){post('/api/batch',{policy:policy.value,n:+n.value,level:level.value||null,scene:scn.value})}
 function stopB(){post('/api/stop')}
 // ---- 语音：浏览器录音(16k 单声道 WAV) → /api/voice → 自动用归一化指令启动 SmolVLA 回合 ----
 async function recWav(sec){
@@ -80,10 +82,31 @@ async function voice(){
  vstate.innerHTML='听到「'+r.text+'」→ 指令「'+r.instruction+'」 ('+r.latency_ms+'ms'+(r.note&&r.note!=='直通'?'，'+r.note:'')+')'+(r.ok?'':' <span class="bad">不可用</span>');
  if(r.ok){policy.value='vla';post('/api/start',{policy:'vla',seed:+seed.value,instruction:r.instruction})}}
 function sendText(){const t=saytext.value.trim();if(!t)return;vstate.textContent='指令「'+t+'」';
- post('/api/start',{policy:policy.value,seed:+seed.value,instruction:t,scenario:scen.value})}
+ post('/api/start',{policy:policy.value,seed:+seed.value,instruction:t,scenario:scen.value,scene:scn.value})}
+// ---- 精绘：房间地板/家具/房间名（公寓场景） ----
+const FURN={chair:['#cd6b5c','#9c463a'],table:['#b98a5a','#8a6236'],sofa:['#6e87c4','#4a5f96'],
+ bed:['#8fa3d9','#63779f'],shelf:['#8b7355','#644f38'],plant:['#5fa46b','#3f7a4a'],
+ box:['#c9a05a','#96703a'],tv:['#3a3a40','#1e1e26']};
+function rr(c,x,y,w,h,r){c.beginPath();c.moveTo(x+r,y);c.arcTo(x+w,y,x+w,y+h,r);c.arcTo(x+w,y+h,x,y+h,r);c.arcTo(x,y+h,x,y,r);c.arcTo(x,y,x+w,y,r);c.closePath()}
 function draw(s){const c=map.getContext('2d');c.fillStyle='#111';c.fillRect(0,0,640,480);
  if(!s.map_meta)return;const m=s.map_meta;
  if(mapImg.src!==s.map&&s.map){mapImg.onload=()=>{c.drawImage(mapImg,0,0,640,480)};mapImg.src=s.map}
+ c.drawImage(mapImg,0,0,640,480);
+ const X=x=>(x-m.b[0])/(m.b[1]-m.b[0])*640, Y=y=>480-(y-m.b[2])/(m.b[3]-m.b[2])*480;
+ // 家具精绘（圆角矩形 + 描边 + 高光），盖在底图色块上
+ for(const o of (m.objs||[])){const fc=FURN[o.cls];if(!fc)continue;
+  const w=2*o.half/(m.b[1]-m.b[0])*640,h=2*o.half/(m.b[3]-m.b[2])*480;
+  const px=X(o.xy[0])-w/2,py=Y(o.xy[1])-h/2,r=Math.min(5,w/3,h/3);
+  c.fillStyle=fc[0];rr(c,px,py,w,h,r);c.fill();
+  c.strokeStyle=fc[1];c.lineWidth=1.5;c.stroke();
+  c.fillStyle='rgba(255,255,255,.35)';rr(c,px+1.5,py+1.5,Math.max(1,w-3),Math.max(1,h*0.3),r*0.6);c.fill()}
+ // 房间名
+ c.font='bold 13px sans-serif';c.textAlign='center';c.textBaseline='middle';
+ for(const rm of (m.rooms||[])){const[gx0,gy0,gx1,gy1]=rm.rect;
+  const cx=X((gx0+gx1)/2),cy=Y((gy0+gy1)/2);
+  c.strokeStyle='rgba(0,0,0,.45)';c.lineWidth=3;c.strokeText(rm.name,cx,cy);
+  c.fillStyle='#5a5248';c.fillText(rm.name,cx,cy)}
+ c.textAlign='start';c.textBaseline='alphabetic';
  const X=x=>(x-m.b[0])/(m.b[1]-m.b[0])*640, Y=y=>480-(y-m.b[2])/(m.b[3]-m.b[2])*480;
  if(s.goal){c.fillStyle='#2f2';c.beginPath();c.arc(X(s.goal[0]),Y(s.goal[1]),7,0,7);c.fill();
   c.fillStyle='#fff';c.font='11px sans-serif';c.fillText('目标',X(s.goal[0])+9,Y(s.goal[1])-6)}

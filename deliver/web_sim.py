@@ -19,6 +19,7 @@ from sim.env import calibrated_env, navigate_metrics, grid_value
 from sim.baselines import (RandomPolicy, OraclePolicy, RandomTargetPolicy,
                            SweepDetectorPolicy)
 from sim.follow import (FollowEnv, OracleFollow, ReactiveFollow, FollowPolicyE4)
+from sim.world import segment_free
 
 LOCK = threading.Lock()
 HTML_FILE = "web_sim.html"
@@ -47,22 +48,32 @@ class Sim:
         self.target = None        # 跟随模式：被跟随者（红马甲）位置
         self.live = None          # 跟随模式：实时 距离/可见/带内
         self.fenv = None          # 跟随环境（懒创建，按 scenario 复用）
+        self.aenv = None          # 公寓场景导航环境（懒创建）
+        self.scene_name = "apartment"
         self.batch = {"running": False, "done": 0, "n": 0, "sr": None,
                       "spl": None, "ne": None, "rows": []}
         self.worker = None
         self._stop = False
 
-    def refresh_map(self):
+    def refresh_map(self, env=None):
         import cv2
-        rgb = self.env.scene.rgb
+        env = env or self.env
+        sc = env.scene
+        rgb = sc.rgb
         h, w = rgb.shape[:2]
-        scale = 460.0 / max(h, w)
-        small = cv2.resize(rgb, (int(w * scale), int(h * scale)))
+        scale = 640.0 / max(h, w)
+        small = cv2.resize(rgb, (int(w * scale), int(h * scale)),
+                           interpolation=cv2.INTER_NEAREST)
         ok, buf = cv2.imencode(".png", cv2.cvtColor(small, cv2.COLOR_RGB2BGR))
         self.map_png = base64.b64encode(buf.tobytes()).decode()
-        b = self.env.scene.bounds
+        b = sc.bounds
         self.map_meta = {"b": [float(b[0]), float(b[1]), float(b[2]), float(b[3])],
-                         "w": int(small.shape[1]), "h": int(small.shape[0])}
+                         "w": int(small.shape[1]), "h": int(small.shape[0]),
+                         "rooms": [{"name": n, "rect": [float(v) for v in rect]}
+                                   for n, rect in getattr(sc, "room_names", [])],
+                         "objs": [{"cls": o.cls, "color": o.color,
+                                   "xy": [float(o.xy[0]), float(o.xy[1])],
+                                   "half": float(o.half)} for o in sc.objects]}
 
     def snapshot(self):
         import cv2
@@ -132,7 +143,92 @@ class VLAPolicy:
         return np.asarray(acts[0], np.float64)
 
 
-def make_policy(name):
+class FieldFollower:
+    """**公寓场景专用**的测地场跟随器（demo 用，不影响论文基线）。
+
+    为什么不用 `OraclePolicy`：它是在 8×6 m **单房间**标定场景（无墙无门）上
+    调出来的 —— 避障减速 + 前瞻窗口的组合在门洞两侧墙角会陷入
+    「贴墙 → 前方光束 <0.2 m → v=0 → 脱困自旋 → 又贴墙」的死循环
+    （公寓 15 个跨房间目标实测 12 个失败）。而论文的 oracle 数据必须
+    保持原实现，所以这里另写一个纯场梯度跟随器：
+
+    - 每步在机器人周边 ±0.4 m 窗口找**测地场最小**的自由格作为临时瞄准点；
+    - 角度差直接比例转向、无避障接管（场路径本身在膨胀栅格上，天然无碰撞）；
+    - 卡住时窗口里总有更小的场值（场只会经门洞传播），因而无局部极小。
+    """
+
+    name = "field"
+
+    def __init__(self, k_ang=3.0, win=14):
+        self.k_ang = float(k_ang)
+        self.win = int(win)
+        self._f = None
+        self._g = None
+
+    def reset(self, env=None):
+        self._f = None
+        self._g = None
+
+    def act(self, obs, env):
+        goal = np.asarray(env.task["goal"], dtype=float)
+        if self._f is None or self._g is None or not np.allclose(goal, self._g):
+            self._f = env._shortest_path_len(goal)
+            self._g = goal.copy()
+        f = self._f
+        H, W = f.shape
+        r, c = env.scene.w2c(env.pose[:2])
+        r, c = int(r), int(c)
+        # 候选格按「场值 + 距离惩罚」排序，取第一个**直线可达**的
+        # （纯取窗口最小会切家具角：目标格自由但连线穿角 → 顶死）
+        cand = []
+        for dr in range(-self.win, self.win + 1):
+            for dc in range(-self.win, self.win + 1):
+                rr, cc = r + dr, c + dc
+                if 0 <= rr < H and 0 <= cc < W and f[rr, cc] >= 0:
+                    v = float(f[rr, cc]) + 0.15 * np.hypot(dr, dc) * CELL_C
+                    cand.append((v, rr, cc))
+        if not cand:
+            return np.array([0.0, 0.5])
+        # 末段直取：贴近目标且视线可达时直接瞄准目标中心
+        # （成功由 env 的「包围盒表面距离 ≤0.30 m」判据触发，无需精确停靠）
+        if env.d_surf == env.d_surf and env.d_surf < 0.9 and \
+                segment_free(env.scene, env.pose[:2], goal, 0.11):
+            ang = float(np.arctan2(goal[1] - env.pose[1],
+                                   goal[0] - env.pose[0]) - env.pose[2])
+            ang = (ang + np.pi) % (2 * np.pi) - np.pi
+            v = env.cfg["v_max"] * float(np.clip(1.0 - abs(ang) / np.pi * 1.4,
+                                                 0.2, 1.0))
+            w = float(np.clip(self.k_ang * ang,
+                              -env.cfg["w_max"], env.cfg["w_max"]))
+            return np.array([v, w])
+        cand.sort()
+        tgt = None
+        for _, rr, cc in cand:          # 全量扫描：前 N 个可能全被墙角挡住
+            p = env.scene.c2w((rr, cc))
+            if segment_free(env.scene, env.pose[:2], p, 0.11):
+                tgt = p
+                break
+        if tgt is None:
+            return np.array([0.0, 0.6])
+        ang = float(np.arctan2(tgt[1] - env.pose[1], tgt[0] - env.pose[0])
+                    - env.pose[2])
+        ang = (ang + np.pi) % (2 * np.pi) - np.pi
+        # 大角度先原地转向（边走边转会在墙角来回顶）
+        if abs(ang) > 1.0:
+            return np.array([0.0, float(np.clip(self.k_ang * ang,
+                                                -env.cfg["w_max"], env.cfg["w_max"]))])
+        v = env.cfg["v_max"] * float(np.clip(1.0 - abs(ang) / np.pi * 1.4, 0.2, 1.0))
+        w = float(np.clip(self.k_ang * ang, -env.cfg["w_max"], env.cfg["w_max"]))
+        d = float(np.linalg.norm(goal - env.pose[:2]))
+        if d < 0.9:
+            v *= max(0.3, d / 0.9)
+        return np.array([v, w])
+
+
+CELL_C = 0.05          # 与 sim.world.CELL 一致（独立常量，避免循环导入）
+
+
+def make_policy(name, env=None):
     if name == "follow_reactive":
         return ReactiveFollow()
     if name == "follow_oracle":
@@ -140,6 +236,9 @@ def make_policy(name):
     if name == "follow_e4":
         return FollowPolicyE4(use_kalman=True, use_depth=True,
                               use_gamma=True, use_enhance=True)
+    if name == "oracle" and env is not None and \
+            getattr(env.scene, "name", "") == "apartment":
+        return FieldFollower()      # 公寓场景换专用跟随器（见类注释）
     return {"oracle": OraclePolicy, "sweep": SweepDetectorPolicy,
             "random_target": RandomTargetPolicy, "random": RandomPolicy,
             "vla": VLAPolicy}[name]()
@@ -167,31 +266,40 @@ def apply_instruction(env, instr):
     return False
 
 
-def _pick_env(sim, policy_name, scenario):
-    """按策略选择环境：follow_* 用跟随环境（按 scenario 懒创建/复用）。"""
+def _pick_env(sim, policy_name, scenario, scene_name=None):
+    """按策略与场景选择环境（导航/跟随 × 标定实验场景/公寓，均懒创建复用）。"""
+    scene_name = scene_name or "lab"
     if policy_name.startswith("follow"):
         sc = scenario or "normal"
-        if sim.fenv is None or sim.fenv.scenario != sc:
+        key = (sc, scene_name)
+        if sim.fenv is None or getattr(sim.fenv, "_key", None) != key:
             sim.fenv = FollowEnv(seed=0, max_steps=300, scenario=sc,
-                                 camera_augment=0.25)
+                                 camera_augment=0.25,
+                                 layout=scene_name if scene_name != "lab" else None)
+            sim.fenv._key = key
         return sim.fenv
+    if scene_name == "apartment":
+        if sim.aenv is None:
+            # 公寓 11.4×8.6 m 远大于 8×6 标定场景，路径更长 → 步数上限放宽
+            sim.aenv = calibrated_env(layout="apartment", max_steps=350)
+        return sim.aenv
     return sim.env
 
 
 def run_episode(sim, policy_name, seed, level, collect_only=False,
-                instruction=None, scenario=None):
-    env = _pick_env(sim, policy_name, scenario)
+                instruction=None, scenario=None, scene_name=None):
+    env = _pick_env(sim, policy_name, scenario, scene_name)
     follow = policy_name.startswith("follow")
     obs = env.reset(seed=seed)
-    pol = make_policy(policy_name)
+    pol = make_policy(policy_name, env=env)
     pol.reset(env=env)
     if instruction and not follow:
         if not apply_instruction(env, instruction):
             raise RuntimeError("指令「%s」在当前场景中无对应目标"
-                               "（试试：去红色的植物旁边 / 去椅子旁边）" % instruction)
+                               "（试试：去白色的箱子旁边 / 去沙发旁边）" % instruction)
     steps = 0
     if not collect_only:
-        sim.refresh_map()
+        sim.refresh_map(env)
     info = None
     while True:
         a = pol.act(obs, env)
@@ -240,15 +348,17 @@ def run_episode(sim, policy_name, seed, level, collect_only=False,
                 "instruction": "跟随红马甲行人", "level": "follow"}
     m = navigate_metrics(info)
     return {"success": float(m["SR"]), "spl": float(m["SPL"]), "ne": float(m["NE"]),
-            "steps": steps, "min_dist": float(sim.env.min_dist),
-            "instruction": sim.env.task["instruction"],
-            "level": str(sim.env.task.get("level", "-"))}
+            "steps": steps, "min_dist": float(env.min_dist),
+            "instruction": env.task["instruction"],
+            "level": str(env.task.get("level", "-"))}
 
 
-def worker_single(sim, policy_name, seed, level, instruction=None, scenario=None):
+def worker_single(sim, policy_name, seed, level, instruction=None, scenario=None,
+                  scene_name=None):
     try:
         res = run_episode(sim, policy_name, seed, level,
-                          instruction=instruction, scenario=scenario)
+                          instruction=instruction, scenario=scenario,
+                          scene_name=scene_name)
         with LOCK:
             sim.result = res
             sim.done = True
@@ -259,14 +369,14 @@ def worker_single(sim, policy_name, seed, level, instruction=None, scenario=None
             sim.result = {"error": "%s: %s" % (type(e).__name__, e)}
 
 
-def worker_batch(sim, policy_name, n, level):
+def worker_batch(sim, policy_name, n, level, scene_name=None):
     rows = []
     try:
         for ep in range(n):
             if sim._stop:
                 break
             res = run_episode(sim, policy_name, 9000 + ep * 37, level,
-                              collect_only=True)
+                              collect_only=True, scene_name=scene_name)
             rows.append(res)
             with LOCK:
                 sim.batch["done"] = ep + 1
@@ -336,7 +446,8 @@ class Handler(BaseHTTPRequestHandler):
                 SIM.worker = threading.Thread(
                     target=worker_single,
                     args=(SIM, SIM.policy_name, SIM.seed, SIM.level,
-                          req.get("instruction"), req.get("scenario")),
+                          req.get("instruction"), req.get("scenario"),
+                          req.get("scene")),
                     daemon=True)
                 SIM.worker.start()
             self._json({"ok": True})
@@ -353,7 +464,8 @@ class Handler(BaseHTTPRequestHandler):
                 SIM.worker = threading.Thread(
                     target=worker_batch,
                     args=(SIM, req.get("policy", "oracle"),
-                          int(req.get("n", 20)), req.get("level")), daemon=True)
+                          int(req.get("n", 20)), req.get("level"),
+                          req.get("scene")), daemon=True)
                 SIM.worker.start()
             self._json({"ok": True})
         elif self.path == "/api/voice":

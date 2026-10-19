@@ -54,7 +54,7 @@ class SemanticNavEnv:
                  reward_shaping=1.0, collide_penalty=0.05,
                  task_level=None, goal_image=False, n_instr_per_episode=1,
                  room_w=3.6, room_h=3.4, n_objects_per_room=(1, 3),
-                 success_standoff=0.30):
+                 success_standoff=0.30, layout=None):
         self.seed = seed
         self.cfg = dict(nx=nx, ny=ny, n_peds=n_peds, max_steps=max_steps, dt=dt,
                         obs_size=obs_size, lidar_beams=lidar_beams,
@@ -66,7 +66,7 @@ class SemanticNavEnv:
                         n_instr_per_episode=n_instr_per_episode,
                         room_w=room_w, room_h=room_h,
                         n_objects_per_room=n_objects_per_room,
-                        success_standoff=success_standoff)
+                        success_standoff=success_standoff, layout=layout)
         self.rng = np.random.default_rng(seed)
         self._ep = 0
         self.scene = None
@@ -84,7 +84,8 @@ class SemanticNavEnv:
         self.rng = np.random.default_rng(int(seed))
         self.scene = make_scene(seed=int(seed), nx=self.cfg["nx"], ny=self.cfg["ny"],
                                 room_w=self.cfg["room_w"], room_h=self.cfg["room_h"],
-                                n_objects_per_room=tuple(self.cfg["n_objects_per_room"]))
+                                n_objects_per_room=tuple(self.cfg["n_objects_per_room"]),
+                                layout=self.cfg.get("layout"))
         self.peds = make_pedestrians(self.scene, self.cfg["n_peds"], seed=int(seed))
         # 规划用栅格：把障碍按机器人半径膨胀，使测地路径天然保持安全间距。
         # 若直接用原栅格，最优路径会贴着墙/家具，任何控制器都会频繁碰撞

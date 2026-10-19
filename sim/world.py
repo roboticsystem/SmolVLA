@@ -150,8 +150,14 @@ def _layout(nx: int, ny: int, room_w: float, room_h: float, wall: float, seed: i
 
 def make_scene(seed: int = 0, nx: int = 3, ny: int = 2, room_w: float = 3.6,
                room_h: float = 3.4, wall: float = 0.18, n_objects_per_room=(1, 3),
-               pad_objects: bool = True) -> Scene:
-    """程序化生成一个语义 MultiRoom 场景（确定性）。"""
+               pad_objects: bool = True, layout: str | None = None) -> Scene:
+    """程序化生成一个语义 MultiRoom 场景（确定性）。
+
+    `layout="apartment"` 时返回固定的「三室两厅」户型（演示用），
+    其余参数被忽略；默认 None 保持原有随机 MultiRoom（论文实验用）。
+    """
+    if layout == "apartment":
+        return make_apartment_scene(seed)
     rng = np.random.default_rng(seed)
     rooms, (xmin, xmax, ymin, ymax) = _layout(nx, ny, room_w, room_h, wall, seed)
 
@@ -243,6 +249,109 @@ def make_scene(seed: int = 0, nx: int = 3, ny: int = 2, room_w: float = 3.6,
             break
     scene._door_cells = door_cells
     scene._room_of_obj = room_of_obj
+    return scene
+
+
+# ---------------------------------------------------------------- 三室两厅公寓（演示场景）
+# 固定户型：客厅 + 餐厅（两厅）、主卧 + 次卧 + 书房（三室）、厨房 + 卫生间 + 走廊。
+# 与 E1 实验场景**同物理/传感器/指令体系**（差速底盘、激光、L1-L3 指令、SPL 口径），
+# 仅布局固定且家具摆放贴近真实住宅 —— 供网页演示与跟随拍摄任务使用；
+# 论文实验一律用默认随机 MultiRoom（`layout=None`），两套场景互不影响。
+# 家具颜色刻意**避开红色**：红色保留给跟随任务的「红马甲」（场景唯一前提）。
+_APARTMENT_ROOMS = [
+    ("客厅", (0.18, 0.18, 5.00, 3.82)),
+    ("餐厅", (5.18, 0.18, 8.00, 3.82)),
+    ("厨房", (8.18, 0.18, 11.22, 3.82)),
+    ("走廊", (0.18, 4.00, 11.22, 4.90)),
+    ("主卧", (0.18, 5.08, 3.60, 8.42)),
+    ("次卧", (3.78, 5.08, 7.00, 8.42)),
+    ("书房", (7.18, 5.08, 9.60, 8.42)),
+    ("卫生间", (9.78, 5.08, 11.22, 8.42)),
+]
+_APARTMENT_FLOORS = {
+    "客厅": (232, 219, 190), "餐厅": (232, 219, 190),          # 木地板
+    "厨房": (213, 226, 233), "卫生间": (213, 226, 233),        # 瓷砖
+    "走廊": (226, 226, 220),
+    "主卧": (235, 222, 224), "次卧": (222, 230, 240), "书房": (224, 233, 222),
+}
+# 门洞 (x0, y0, x1, y1)，内门统一 1.2 m（0.9 m 时 oracle 前瞻+避障会在门口墙角卡死）
+_APARTMENT_DOORS = [
+    (5.00, 1.30, 5.18, 2.70),      # 客厅 ↔ 餐厅（宽开口 1.4 m）
+    (8.00, 1.30, 8.18, 2.50),      # 餐厅 ↔ 厨房
+    (2.20, 3.82, 3.40, 4.00),      # 客厅 ↔ 走廊（宽开口 1.2 m）
+    (6.10, 3.82, 7.30, 4.00),      # 餐厅 ↔ 走廊
+    (9.20, 3.82, 10.40, 4.00),     # 厨房 ↔ 走廊
+    (1.20, 4.90, 2.40, 5.08),      # 主卧 ↔ 走廊
+    (4.90, 4.90, 6.10, 5.08),      # 次卧 ↔ 走廊
+    (7.70, 4.90, 8.90, 5.08),      # 书房 ↔ 走廊
+    (9.90, 4.90, 11.10, 5.08),     # 卫生间 ↔ 走廊
+]
+# (cls, color, x, y, half)。指令可达性：L1 唯一类 = 沙发/电视/箱子；
+# L2 唯一「颜色+类」组合覆盖床/桌/椅/架/植物等（见 _all_phrasings 的唯一性校验）。
+_APARTMENT_FURNITURE = [
+    ("sofa",  "blue",  1.10, 2.90, 0.55),   # 客厅沙发
+    ("tv",    "black", 4.60, 3.30, 0.18),   # 电视柜（北墙侧，西侧 approached 开阔）
+    ("table", "white", 3.60, 2.30, 0.40),   # 茶几（避开出生点→走廊门洞的直线路径）
+    ("plant", "green", 0.70, 0.80, 0.22),   # 客厅绿植
+    ("table", "yellow", 6.40, 1.90, 0.45),  # 餐桌
+    ("chair", "green", 7.55, 0.75, 0.22),   # 餐椅（四周留 0.5m+ 站位，勿夹缝）
+    ("chair", "green", 5.60, 3.30, 0.22),   # 餐椅
+    ("shelf", "blue", 10.70, 1.00, 0.25),   # 橱柜
+    ("box",   "white", 9.00, 1.00, 0.25),   # 纸箱（L1「去箱子旁边」→ 与真机指令对齐）
+    ("bed",   "white", 1.60, 7.10, 0.75),   # 主卧床
+    ("shelf", "yellow", 2.90, 5.70, 0.25),  # 衣柜
+    ("plant", "yellow", 0.80, 5.70, 0.22),  # 主卧植物
+    ("bed",   "blue",  5.30, 7.10, 0.75),   # 次卧床
+    ("shelf", "black", 8.90, 7.60, 0.25),   # 书房书架
+    ("chair", "blue",  7.60, 5.70, 0.22),   # 书房椅（避开门口动线）
+]
+_APARTMENT_SPAWN = (2.60, 1.00)             # 客厅（玄关侧），面向沙发/电视
+
+
+def make_apartment_scene(seed: int = 0) -> Scene:
+    """固定「三室两厅」户型场景（确定性，`seed` 仅保持接口兼容）。"""
+    del seed
+    xmin, ymin, xmax, ymax = 0.0, 0.0, 11.4, 8.6
+    Wg = int(np.ceil((xmax - xmin) / CELL))
+    Hg = int(np.ceil((ymax - ymin) / CELL))
+    sem = np.full((Hg, Wg), WALL, dtype=np.uint8)
+    rgb = np.zeros((Hg, Wg, 3), dtype=np.uint8)
+    rgb[:] = np.array(SEMANTICS[WALL][1], dtype=np.uint8)
+
+    def carve(x0, y0, x1, y1, val=FREE, rgbv=None):
+        c0 = int(np.floor((x0 - xmin) / CELL)); c1 = int(np.ceil((x1 - xmin) / CELL))
+        r0 = int(np.floor((y0 - ymin) / CELL)); r1 = int(np.ceil((y1 - ymin) / CELL))
+        r0, r1 = max(0, r0), min(Hg, r1); c0, c1 = max(0, c0), min(Wg, c1)
+        sem[r0:r1, c0:c1] = val
+        rgb[r0:r1, c0:c1] = np.array(
+            rgbv if rgbv is not None else SEMANTICS[val][1], dtype=np.uint8)
+
+    for name, (x0, y0, x1, y1) in _APARTMENT_ROOMS:
+        carve(x0, y0, x1, y1, FREE, _APARTMENT_FLOORS[name])
+    for d in _APARTMENT_DOORS:
+        carve(*d, DOOR, (201, 160, 99))
+
+    objects = [Obj(cls, color, (x, y), half)
+               for cls, color, x, y, half in _APARTMENT_FURNITURE]
+    rooms = [rect for _, rect in _APARTMENT_ROOMS]
+    scene = Scene(sem, rgb, objects, np.array(_APARTMENT_SPAWN), np.pi / 2.0,
+                  rooms, (xmin, xmax, ymin, ymax), name="apartment")
+
+    # 家具画进栅格（语义 + 颜色 + 深色描边增强俯视观感）
+    dark = (60, 56, 52)
+    for o in objects:
+        r0, c0, r1, c1 = scene.cell_bbox(o.xy, o.half)
+        scene.sem[r0:r1, c0:c1] = o.cls_id
+        scene.rgb[r0:r1, c0:c1] = o.rgb
+        scene.rgb[r0, c0:c1] = dark; scene.rgb[r1 - 1, c0:c1] = dark
+        scene.rgb[r0:r1, c0] = dark; scene.rgb[r0:r1, c1 - 1] = dark
+    scene.wall_grid = (scene.sem == WALL)
+    scene.occ = (scene.sem == WALL)
+    for o in objects:
+        scene._stamp_occ(o)
+    scene._door_cells = []
+    scene._room_of_obj = {}
+    scene.room_names = list(_APARTMENT_ROOMS)     # 前端房间名标注用
     return scene
 
 
