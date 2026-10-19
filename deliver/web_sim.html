@@ -18,15 +18,28 @@ table{border-collapse:collapse;font-size:13px}td,th{border:1px solid #444;paddin
 <option value="sweep" selected>sweep 扫描检测（论文基线）</option>
 <option value="random_target">random_target 随机游走（下界）</option>
 <option value="random">random 纯随机</option>
-<option value="vla">SmolVLA 真模型（需推理服务:8000）</option></select>
+<option value="vla">SmolVLA 真模型（需推理服务:8000）</option>
+<option value="follow_reactive">跟随 reactive（E11 · 与真机同口径）</option>
+<option value="follow_e4">跟随 reactive + E4 增强（卡尔曼/深度融合）</option>
+<option value="follow_oracle">跟随 oracle（真值上界）</option></select>
 任务层级 <select id="level"><option value="">混合 L1-L3</option>
 <option value="L1">L1 类别</option><option value="L2">L2 属性</option>
 <option value="L3">L3 空间关系</option></select>
+遮挡场景 <select id="scen" style="display:none"><option value="normal">normal 常规</option>
+<option value="short_occl">short_occl 短遮挡 1.6s</option>
+<option value="long_occl">long_occl 长遮挡 3.8s</option>
+<option value="light_shift">light_shift 光照突变</option>
+<option value="narrow">narrow 窄道穿行</option>
+<option value="dim">dim 弱光</option><option value="backlight">backlight 逆光</option></select>
 起始种子 <input id="seed" type="number" value="9000" style="width:90px">
 <button onclick="start()">▶ 单回合演示</button>
 回合数 <input id="n" type="number" value="20" style="width:70px">
 <button onclick="batch()">📊 批量评测</button>
 <button onclick="stopB()">⏹ 停止</button>
+<div style="margin-top:8px">
+<button onclick="voice()" style="background:#7a3030">🎤 语音指令（录音 4s）</button>
+<input id="saytext" placeholder="或手动输入指令：去红色的植物旁边 / 去椅子旁边" style="width:300px">
+<button onclick="sendText()">发送</button> <span id="vstate"></span></div>
 </div>
 <div class="row">
 <div class="panel"><b>俯视地图</b><br><canvas id="map" width="640" height="480"></canvas></div>
@@ -37,15 +50,45 @@ table{border-collapse:collapse;font-size:13px}td,th{border:1px solid #444;paddin
 <script>
 let meta=null;
 async function post(u,d){const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d||{})});return r.json()}
-function start(){post('/api/start',{policy:policy.value,seed:+seed.value,level:level.value||null})}
+policy.onchange=()=>{scen.style.display=policy.value.startsWith('follow')?'':'none'};
+function start(){post('/api/start',{policy:policy.value,seed:+seed.value,level:level.value||null,scenario:scen.value})}
 function batch(){post('/api/batch',{policy:policy.value,n:+n.value,level:level.value||null})}
 function stopB(){post('/api/stop')}
+// ---- 语音：浏览器录音(16k 单声道 WAV) → /api/voice → 自动用归一化指令启动 SmolVLA 回合 ----
+async function recWav(sec){
+ const stream=await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:true,noiseSuppression:true}});
+ const ac=new AudioContext({sampleRate:16000});await ac.resume();
+ const src=ac.createMediaStreamSource(stream),proc=ac.createScriptProcessor(4096,1,1),buf=[];
+ proc.onaudioprocess=e=>{buf.push(new Float32Array(e.inputBuffer.getChannelData(0)))};
+ src.connect(proc);proc.connect(ac.destination);
+ await new Promise(r=>setTimeout(r,sec*1000));
+ proc.disconnect();src.disconnect();stream.getTracks().forEach(t=>t.stop());ac.close();
+ let n=0;buf.forEach(b=>n+=b.length);const pcm=new Float32Array(n);let o=0;buf.forEach(b=>{pcm.set(b,o);o+=b.length});
+ const sr=ac.sampleRate,len=pcm.length,bw=new ArrayBuffer(44+len*2),v=new DataView(bw);
+ const ws=(i,s)=>{for(let j=0;j<s.length;j++)v.setUint8(i+j,s.charCodeAt(j))};
+ ws(0,'RIFF');v.setUint32(4,36+len*2,true);ws(8,'WAVE');ws(12,'fmt ');v.setUint32(16,16,true);
+ v.setUint16(20,1,true);v.setUint16(22,1,true);v.setUint32(24,sr,true);v.setUint32(28,sr*2,true);
+ v.setUint16(32,2,true);v.setUint16(34,16,true);ws(36,'data');v.setUint32(40,len*2,true);
+ for(let i=0;i<len;i++){const s=Math.max(-1,Math.min(1,pcm[i]));v.setInt16(44+i*2,s<0?s*0x8000:s*0x7FFF,true)}
+ const u8=new Uint8Array(bw);let s2='';for(let i=0;i<u8.length;i+=8192)s2+=String.fromCharCode.apply(null,u8.subarray(i,i+8192));
+ return btoa(s2);}
+async function voice(){
+ vstate.textContent='🎤 录音中(4s)，请说指令…';
+ try{var b64=await recWav(4)}catch(e){vstate.innerHTML='<span class="bad">麦克风不可用：需 localhost 或 HTTPS（SSH 隧道 -L 8020 后访问 http://localhost:8020）。可用手动输入。</span>';return}
+ vstate.textContent='识别中…';const r=await post('/api/voice',{wav_b64:b64});
+ if(r.error){vstate.innerHTML='<span class="bad">'+r.error+'</span>';return}
+ vstate.innerHTML='听到「'+r.text+'」→ 指令「'+r.instruction+'」 ('+r.latency_ms+'ms'+(r.note&&r.note!=='直通'?'，'+r.note:'')+')'+(r.ok?'':' <span class="bad">不可用</span>');
+ if(r.ok){policy.value='vla';post('/api/start',{policy:'vla',seed:+seed.value,instruction:r.instruction})}}
+function sendText(){const t=saytext.value.trim();if(!t)return;vstate.textContent='指令「'+t+'」';
+ post('/api/start',{policy:policy.value,seed:+seed.value,instruction:t,scenario:scen.value})}
 function draw(s){const c=map.getContext('2d');c.fillStyle='#111';c.fillRect(0,0,640,480);
  if(!s.map_meta)return;const m=s.map_meta;
  if(mapImg.src!==s.map&&s.map){mapImg.onload=()=>{c.drawImage(mapImg,0,0,640,480)};mapImg.src=s.map}
  const X=x=>(x-m.b[0])/(m.b[1]-m.b[0])*640, Y=y=>480-(y-m.b[2])/(m.b[3]-m.b[2])*480;
  if(s.goal){c.fillStyle='#2f2';c.beginPath();c.arc(X(s.goal[0]),Y(s.goal[1]),7,0,7);c.fill();
   c.fillStyle='#fff';c.font='11px sans-serif';c.fillText('目标',X(s.goal[0])+9,Y(s.goal[1])-6)}
+ if(s.target){c.fillStyle='#f44';c.beginPath();c.arc(X(s.target[0]),Y(s.target[1]),9,0,7);c.fill();
+  c.fillStyle='#fff';c.font='bold 11px sans-serif';c.fillText('人',X(s.target[0])+11,Y(s.target[1])+4)}
  c.strokeStyle='#f9933b';c.lineWidth=1;
  for(const p of s.lidar){c.beginPath();c.moveTo(X(s.pose[0]),Y(s.pose[1]));c.lineTo(X(p[0]),Y(p[1]));c.stroke()}
  if(s.traj.length>1){c.strokeStyle='#4af';c.lineWidth=2;c.beginPath();
@@ -56,8 +99,15 @@ async function loop(){try{const s=await(await fetch('/api/state')).json();draw(s
  if(s.image)cam.src='data:image/jpeg;base64,'+s.image;
  const r=s.result;let st='指令: '+(s.instruction||'—')+'<br>层级: '+s.level+' | 步数: '+s.step+
   ' | 策略: '+s.policy+' | seed: '+s.seed;
+ if(s.live)st+='<br>跟随实时: 距离 '+s.live.dist.toFixed(2)+' m | '+
+  (s.live.visible?'<span class="ok">可见</span>':'<span class="bad">丢失(扫描中)</span>')+' | '+
+  (s.live.in_band?'<span class="ok">带内 [0.9, 2.6]</span>':'<span class="bad">带外</span>');
  if(s.mode==='running')st+='<br><span class="big" style="color:#4af">▶ 运行中…</span>';
- if(s.mode==='done'&&r)st+='<br>'+(r.success?'<span class="ok big">✔ 成功到达</span>':
+ if(s.mode==='done'&&r&&r.follow)st+='<br>'+(r.success?'<span class="ok big">✔ 跟随完成</span>':
+  '<span class="bad big">✘ 跟随欠佳</span>')+'<br>TCR: '+r.TCR+'% | 距离误差: '+r.err_mean+
+  '±'+r.err_std+' m<br>可见率: '+r.vis_rate+'% | 丢失: '+r.n_loss+' 次 | 恢复中位: '+
+  r.rec_ms_median+' ms | 碰撞: '+r.n_collide;
+ if(s.mode==='done'&&r&&!r.follow)st+='<br>'+(r.success?'<span class="ok big">✔ 成功到达</span>':
   '<span class="bad big">✘ 未成功</span>')+'<br>剩余距离 NE: '+r.ne.toFixed(2)+
   ' m | SPL: '+r.spl.toFixed(3)+' | 全程最小距离: '+r.min_dist.toFixed(2)+' m';
  if(s.mode==='error')st+='<br><span class="bad">错误: '+(r&&r.error||'')+'</span>';
@@ -66,7 +116,7 @@ async function loop(){try{const s=await(await fetch('/api/state')).json();draw(s
   s.batch.spl+' | NE '+s.batch.ne+' m';
  if(s.batch.rows&&s.batch.rows.length){b+='<table><tr><th>#</th><th>指令</th><th>SR</th><th>NE</th></tr>'+
   s.batch.rows.map((r,i)=>'<tr><td>'+(s.batch.done-s.batch.rows.length+i+1)+'</td><td>'+r.instruction+
-  '</td><td>'+(r.success?'✔':'✘')+'</td><td>'+r.ne.toFixed(2)+'</td></tr>').join('')+'</table>'}
+  '</td><td>'+(r.success?'✔':'✘')+'</td><td>'+(r.ne!=null?r.ne.toFixed(2):('TCR '+r.TCR+'%'))+'</td></tr>').join('')+'</table>'}
  batch.innerHTML=b}catch(e){}setTimeout(loop,120)}
 const mapImg=new Image();
 loop();

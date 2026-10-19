@@ -40,6 +40,7 @@ import numpy as np
 COLOR_MAP = {
     "红色": "red", "红": "red", "蓝色": "blue", "蓝": "blue",
     "绿色": "green", "绿": "green", "黄色": "yellow", "黄": "yellow",
+    "白色": "white", "白": "white", "黑色": "black", "黑": "black",
     "紫色": "purple", "紫": "purple", "橙色": "orange", "橙": "orange",
     "橘色": "orange", "橘": "orange",
     # Whisper 偶发输出繁体（如"紅色"），一并映射

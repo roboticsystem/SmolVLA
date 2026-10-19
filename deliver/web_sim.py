@@ -15,9 +15,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import numpy as np
 
-from sim.env import calibrated_env, navigate_metrics
+from sim.env import calibrated_env, navigate_metrics, grid_value
 from sim.baselines import (RandomPolicy, OraclePolicy, RandomTargetPolicy,
                            SweepDetectorPolicy)
+from sim.follow import (FollowEnv, OracleFollow, ReactiveFollow, FollowPolicyE4)
 
 LOCK = threading.Lock()
 HTML_FILE = "web_sim.html"
@@ -43,6 +44,9 @@ class Sim:
         self.map_meta = None
         self.img_b64 = None
         self.lidar_pts = []
+        self.target = None        # 跟随模式：被跟随者（红马甲）位置
+        self.live = None          # 跟随模式：实时 距离/可见/带内
+        self.fenv = None          # 跟随环境（懒创建，按 scenario 复用）
         self.batch = {"running": False, "done": 0, "n": 0, "sr": None,
                       "spl": None, "ne": None, "rows": []}
         self.worker = None
@@ -84,6 +88,7 @@ class Sim:
                 "level": self.level_str, "pose": self.pose, "traj": traj,
                 "goal": self.goal, "lidar": lidar, "image": self.img_b64,
                 "map": self.map_png, "map_meta": self.map_meta,
+                "target": self.target, "live": self.live,
                 "done": self.done, "result": self.result, "batch": self.batch}
 
 
@@ -128,40 +133,111 @@ class VLAPolicy:
 
 
 def make_policy(name):
+    if name == "follow_reactive":
+        return ReactiveFollow()
+    if name == "follow_oracle":
+        return OracleFollow()
+    if name == "follow_e4":
+        return FollowPolicyE4(use_kalman=True, use_depth=True,
+                              use_gamma=True, use_enhance=True)
     return {"oracle": OraclePolicy, "sweep": SweepDetectorPolicy,
             "random_target": RandomTargetPolicy, "random": RandomPolicy,
             "vla": VLAPolicy}[name]()
 
 
-def run_episode(sim, policy_name, seed, level, collect_only=False):
-    obs = sim.env.reset(seed=seed, level=level)
+def apply_instruction(env, instr):
+    """把（语音归一化后的）指令落到当前场景：匹配场景中唯一指代表述并替换任务。
+
+    与 voice_server 的归一化句式（去{color}的{cls}旁边 / 去{cls}旁边）逐字对齐
+    `env._all_phrasings` 的产出；找不到则报错，让用户换说法或换场景。
+    """
+    instr = str(instr).strip()
+    for oi, obj in enumerate(env.scene.objects):
+        for lvl, text, ref in env._all_phrasings(obj):
+            if text == instr:
+                env.task = {"level": lvl, "goal": obj.xy.copy(),
+                            "instruction": text, "target_cls": obj.cls,
+                            "ref_cls": ref, "obj_index": int(oi),
+                            "phrasings": env._all_phrasings(obj)}
+                d = float(np.linalg.norm(env.task["goal"] - env.pose[:2]))
+                env.prev_dist = env.d0 = env.min_dist = d
+                env.lstar = grid_value(env._shortest_path_len(env.task["goal"]),
+                                       env.scene, env.start_xy)
+                return True
+    return False
+
+
+def _pick_env(sim, policy_name, scenario):
+    """按策略选择环境：follow_* 用跟随环境（按 scenario 懒创建/复用）。"""
+    if policy_name.startswith("follow"):
+        sc = scenario or "normal"
+        if sim.fenv is None or sim.fenv.scenario != sc:
+            sim.fenv = FollowEnv(seed=0, max_steps=300, scenario=sc,
+                                 camera_augment=0.25)
+        return sim.fenv
+    return sim.env
+
+
+def run_episode(sim, policy_name, seed, level, collect_only=False,
+                instruction=None, scenario=None):
+    env = _pick_env(sim, policy_name, scenario)
+    follow = policy_name.startswith("follow")
+    obs = env.reset(seed=seed)
     pol = make_policy(policy_name)
-    pol.reset(env=sim.env)
+    pol.reset(env=env)
+    if instruction and not follow:
+        if not apply_instruction(env, instruction):
+            raise RuntimeError("指令「%s」在当前场景中无对应目标"
+                               "（试试：去红色的植物旁边 / 去椅子旁边）" % instruction)
     steps = 0
     if not collect_only:
         sim.refresh_map()
     info = None
     while True:
-        a = pol.act(obs, sim.env)
-        obs, _r, done, info = sim.env.step(a)
+        a = pol.act(obs, env)
+        obs, _r, done, info = env.step(a)
         steps += 1
         if collect_only:
-            if done or steps >= sim.env.cfg["max_steps"]:
+            if done or steps >= env.cfg["max_steps"]:
                 break
         else:
             with LOCK:
                 sim.obs = obs
-                sim.pose = [float(sim.env.pose[0]), float(sim.env.pose[1]),
-                            float(sim.env.pose[2])]
-                sim.traj = [list(map(float, p)) for p in sim.env.traj]
-                sim.goal = [float(x) for x in sim.env.task["goal"]]
-                sim.instruction = sim.env.task["instruction"]
-                sim.level_str = str(sim.env.task.get("level", "-"))
+                sim.pose = [float(env.pose[0]), float(env.pose[1]),
+                            float(env.pose[2])]
+                sim.traj = [list(map(float, p)) for p in env.traj]
+                if follow:
+                    sim.goal = None
+                    sim.target = [float(x) for x in env.target.xy]
+                    sim.live = {"dist": float(info["dist"]),
+                                "visible": bool(info["visible"]),
+                                "in_band": bool(info["in_band"])}
+                    sim.instruction = "跟随红马甲行人"
+                    sim.level_str = "follow"
+                else:
+                    sim.goal = [float(x) for x in env.task["goal"]]
+                    sim.target = None
+                    sim.live = None
+                    sim.instruction = env.task["instruction"]
+                    sim.level_str = str(env.task.get("level", "-"))
                 sim.step = steps
                 sim.done = bool(done)
             time.sleep(0.05)
-            if done or steps >= sim.env.cfg["max_steps"]:
+            if done or steps >= env.cfg["max_steps"]:
                 break
+    if follow:
+        m = env.metrics()
+        return {"follow": True,
+                "success": float(m["TCR"] >= 0.7 and m["in_band_rate"] >= 0.7),
+                "TCR": round(100 * m["TCR"], 1),
+                "err_mean": round(m["err_mean"], 3),
+                "err_std": round(m["err_std"], 3),
+                "vis_rate": round(100 * m["vis_rate"], 1),
+                "in_band_rate": round(100 * m["in_band_rate"], 1),
+                "n_loss": m["n_loss"],
+                "rec_ms_median": round(m["rec_ms_median"], 1),
+                "steps": steps, "n_collide": m["n_collide"],
+                "instruction": "跟随红马甲行人", "level": "follow"}
     m = navigate_metrics(info)
     return {"success": float(m["SR"]), "spl": float(m["SPL"]), "ne": float(m["NE"]),
             "steps": steps, "min_dist": float(sim.env.min_dist),
@@ -169,9 +245,10 @@ def run_episode(sim, policy_name, seed, level, collect_only=False):
             "level": str(sim.env.task.get("level", "-"))}
 
 
-def worker_single(sim, policy_name, seed, level):
+def worker_single(sim, policy_name, seed, level, instruction=None, scenario=None):
     try:
-        res = run_episode(sim, policy_name, seed, level)
+        res = run_episode(sim, policy_name, seed, level,
+                          instruction=instruction, scenario=scenario)
         with LOCK:
             sim.result = res
             sim.done = True
@@ -253,10 +330,14 @@ class Handler(BaseHTTPRequestHandler):
                 SIM.policy_name = req.get("policy", "oracle")
                 SIM.seed = int(req.get("seed", 9000))
                 SIM.level = req.get("level")
+                SIM.target = None
+                SIM.live = None
                 SIM.batch["running"] = False
                 SIM.worker = threading.Thread(
                     target=worker_single,
-                    args=(SIM, SIM.policy_name, SIM.seed, SIM.level), daemon=True)
+                    args=(SIM, SIM.policy_name, SIM.seed, SIM.level,
+                          req.get("instruction"), req.get("scenario")),
+                    daemon=True)
                 SIM.worker.start()
             self._json({"ok": True})
         elif self.path == "/api/batch":
@@ -275,6 +356,18 @@ class Handler(BaseHTTPRequestHandler):
                           int(req.get("n", 20)), req.get("level")), daemon=True)
                 SIM.worker.start()
             self._json({"ok": True})
+        elif self.path == "/api/voice":
+            # 代理到 voice_server(:8010) 的 /asr：录音 → 转写 → 归一化指令
+            try:
+                import urllib.request
+                r = urllib.request.Request(
+                    "http://127.0.0.1:8010/asr",
+                    json.dumps({"wav_b64": req.get("wav_b64", "")}).encode(),
+                    {"Content-Type": "application/json"})
+                out = json.loads(urllib.request.urlopen(r, timeout=60).read())
+            except Exception as e:                          # noqa: BLE001
+                out = {"error": "语音服务(8010)不可达: %s" % e}
+            self._json(out)
         elif self.path == "/api/stop":
             SIM._stop = True
             self._json({"ok": True})
