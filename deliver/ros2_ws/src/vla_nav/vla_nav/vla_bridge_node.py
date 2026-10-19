@@ -40,21 +40,26 @@ from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Twist
 
 STATE_DIM = 32          # 与训练一致（max_state_dim）
-SERVER = "http://192.168.1.100:8000/infer"   # 服务器侧推理地址
-TIMEOUT_S = 0.35        # 大纲 §5 E8：p95 ≤ 150 ms 的目标留给 D1；D2 放宽到 350 ms
+SERVER = "http://100.92.217.51:8000/infer"   # 服务器侧推理地址（推理机 GPU 服务器）
+TIMEOUT_S = 1.0         # 实测服务端 ~0.5 s/请求（4090），0.35 会全部超时进 degraded
 
 
 class VLABridge(Node):
     def __init__(self):
         super().__init__("vla_bridge")
         self.declare_parameter("server", SERVER)
-        self.declare_parameter("instruction", "go to the red chair")
+        self.declare_parameter("instruction", "去red的箱子旁边")
         self.declare_parameter("st_mean", [0.0] * 5)
         self.declare_parameter("st_std", [1.0] * 5)
+        # 归一化开关：infer_server 端已按 norm_stats.json 归一化（单一口径来源），
+        # 桥接端**默认关闭**，避免双重归一化（st 会被拉到 [-2,2] 之外，动作全歪）。
+        # 仅当服务端是旧版（不做归一化）时才置 true 并配 st_mean/st_std。
+        self.declare_parameter("normalize_state", False)
         self.server = self.get_parameter("server").value
         self.instr = self.get_parameter("instruction").value
         self.st_mean = np.array(self.get_parameter("st_mean").value, dtype=np.float32)
         self.st_std = np.array(self.get_parameter("st_std").value, dtype=np.float32)
+        self.normalize_state = bool(self.get_parameter("normalize_state").value)
 
         self.last_img = None
         self.last_scan = None
@@ -98,7 +103,8 @@ class VLABridge(Node):
         if o is None:
             return None
         st = np.concatenate([o[:3], self.last_action]).astype(np.float32)
-        st = (st - self.st_mean) / self.st_std
+        if self.normalize_state:
+            st = (st - self.st_mean) / self.st_std
         if st.size < STATE_DIM:
             st = np.pad(st, (0, STATE_DIM - st.size))
         return st[:STATE_DIM]
