@@ -88,8 +88,14 @@ async function voice(){
  if(r.error){vstate.innerHTML='<span class="bad">'+r.error+'</span>';return}
  vstate.innerHTML='听到「'+r.text+'」→ 指令「'+r.instruction+'」 ('+r.latency_ms+'ms'+(r.note&&r.note!=='直通'?'，'+r.note:'')+')'+(r.ok?'':' <span class="bad">不可用</span>');
  if(r.ok){policy.value='vla';post('/api/start',{policy:'vla',seed:+seed.value,instruction:r.instruction})}}
-function sendText(){const t=saytext.value.trim();if(!t)return;vstate.textContent='指令「'+t+'」';
- post('/api/start',{policy:policy.value,seed:+seed.value,instruction:t,scenario:scen.value,scene:scn.value})}
+function sendText(){const t=saytext.value.trim();if(!t)return;
+ // 文字指令是导航任务：若当前选的是跟随策略，指令会被后端忽略（仍跟着人走）
+ // —— 与语音路径一致，自动切到 SmolVLA 导航策略
+ let p=policy.value;
+ if(p.startsWith('follow')){p='vla';policy.value='vla';scen.style.display='none';
+  vstate.innerHTML='指令「'+t+'」（跟随策略不接收指令，已自动切换 SmolVLA）';}
+ else vstate.textContent='指令「'+t+'」';
+ post('/api/start',{policy:p,seed:+seed.value,instruction:t,scenario:scen.value,scene:scn.value})}
 // ================= 2D 平面图（小地图，含房间名） =================
 const FURN={chair:['#cd6b5c','#9c463a'],table:['#b98a5a','#8a6236'],sofa:['#6e87c4','#4a5f96'],
  bed:['#8fa3d9','#63779f'],shelf:['#8b7355','#644f38'],plant:['#5fa46b','#3f7a4a'],
