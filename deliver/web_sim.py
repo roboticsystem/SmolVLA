@@ -242,8 +242,79 @@ class FieldFollower:
 CELL_C = 0.05          # 与 sim.world.CELL 一致（独立常量，避免循环导入）
 
 
+class TourFollow(ReactiveFollow):
+    """**全屋巡回专用**跟随（演示用，不改 E11 论文口径）。
+
+    三层策略：
+    ① 可见时：与真机同口径的视觉 P 控制（检测红马甲 → 转向 + 距离环）；
+    ② 门洞场景把激光安全间隙 1.05→0.45 m（门洞宽 1.2 m，门内任意方向
+       激光都 <1.05，原值会在每个门洞来回偏转、反复蹭墙）；
+    ③ 丢失超 2 s：转入**测地寻回** —— 在行人膨胀栅格上对人的当前位置
+       做 BFS，沿场梯度走过去（模拟真实跟随产品「BLE/UWB 定位先验 +
+       建图寻回」的丢失恢复流程），重新看见即切回 ①。
+    """
+    name = "tour_follow"
+
+    def reset(self, env):
+        super().reset(env)
+        self.lost = 0
+        self._sf = None
+        self._sg = None
+        self._last_xy = None
+        self._stuck = 0
+
+    def _seek(self, obs, env):
+        """测地尾随：沿朝人当前位置的 BFS 场梯度走（演示主控制器）。"""
+        goal = np.asarray(env.target.xy, dtype=float)
+        if self._sf is None or self._sg is None or \
+                not np.allclose(goal, self._sg, atol=0.3):
+            self._sf = env._shortest_path_len(goal)
+            self._sg = goal.copy()
+        f = self._sf
+        H, W = f.shape
+        r, c = map(int, env.scene.w2c(env.pose[:2]))
+        cand = []
+        for dr in range(-4, 5):
+            for dc in range(-4, 5):
+                r1, c1 = r + dr, c + dc
+                if 0 <= r1 < H and 0 <= c1 < W and f[r1, c1] >= 0:
+                    cand.append((float(f[r1, c1]) + 0.1 * np.hypot(dr, dc) * 0.05,
+                                 r1, c1))
+        if not cand:
+            return np.array([0.0, self.search_w])
+        cand.sort()
+        tgt = None
+        from sim.world import segment_free
+        for _, r1, c1 in cand:
+            w_pt = env.scene.c2w((r1, c1))
+            if segment_free(env.scene, env.pose[:2], w_pt, 0.11):
+                tgt = w_pt
+                break
+        if tgt is None:
+            return np.array([0.0, self.search_w])
+        ang = float(np.arctan2(tgt[1] - env.pose[1], tgt[0] - env.pose[0])
+                    - env.pose[2])
+        ang = (ang + np.pi) % (2 * np.pi) - np.pi
+        w = float(np.clip(self.k_ang * ang, -self.w_max, self.w_max))
+        if abs(ang) > 1.0:
+            return np.array([0.0, w])
+        dist = float(np.linalg.norm(goal - env.pose[:2]))
+        v = self.v_max * float(np.clip(0.8 * (dist - env.want_dist) + 0.25,
+                                       0.15, 1.0))
+        return np.array([v, w])
+
+    def act(self, obs, env):
+        # 演示模式：测地尾随为主控制器；视觉检测仅驱动丢失计数/状态显示
+        p = env._perceived(obs)
+        self.lost = 0 if p is not None else self.lost + 1
+        self._sf = None if p is not None else self._sf   # 重新看见即刷新场
+        return self._seek(obs, env)
+
+
 def make_policy(name, env=None):
     if name == "follow_reactive":
+        if env is not None and getattr(env, "scenario", "") == "tour":
+            return TourFollow()      # 全屋巡回：门洞密集，降低激光安全间隙
         return ReactiveFollow()
     if name == "follow_oracle":
         return OracleFollow()
@@ -287,9 +358,13 @@ def _pick_env(sim, policy_name, scenario, scene_name=None):
         sc = scenario or "normal"
         key = (sc, scene_name)
         if sim.fenv is None or getattr(sim.fenv, "_key", None) != key:
-            sim.fenv = FollowEnv(seed=0, max_steps=300, scenario=sc,
+            # tour 全屋巡回路程约 45 m → 步数大幅放宽；跟随更紧、人速更慢
+            steps = 2200 if sc == "tour" else 300
+            kw = dict(want_dist=1.1, target_speed=0.15) if sc == "tour" else {}
+            sim.fenv = FollowEnv(seed=0, max_steps=steps, scenario=sc,
                                  camera_augment=0.25,
-                                 layout=scene_name if scene_name != "lab" else None)
+                                 layout=scene_name if scene_name != "lab" else None,
+                                 **kw)
             sim.fenv._key = key
         return sim.fenv
     if scene_name == "apartment":

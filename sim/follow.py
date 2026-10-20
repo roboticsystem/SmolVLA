@@ -50,7 +50,7 @@ from .env import CALIBRATED, ROBOT_RADIUS, SemanticNavEnv
 from .perception import detect
 from .sensors import (CAMERA_HEIGHT, CAMERA_HFOV_DEG, LIDAR_MAX_RANGE, lidar_scan,
                       photometric_augment, raycast, render)
-from .world import COLORS, segment_free
+from .world import COLORS, segment_free, CELL
 
 VEST_COLOR = "red"          # 马甲色：用调色板里的 red，**必须场景唯一**
 PERSON_H = 1.70             # 人体高（真机用「已知人体高度」反推距离）
@@ -131,7 +131,7 @@ class FollowTarget:
     """
 
     def __init__(self, scene, rng, speed=TARGET_SPEED, waypoints=None, spawn_pose=None,
-                 pause_at=None, pause_sec=0.0):
+                 pause_at=None, pause_sec=0.0, loop_wps=False):
         self.scene = scene
         self.rng = rng
         self.speed = float(speed)
@@ -140,6 +140,7 @@ class FollowTarget:
         self.rgb = np.array(COLORS[VEST_COLOR], dtype=np.uint8)   # 马甲色（场景唯一）
         self._wps = [np.asarray(w, dtype=np.float64) for w in (waypoints or [])]
         self._wi = 0
+        self._loop = bool(loop_wps)                 # 航点走完后从头再循环（全屋巡回用）
         # **可控时长的遮挡**：到达 `pause_at` 后原地停留 `pause_sec` 秒。
         # 早先 `short_occl` 与 `long_occl` 走同一分支、只是航点构造相同，
         # 实测两者**结果完全一致**（TCR 81.5% / 恢复 1191.7 ms 逐位相同）——
@@ -192,11 +193,19 @@ class FollowTarget:
 
     def _next_wp(self):
         """脚本航点优先；用完后随机选「直线可达」的点，避免穿墙。"""
+        if self._loop and self._wps and self._wi >= len(self._wps):
+            self._wi = 0                             # 全屋巡回：从头再走
+        # 循环航点（tour）由 BFS 按行人半径生成，校验余量须与生成时的
+        # 膨胀半径一致（0.30 会把贴边航点全部误拒 → 人困在原地踱步）
+        m = self.radius if self._loop else self.radius + 0.05
         while self._wi < len(self._wps):
             p = self._wps[self._wi]
             self._wi += 1
-            if self.scene.is_free(p, margin=self.radius + 0.05) and \
-                    segment_free(self.scene, self.xy, p, self.radius + 0.05):
+            if self._loop:
+                # BFS 路径本身已按行人半径无碰撞，方盒校验会误拒贴边航点
+                return p
+            if self.scene.is_free(p, margin=m) and \
+                    segment_free(self.scene, self.xy, p, m):
                 return p
         for _ in range(400):
             p = self._rand_free()
@@ -269,6 +278,80 @@ class FollowEnv(SemanticNavEnv):
                 o.color = alt
                 o.rgb = np.array(COLORS[alt], dtype=np.uint8)
 
+    # 全屋巡回的「到访点」（公寓各房间的自由开阔位；演示时依次走到）
+    TOUR_VISITS = [(2.60, 1.20),   # 客厅
+                   (3.00, 7.00),   # 主卧（床东侧）
+                   (6.50, 6.90),   # 次卧（床东侧）
+                   (8.30, 6.40),   # 书房
+                   (10.50, 6.50),  # 卫生间
+                   (9.80, 2.00),   # 厨房
+                   (5.60, 1.00),   # 餐厅
+                   (2.60, 1.20)]   # 回客厅（闭环）
+
+    def _tour_waypoints(self, start):
+        """**算法生成**全屋巡回航点：以行人半径膨胀栅格 → BFS 测地路径。
+
+        为什么不用手工航点：门洞宽 1.2 m、行人换向余量 0.30 m，斜穿门洞时
+        视线校验必然擦到门角墙（实测 8 个航点被静默跳过、人困在客厅）。
+        改为对每个到访点做 BFS 距离场，再从当前位置沿场梯度走到该点 ——
+        路径天然经门洞中心、与墙/家具保持行人半径间距。
+        """
+        from collections import deque
+        from .env import _dilate
+        sc = self.scene
+        free = ~_dilate(sc.occ, int(np.ceil(PERSON_R / CELL)))
+        H, W = free.shape
+        pts = []
+        cur = np.asarray(start, dtype=np.float64)
+        for goal in self.TOUR_VISITS:
+            g = np.asarray(goal, dtype=np.float64)
+            gr, gc = sc.w2c(g); gr, gc = int(gr), int(gc)
+            dist = np.full((H, W), -1, dtype=np.int32)
+            if not free[gr, gc]:
+                cand = np.argwhere(free)
+                if len(cand) == 0:
+                    continue
+                k = int(np.argmin((cand[:, 0] - gr) ** 2 + (cand[:, 1] - gc) ** 2))
+                gr, gc = int(cand[k, 0]), int(cand[k, 1])
+            dist[gr, gc] = 0
+            q = deque([(gr, gc)])
+            while q:
+                r0, c0 = q.popleft()
+                for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    r1, c1 = r0 + dr, c0 + dc
+                    if 0 <= r1 < H and 0 <= c1 < W and free[r1, c1] \
+                            and dist[r1, c1] < 0:
+                        dist[r1, c1] = dist[r0, c0] + 1
+                        q.append((r1, c1))
+            sr, sc_ = sc.w2c(cur); sr, sc_ = int(sr), int(sc_)
+            path = []
+            for _ in range(4000):
+                path.append((sr, sc_))
+                d0 = dist[sr, sc_]
+                if d0 <= 0:
+                    break
+                best = None
+                for dr in (-1, 0, 1):
+                    for dc in (-1, 0, 1):
+                        if dr == 0 and dc == 0:
+                            continue
+                        r1, c1 = sr + dr, sc_ + dc
+                        if 0 <= r1 < H and 0 <= c1 < W and dist[r1, c1] >= 0 \
+                                and dist[r1, c1] < d0:
+                            if best is None or dist[r1, c1] < best[0]:
+                                best = (dist[r1, c1], r1, c1)
+                if best is None:
+                    break
+                sr, sc_ = best[1], best[2]
+            last = cur.copy()
+            for r0, c0 in path:
+                w = np.asarray(sc.c2w((r0, c0)))
+                if np.linalg.norm(w - last) >= 0.25:
+                    pts.append(w)
+                    last = w
+            cur = g
+        return pts
+
     def _make_target(self, seed):
         rng = np.random.default_rng(int(seed) + 104729)
         spawn = np.array([self.scene.spawn[0], self.scene.spawn[1],
@@ -299,6 +382,17 @@ class FollowEnv(SemanticNavEnv):
             sec = 1.6 if self.scenario == "short_occl" else 3.8
             return FollowTarget(self.scene, rng, speed=self.target_speed, waypoints=wps,
                                 spawn_pose=spawn, pause_at=pause, pause_sec=sec)
+        if self.scenario == "tour":
+            # 全屋巡回：先建目标（确定出生位），再按其位置算法生成巡回航点
+            tgt = FollowTarget(self.scene, rng, speed=self.target_speed,
+                               spawn_pose=spawn)
+            wps = self._tour_waypoints(tgt.xy)
+            tgt._wps = wps
+            tgt._wi = 0
+            tgt._loop = True
+            if wps:
+                tgt.wp = wps[0]
+            return tgt
         return FollowTarget(self.scene, rng, speed=self.target_speed, waypoints=wps,
                             spawn_pose=spawn)
 
