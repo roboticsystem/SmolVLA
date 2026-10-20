@@ -141,17 +141,27 @@ def cv2_jpeg(rgb):
 
 
 class VLAPolicy:
-    """经 infer_server(:8000) 调真模型；chunk 执行（每次推理走 10 步）。"""
+    """经 infer_server(:8000) 调真模型；chunk 执行（每次推理走 10 步）。
+
+    **工程侧指标**（对齐参考论文1 的端到端延迟/FPS、论文2 的推理时延）：
+    每次 HTTP 推理的耗时、请求数、失败数、chunk 复用率都会记在 `self.stats`，
+    由 `run_episode` 汇总进回合结果。
+    """
 
     def __init__(self, server="http://127.0.0.1:8000"):
         self.server = server
         self.queue = []
+        self.stats = {"requests": 0, "fails": 0, "total_ms": 0.0, "lat": [],
+                      "cached_steps": 0, "chunk_len": 0}
 
     def reset(self, env=None):
         self.queue = []
+        self.stats = {"requests": 0, "fails": 0, "total_ms": 0.0, "lat": [],
+                      "cached_steps": 0, "chunk_len": 0}
 
     def act(self, obs, env):
         if self.queue:
+            self.stats["cached_steps"] += 1
             return self.queue.pop(0)
         import urllib.request
         ok, buf = cv2_jpeg(obs["image"])
@@ -159,14 +169,25 @@ class VLAPolicy:
                "scan": obs["lidar"].tolist(),
                "state": [float(x) for x in obs["state"][:5]],
                "instruction": obs["instruction"]}
-        r = urllib.request.urlopen(urllib.request.Request(
-            self.server + "/infer", json.dumps(req).encode(),
-            {"Content-Type": "application/json"}), timeout=30)
-        out = json.loads(r.read())
+        t0 = time.perf_counter()
+        try:
+            r = urllib.request.urlopen(urllib.request.Request(
+                self.server + "/infer", json.dumps(req).encode(),
+                {"Content-Type": "application/json"}), timeout=30)
+            out = json.loads(r.read())
+        except Exception:                                    # noqa: BLE001
+            self.stats["fails"] += 1
+            raise
+        finally:
+            dt = (time.perf_counter() - t0) * 1000.0
+            self.stats["requests"] += 1
+            self.stats["total_ms"] += dt
+            self.stats["lat"].append(dt)
         if "error" in out:
             raise RuntimeError(out["error"])
         acts = out.get("actions") or [out["action"]]
         self.queue = [np.asarray(a, np.float64) for a in acts[1:]]
+        self.stats["chunk_len"] = max(self.stats["chunk_len"], len(acts))
         return np.asarray(acts[0], np.float64)
 
 
@@ -431,13 +452,16 @@ def run_episode(sim, policy_name, seed, level, collect_only=False,
             raise RuntimeError("指令「%s」在当前场景中无对应目标"
                                "（试试：去白色的箱子旁边 / 去沙发旁边）" % instruction)
     steps = 0
+    ctrl_ms = []
     if not collect_only:
         sim.refresh_map(env)
     info = None
     while True:
         if sim._stop:                # 「⏹ 停止」按钮：任何运行中的回合立即终止
             break
+        _t0 = time.perf_counter()
         a = pol.act(obs, env)
+        ctrl_ms.append((time.perf_counter() - _t0) * 1000.0)
         obs, _r, done, info = env.step(a)
         steps += 1
         if collect_only:
@@ -468,6 +492,20 @@ def run_episode(sim, policy_name, seed, level, collect_only=False,
             time.sleep(0.05)
             if done or steps >= env.cfg["max_steps"]:
                 break
+    # ---- 工程侧指标：策略计算耗时（控制延迟）+ VLA 推理延迟/吞吐 ----
+    eng = {"ctrl_ms_mean": round(float(np.mean(ctrl_ms)), 2) if ctrl_ms else 0.0,
+           "ctrl_ms_p95": round(float(np.percentile(ctrl_ms, 95)), 2) if ctrl_ms else 0.0}
+    if isinstance(pol, VLAPolicy):
+        st = pol.stats
+        lat = st["lat"]
+        eng.update({
+            "infer_ms_mean": round(float(np.mean(lat)), 1) if lat else 0.0,
+            "infer_ms_p95": round(float(np.percentile(lat, 95)), 1) if lat else 0.0,
+            "infer_reqs": st["requests"], "infer_fails": st["fails"],
+            "chunk_reuse": (st["cached_steps"] /
+                            max(st["cached_steps"] + st["requests"], 1)),
+            "hz": round(1000.0 / max(float(np.mean(ctrl_ms)), 1e-6), 1),
+        })
     if follow:
         m = env.metrics()
         return {"follow": True,
@@ -480,12 +518,12 @@ def run_episode(sim, policy_name, seed, level, collect_only=False,
                 "n_loss": m["n_loss"],
                 "rec_ms_median": round(m["rec_ms_median"], 1),
                 "steps": steps, "n_collide": m["n_collide"],
-                "instruction": "跟随红马甲行人", "level": "follow"}
+                "instruction": "跟随红马甲行人", "level": "follow", **eng}
     m = navigate_metrics(info)
     return {"success": float(m["SR"]), "spl": float(m["SPL"]), "ne": float(m["NE"]),
             "steps": steps, "min_dist": float(env.min_dist),
             "instruction": env.task["instruction"],
-            "level": str(env.task.get("level", "-"))}
+            "level": str(env.task.get("level", "-")), **eng}
 
 
 def worker_single(sim, policy_name, seed, level, instruction=None, scenario=None,
@@ -508,26 +546,121 @@ def worker_single(sim, policy_name, seed, level, instruction=None, scenario=None
             sim.result = {"error": "%s: %s" % (type(e).__name__, e)}
 
 
-def worker_batch(sim, policy_name, n, level, scene_name=None):
+def _batch_scenes(scene_name):
+    """批量评测的场景集合：'multi' → 标定场地 + 公寓（跨场景联合统计）。"""
+    if scene_name in ("multi", "all"):
+        return ["lab", "apartment"]
+    return [scene_name]
+
+
+def _pack_rows(rs):
+    """把一批回合记录压成统计量（含 Wilson 95% 区间与标准差）。"""
+    from sim.plot_results import wilson
+    n = len(rs)
+    if n == 0:
+        return {}
+    succ = [float(r.get("success", 0.0)) for r in rs]
+    k = int(sum(succ))
+    lo, hi = wilson(k, n)
+    out = {"n": n,
+           "SR": round(100 * sum(succ) / n, 1),
+           "SR_lo": round(100 * lo, 1), "SR_hi": round(100 * hi, 1),
+           "SR_std": round(100 * float(np.std(succ, ddof=1)), 1) if n > 1 else 0.0}
+    for key, lab in (("spl", "SPL"), ("ne", "NE"), ("TCR", "TCR"),
+                     ("err_mean", "err"), ("vis_rate", "vis"),
+                     ("in_band_rate", "band"), ("rec_ms_median", "rec_ms"),
+                     ("n_collide", "collide"),
+                     ("ctrl_ms_mean", "ctrl_ms"), ("infer_ms_mean", "infer_ms"),
+                     ("infer_ms_p95", "infer_p95"), ("hz", "hz")):
+        vals = [float(r[key]) for r in rs if r.get(key) is not None]
+        if vals:
+            out[lab] = round(float(np.mean(vals)), 3)
+            if len(vals) > 1:
+                out[lab + "_std"] = round(float(np.std(vals, ddof=1)), 3)
+    return out
+
+
+def _batch_stats(rows, ref_rows=None):
+    """分场景 / 合并统计 + 重复次数间的离散度 + 配对 McNemar 检验。"""
+    from sim.plot_results import mcnemar_exact
+    stats = {"pooled": _pack_rows(rows), "per_scene": {}}
+    scenes = sorted({r.get("scene", "?") for r in rows})
+    for sc in scenes:
+        rs = [r for r in rows if r.get("scene") == sc]
+        pack = _pack_rows(rs)
+        # 「重复 N 次取平均 + 报方差」口径：按 repeat 分组求均值，再看组间离散度
+        reps = sorted({int(r.get("rep", 0)) for r in rs})
+        if len(reps) > 1:
+            means = []
+            for rp in reps:
+                rr = [r for r in rs if int(r.get("rep", 0)) == rp]
+                s = [float(x.get("success", 0.0)) for x in rr]
+                means.append(100 * sum(s) / max(len(s), 1))
+            pack["rep_SR_mean"] = round(float(np.mean(means)), 1)
+            pack["rep_SR_std"] = round(float(np.std(means, ddof=1)), 2)
+            pack["repeats"] = len(reps)
+        stats["per_scene"][sc] = pack
+    if ref_rows:
+        stats["ref"] = _pack_rows(ref_rows)
+        key = lambda r: (r.get("scene"), int(r.get("rep", 0)), r.get("seed"))
+        A = {key(r): float(r.get("success", 0.0)) for r in rows}
+        B = {key(r): float(r.get("success", 0.0)) for r in ref_rows}
+        common = sorted(set(A) & set(B))
+        n10 = sum(1 for k in common if A[k] == 1 and B[k] == 0)
+        n01 = sum(1 for k in common if A[k] == 0 and B[k] == 1)
+        stats["mcnemar"] = {"p": round(mcnemar_exact(n10, n01), 4),
+                             "n10": n10, "n01": n01, "n": len(common)}
+    return stats
+
+
+def worker_batch(sim, policy_name, n, level, scene_name=None, scenario=None,
+                 repeats=1, ref_policy=None):
+    """批量评测：**可跨场景 + 可重复多次 + 可配对参考基线**。
+
+    - 跨场景：`scene_name='multi'` 时在「标定场地 + 公寓」两种场地上跑同一批种子，
+      分场景报指标并给出合并统计（论文4 的多规模实验口径）。
+    - 重复：第 r 轮用种子 `9000 + ep*37 + 100000*r`，与第 0 轮**同场景不同布局**，
+      报「各轮均值的均值 ± 组间标准差」（论文1/2/3/4 都采用「重复 N 次取平均」）。
+    - 配对检验：给了 `ref_policy` 就在**同一批种子**上再跑一遍参考策略，
+      用 McNemar 精确检验给出显著性 p 值。
+    """
     rows = []
+    ref_rows = []
+    scenes = _batch_scenes(scene_name)
     try:
-        for ep in range(n):
-            if sim._stop:
-                break
-            res = run_episode(sim, policy_name, 9000 + ep * 37, level,
-                              collect_only=True, scene_name=scene_name)
-            rows.append(res)
-            with LOCK:
-                sim.batch["done"] = ep + 1
-                sim.batch["rows"] = rows[-8:]
-                sim.batch["sr"] = round(100 * sum(r["success"] for r in rows)
-                                        / len(rows), 1)
-                sim.batch["spl"] = round(sum(r["spl"] for r in rows) / len(rows), 3)
-                sim.batch["ne"] = round(sum(r["ne"] for r in rows) / len(rows), 2)
+        total = n * len(scenes) * repeats
+        done = 0
+        for rep in range(repeats):
+            for sc in scenes:
+                for ep in range(n):
+                    if sim._stop:
+                        break
+                    seed = 9000 + ep * 37 + 100000 * rep
+                    res = run_episode(sim, policy_name, seed, level,
+                                      collect_only=True, scene_name=sc,
+                                      scenario=scenario)
+                    res.update(scene=sc, rep=rep, seed=seed)
+                    rows.append(res)
+                    if ref_policy:
+                        r2 = run_episode(sim, ref_policy, seed, level,
+                                         collect_only=True, scene_name=sc,
+                                         scenario=scenario)
+                        r2.update(scene=sc, rep=rep, seed=seed)
+                        ref_rows.append(r2)
+                    done += 1
+                    with LOCK:
+                        sim.batch["done"] = done
+                        sim.batch["total"] = total
+                        sim.batch["rows"] = rows[-8:]
+                        sim.batch["sr"] = round(100 * sum(r.get("success", 0)
+                                                          for r in rows)
+                                                / len(rows), 1)
     except Exception as e:                              # noqa: BLE001
         rows.append({"error": "%s: %s" % (type(e).__name__, e)})
     with LOCK:
         sim.batch["running"] = False
+        if rows and "error" not in rows[-1]:
+            sim.batch["stats"] = _batch_stats(rows, ref_rows or None)
         if rows:
             sim.batch["sr"] = round(100 * sum(r.get("success", 0) for r in rows)
                                     / len(rows), 1)
@@ -616,13 +749,20 @@ class Handler(BaseHTTPRequestHandler):
                 SIM._stop = False        # 无条件复位（与 /api/start 同理）
                 SIM.mode = "batch"
                 SIM.batch = {"running": True, "done": 0,
+                             "total": int(req.get("n", 20)) *
+                             int(req.get("repeats", 1)) *
+                             len(_batch_scenes(req.get("scene"))),
                              "n": int(req.get("n", 20)), "sr": None,
-                             "spl": None, "ne": None, "rows": []}
+                             "spl": None, "ne": None, "rows": [],
+                             "stats": None, "repeats": int(req.get("repeats", 1)),
+                             "ref": req.get("ref_policy") or None}
                 SIM.worker = threading.Thread(
                     target=worker_batch,
                     args=(SIM, req.get("policy", "oracle"),
                           int(req.get("n", 20)), req.get("level"),
-                          req.get("scene")), daemon=True)
+                          req.get("scene"), req.get("scenario"),
+                          int(req.get("repeats", 1)),
+                          req.get("ref_policy") or None), daemon=True)
                 SIM.worker.start()
             self._json({"ok": True})
         elif self.path == "/api/voice":
