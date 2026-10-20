@@ -361,7 +361,8 @@ def apply_instruction(env, instr):
 
 # 各固定布局的步数上限（场景越大路径越长，步数按测地尺度放宽）
 LAYOUT_STEPS = {"apartment": 350, "apartment_s": 300, "apartment_l": 450,
-                 "corridor": 700, "s_corridor": 700, "warehouse": 650}
+                 "corridor": 700, "s_corridor": 700, "warehouse": 650,
+                 "classroom": 600, "office": 600}
 
 # **硬件退化族**（论文1/2 报告的 sim-to-real 差距来源；默认全关，保全论文数字）
 DEGRADE_KW = {

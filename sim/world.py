@@ -507,6 +507,136 @@ def make_warehouse_scene(seed: int = 0) -> Scene:
     return scene
 
 
+# ---------------------------------------------------------------- 教室场景
+# 参照论文1《基于嵌入式视觉的室内无人车可行走路径的识别系统研究》§5.3~5.4
+# 的室内工况（教室/自习室一类的**规整阵列式**布置），补上场景族里
+# 缺失的一类：**大量同规格家具按行列整齐排布**。
+#
+# 与既有场景的差别（这正是它要补的短板）：
+#   公寓    —— 家具种类多、摆放随意（杂乱度中）
+#   走廊    —— 单通道、无阵列（杂乱度低）
+#   仓库    —— 直线货架（高规则、低密度）
+#   教室    —— **行列阵列 + 单一朝向**（高规则、中高密度）→ 阵列式密集障碍
+#              是反应式/纯追踪控制器最容易失效的工况（会切到相邻课桌），
+#              正好用来暴露「局部避障」与「全局规划」的差距。
+#
+# 几何约束（踩过的坑，逐条遵守）：
+#   ① 课桌排距 2.10 m、列距 2.60 m → 扣除膨胀后仍留 1.3~1.8 m 通道；
+#   ② 椅子贴在桌子**南侧**（学生面向讲台），不与相邻排的桌角形成夹缝；
+#   ③ 讲台与最后一排课桌留 1.7 m；
+#   ④ 门洞 1.4 m 宽（0.9 m 会让避障在门口墙角卡死）。
+_CLASSROOM_ROOMS = [
+    # **两个矩形刻意重叠**（y ∈ [6.80, 6.95]）：`_build_fixed_scene` 把每个矩形
+    # 各自 carve 成自由空间，重叠 ⇒ 两区之间**没有墙**。
+    # 若把两块拉开成 6.92/7.10，就会留下一道 0.18 m 的墙，把「讲台区」封成
+    # 只对外开门的独立房间 → 讲台/白板/教具柜全部不可达（实测 SR 从 100% 掉到 30%）。
+    ("课桌区", (0.18, 0.18, 13.02, 6.95)),
+    ("讲台区", (0.18, 6.80, 13.02, 9.02)),
+]
+_CLASSROOM_FLOORS = {"讲台区": (216, 198, 170), "课桌区": (226, 210, 182)}
+_CLASSROOM_DOORS = [
+    (0.00, 0.90, 0.18, 2.30),        # 入口（左侧外墙，净宽 1.4 m）
+    (13.02, 7.60, 13.20, 9.00),      # 前门（右侧外墙，净宽 1.4 m）
+]
+# 课桌阵列：3 排 × 4 列。桌 half=0.40、椅 half=0.22、椅子在桌南侧 0.78 m。
+_CLASSROOM_TABLE_X = (2.60, 5.20, 7.80, 10.40)
+_CLASSROOM_TABLE_Y = (2.50, 4.60, 6.60)
+_CLASSROOM_SPAWN = (1.50, 0.90)     # 入口内侧，面向教室内部
+
+
+def _classroom_furniture():
+    """教室家具清单：讲台区固定件 + 课桌阵列。"""
+    furn = [
+        ("table", "white",  2.60, 8.40, 0.45),   # 讲台（贴前墙，留 0.65 m 通道）
+        ("tv",    "black",  6.60, 8.84, 0.18),   # 电子白板（贴前墙）
+        ("shelf", "white", 12.40, 8.40, 0.25),   # 教具柜
+        ("chair", "black",  1.60, 8.40, 0.22),   # 讲台椅（唯一黑椅 → L2 唯一组合）
+        ("plant", "green",  0.75, 3.20, 0.22),   # 绿植（唯一 → L1）
+        ("box",   "white", 12.40, 0.95, 0.25),   # 纸箱（唯一 → L1）
+    ]
+    for x in _CLASSROOM_TABLE_X:
+        for y in _CLASSROOM_TABLE_Y:
+            furn.append(("table", "yellow", x, y, 0.40))          # 课桌
+            furn.append(("chair", "blue", x, y - 0.78, 0.22))      # 椅子（桌南侧）
+    return furn
+
+
+def make_classroom_scene(seed: int = 0) -> Scene:
+    """教室场景（规整阵列式布局）——补场景族的「高规则、中高密度」一档。"""
+    del seed
+    scene = _build_fixed_scene(
+        "classroom", _CLASSROOM_ROOMS, _CLASSROOM_FLOORS, _CLASSROOM_DOORS,
+        _classroom_furniture(), _CLASSROOM_SPAWN, (0.0, 13.2, 0.0, 9.2))
+    scene.spawn_theta = np.pi / 2.0        # 面向 +y（讲台方向）
+    return scene
+
+
+# ---------------------------------------------------------------- 办公室场景
+# 参照论文2《基于多传感器室内自动搬运机器人的研究与实现》§6.2 的室内作业环境，
+# 补上场景族里缺失的一类：**隔断工位式**布局。
+#
+# 与既有场景的差别：
+#   教室    —— 开放大空间里的阵列（无隔断）
+#   办公室  —— **隔断工位 + 独立会议室 + 休息区**（多房间 + 门洞串联），
+#              通道更窄、视线更受限，是「找目标」比「走对路」更难的工况。
+#
+# 几何约束：
+#   ① 工位桌 → 显示器在桌**北侧**、椅子在桌**南侧**（相距 0.58/1.00 m），
+#      保证显示器**南侧不留 0.02 m 的死缝**（否则机器人无法停靠到 0.30 m 内）；
+#   ② 工位排距 3.40 m → 扣除家具后净通道 ≥ 1.4 m；
+#   ③ 三个子房间之间用 0.18 m 墙 + 1.4 m 门洞串联，形成「绕行」工况；
+#   ④ 会议桌四周的椅子与桌沿留 ≥ 0.18 m 间隙，不与桌角形成夹缝。
+_OFFICE_ROOMS = [
+    ("开放办公区", (0.18, 0.18, 8.60, 9.32)),
+    ("会议室", (8.78, 5.20, 13.82, 9.32)),
+    ("前台休息区", (8.78, 0.18, 13.82, 5.02)),
+]
+_OFFICE_FLOORS = {"开放办公区": (206, 204, 200), "会议室": (198, 186, 168),
+                  "前台休息区": (212, 198, 186)}
+_OFFICE_DOORS = [
+    (0.00, 1.20, 0.18, 2.60),              # 入口（左侧外墙，净宽 1.4 m）
+    (8.60, 6.60, 8.78, 8.00),              # 办公区 ↔ 会议室
+    (8.60, 1.60, 8.78, 3.00),              # 办公区 ↔ 休息区
+    (10.60, 5.02, 12.00, 5.20),            # 会议室 ↔ 休息区
+]
+_OFFICE_DESK_X = (2.40, 6.00)
+_OFFICE_DESK_Y = (3.20, 6.60)
+_OFFICE_SPAWN = (1.30, 1.90)              # 入口内侧，面向 +x（工位区）
+
+
+def _office_furniture():
+    """办公室家具清单：4 个工位（桌+椅+显示器）+ 会议室 + 休息区。"""
+    furn = []
+    for x in _OFFICE_DESK_X:
+        for y in _OFFICE_DESK_Y:
+            furn.append(("table", "yellow", x, y, 0.40))          # 工位办公桌
+            furn.append(("chair", "black", x, y - 1.00, 0.22))    # 工位椅
+            furn.append(("tv", "black", x, y + 0.58, 0.16))       # 显示器（桌北侧）
+    furn += [
+        ("table", "white", 11.30, 7.30, 0.60),     # 会议桌（唯一白桌 → L2）
+        ("tv",    "white", 11.30, 9.10, 0.18),     # 会议显示屏（唯一白屏 → L2）
+        ("chair", "blue",  11.30, 8.35, 0.22),     # 会议椅 ×4
+        ("chair", "blue",  11.30, 6.25, 0.22),
+        ("chair", "blue",  10.20, 7.30, 0.22),
+        ("chair", "blue",  12.40, 7.30, 0.22),
+        ("sofa",  "blue",  12.60, 1.20, 0.55),     # 休息区沙发（唯一 → L1）
+        ("plant", "green",  9.40, 0.80, 0.22),     # 绿植（唯一 → L1）
+        ("shelf", "white",   9.40, 4.40, 0.25),     # 文件柜（唯一 → L1）
+        ("box",   "black", 12.90, 4.30, 0.25),     # 快递箱（唯一 → L1）
+    ]
+    return furn
+
+
+def make_office_scene(seed: int = 0) -> Scene:
+    """办公室场景（隔断工位 + 会议室 + 休息区）——补场景族的「多房间隔断」一档。"""
+    del seed
+    scene = _build_fixed_scene(
+        "office", _OFFICE_ROOMS, _OFFICE_FLOORS, _OFFICE_DOORS,
+        _office_furniture(), _OFFICE_SPAWN, (0.0, 14.0, 0.0, 9.5))
+    scene.spawn_theta = 0.0             # 面向 +x（工位区）
+    return scene
+
+
 # 布局注册表：新增场景只需在此登记（env / web 侧用 layout 名选择）
 LAYOUTS = {
     "apartment": lambda s: make_apartment_scene(s, 1.0),
@@ -515,6 +645,8 @@ LAYOUTS = {
     "corridor": make_corridor_scene,                          # 1.5 m 窄走廊
     "s_corridor": make_s_corridor_scene,                      # S 形窄走廊
     "warehouse": make_warehouse_scene,                        # 仓库货架
+    "classroom": make_classroom_scene,                        # 教室（阵列式）
+    "office": make_office_scene,                              # 办公室（隔断工位）
 }
 
 
@@ -525,6 +657,107 @@ def segment_free(scene: "Scene", a, b, radius: float, n: int = 24) -> bool:
     b = np.asarray(b, dtype=np.float64)
     for t in np.linspace(0.0, 1.0, n):
         if not scene.is_free(a + (b - a) * t, margin=radius):
+            return False
+    return True
+
+
+def _free_map(scene: "Scene") -> np.ndarray:
+    """**物理碰撞口径**的自由图（缓存到 scene 上）。
+
+    `Scene.is_free(xy, margin)` 的判定是「所在格 ±m 邻域内无障碍」，
+    m = ceil(margin/CELL)。物理碰撞用的 margin = ROBOT_RADIUS*0.6 = 0.108
+    ⇒ m = 3 格 ⇒ 自由图 = 7×7 **方形**膨胀后的取反。
+
+    规划器若用别的口径做可行性判断，就会出现「规划说能过、实际过不去」——
+    故这里把**与物理判据完全一致**的自由图显式缓存下来。
+    """
+    key = "_free_map3"
+    fm = getattr(scene, key, None)
+    if fm is None:
+        from .env import ROBOT_RADIUS          # 延迟导入：避免循环依赖
+        m = int(np.ceil(ROBOT_RADIUS * 0.6 / CELL))
+        occ = scene.occ
+        # 沿行方向膨胀 m 格（每轮膨胀 1 格，用上一轮的结果迭代）
+        row = occ.copy()
+        for _ in range(m):
+            nxt = row.copy()
+            nxt[1:, :] |= row[:-1, :]
+            nxt[:-1, :] |= row[1:, :]
+            row = nxt
+        # 再沿列方向膨胀 m 格 ⇒ (2m+1)² 方形膨胀
+        col = row.copy()
+        for _ in range(m):
+            nxt = col.copy()
+            nxt[:, 1:] |= col[:, :-1]
+            nxt[:, :-1] |= col[:, 1:]
+            col = nxt
+        fm = ~col
+        # 边界：物理判据 `is_free` 会拒绝「格子距栅格边缘不足 m 格」的位置，
+        # 这里同样把它们标成不可用，保证两张图**逐点一致**（实测内部 0 处不一致）。
+        fm[:m, :] = False
+        fm[-m:, :] = False
+        fm[:, :m] = False
+        fm[:, -m:] = False
+        setattr(scene, key, fm)
+    return fm
+
+
+def _segment_cells(r0, c0, r1, c1):
+    """线段 (r0,c0)→(r1,c1) 经过的所有格子（**解析枚举**，不靠采样）。
+
+    做法：线段穿过的每条格线都对应一个 t 值，把这些 t 排序后，
+    相邻 t 之间线段所在格子恒定 → 取区间中点定出该格。
+    这样**不会漏格**：对角线段擦过某个格子的 t 窗口可以极窄
+    （实测窄到 0.014 t），任何等步长采样都可能整格跳过
+    （机器人于是规划出「擦着桌角」的路径 → 顶死在桌角、反复碰撞到超时）。
+    """
+    dr = r1 - r0
+    dc = c1 - c0
+    ts = [0.0, 1.0]
+    if dr != 0:
+        lo, hi = sorted((r0, r1))
+        for k in range(int(np.floor(lo)) + 1, int(np.ceil(hi)) + 1):
+            t = (k - r0) / dr
+            if 0.0 < t < 1.0:
+                ts.append(t)
+    if dc != 0:
+        lo, hi = sorted((c0, c1))
+        for k in range(int(np.floor(lo)) + 1, int(np.ceil(hi)) + 1):
+            t = (k - c0) / dc
+            if 0.0 < t < 1.0:
+                ts.append(t)
+    ts.sort()
+    cells = []
+    for i in range(len(ts) - 1):
+        tm = 0.5 * (ts[i] + ts[i + 1])
+        r = int(np.floor(r0 + dr * tm))
+        c = int(np.floor(c0 + dc * tm))
+        if not cells or cells[-1] != (r, c):
+            cells.append((r, c))
+    return cells
+
+
+def segment_free_exact(scene: "Scene", a, b, radius: float = 0.0) -> bool:
+    """**格精确**的直线可达判定（口径与物理碰撞完全一致）。
+
+    为什么不能只靠采样点（`segment_free`）：采样点之间存在「窄缝」，
+    两条采样点分别落在障碍两侧的空格，中间那个被占的格子被跳过 ——
+    实测教室场景里机器人规划到一条恰好擦过课桌桌角的路径，
+    实际走过去被卡死（400+ 次碰撞后超时）。
+
+    做法：解析枚举线段经过的**所有格子**，逐格查「物理口径自由图」
+    （= 7×7 方形膨胀的取反，与 `Scene.is_free(margin)` 逐点一致）。
+    """
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    free = _free_map(scene)
+    H, W = free.shape
+    r0, c0 = scene.w2c(a)
+    r1, c1 = scene.w2c(b)
+    for (r, c) in _segment_cells(r0, c0, r1, c1):
+        if not (0 <= r < H and 0 <= c < W):
+            return False
+        if not free[r, c]:
             return False
     return True
 

@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from .env import V_MAX, W_MAX
+from .env import SAFE_CLEARANCE, V_MAX, W_MAX
 from .sensors import LIDAR_MAX_RANGE
 from .world import CELL
 
@@ -348,7 +348,7 @@ class GeodesicWindowPolicy:
 
     # ---------------------------------------------------------------- 主体
     def act(self, obs, env):
-        from .world import segment_free
+        from .world import segment_free_exact
         goal = self._goal_of(env)
         if self._f is None or self._g is None or \
                 not np.allclose(goal, self._g, atol=0.3):
@@ -370,14 +370,18 @@ class GeodesicWindowPolicy:
         tgt = None
         for _, r1, c1 in cand:
             p = env.scene.c2w((r1, c1))
-            if segment_free(env.scene, env.pose[:2], p, 0.11):
+            # **可行性判据必须与物理碰撞判据一致**（格精确版）：
+            # 用采样点会漏掉「恰好擦过桌角」的窄缝 → 规划出的路径机器人挤不进去，
+            # 表现为顶在障碍角上反复碰撞直到超时（实测教室场景 482 次碰撞）。
+            if segment_free_exact(env.scene, env.pose[:2], p):
                 tgt = p
                 break
         if tgt is None:
             return np.array([0.0, 0.6])
         # 末段直取：贴近目标且视线可达时直接瞄准目标中心
         ds = env.d_surf
-        if ds == ds and ds < 0.9 and segment_free(env.scene, env.pose[:2], goal, 0.11):
+        if ds == ds and ds < 0.9 and \
+                segment_free_exact(env.scene, env.pose[:2], goal):
             tgt = goal
         ang = float(np.arctan2(tgt[1] - env.pose[1], tgt[0] - env.pose[0])
                     - env.pose[2])
