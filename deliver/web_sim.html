@@ -11,7 +11,7 @@ button{cursor:pointer}button:hover{background:#3a3a3a}
 table{border-collapse:collapse;font-size:13px}td,th{border:1px solid #444;padding:4px 10px}
 .big{font-size:18px;font-weight:bold}
 </style></head><body>
-<h1>SmolVLA 室内语义导航 · 仿真演示系统（E1 标定场地，与论文实验同环境）</h1>
+<h1>SmolVLA 室内语义导航 · 仿真演示系统（三室两厅公寓演示 / E1 标定场景可切换）</h1>
 <div class="panel">
 策略 <select id="policy">
 <option value="oracle">oracle 全知规划（上界）</option>
@@ -107,7 +107,6 @@ function draw(s){const c=map.getContext('2d');c.fillStyle='#111';c.fillRect(0,0,
   c.strokeStyle='rgba(0,0,0,.45)';c.lineWidth=3;c.strokeText(rm.name,cx,cy);
   c.fillStyle='#5a5248';c.fillText(rm.name,cx,cy)}
  c.textAlign='start';c.textBaseline='alphabetic';
- const X=x=>(x-m.b[0])/(m.b[1]-m.b[0])*640, Y=y=>480-(y-m.b[2])/(m.b[3]-m.b[2])*480;
  if(s.goal){c.fillStyle='#2f2';c.beginPath();c.arc(X(s.goal[0]),Y(s.goal[1]),7,0,7);c.fill();
   c.fillStyle='#fff';c.font='11px sans-serif';c.fillText('目标',X(s.goal[0])+9,Y(s.goal[1])-6)}
  if(s.target){c.fillStyle='#f44';c.beginPath();c.arc(X(s.target[0]),Y(s.target[1]),9,0,7);c.fill();
