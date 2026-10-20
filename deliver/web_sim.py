@@ -418,6 +418,15 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         elif self.path == "/api/state":
             with LOCK:
+                if SIM.map_png is None:
+                    # 首次访问即预渲染默认场景（公寓）的底图，页面打开就有户型图
+                    try:
+                        if SIM.aenv is None:
+                            SIM.aenv = calibrated_env(layout="apartment",
+                                                      max_steps=350)
+                        SIM.refresh_map(SIM.aenv)
+                    except Exception:                       # noqa: BLE001
+                        pass
                 self._json(SIM.snapshot())
         else:
             self._json({"error": "not found"})
