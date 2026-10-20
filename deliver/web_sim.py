@@ -435,6 +435,8 @@ def run_episode(sim, policy_name, seed, level, collect_only=False,
         sim.refresh_map(env)
     info = None
     while True:
+        if sim._stop:                # 「⏹ 停止」按钮：任何运行中的回合立即终止
+            break
         a = pol.act(obs, env)
         obs, _r, done, info = env.step(a)
         steps += 1
@@ -493,9 +495,13 @@ def worker_single(sim, policy_name, seed, level, instruction=None, scenario=None
                           instruction=instruction, scenario=scenario,
                           scene_name=scene_name)
         with LOCK:
+            if sim._stop:
+                res = dict(res, stopped=True)    # 「⏹ 停止」终止：标注为手动停止
+                sim.mode = "stopped"
             sim.result = res
             sim.done = True
-            sim.mode = "done"
+            if sim.mode != "stopped":
+                sim.mode = "done"
     except Exception as e:                              # noqa: BLE001
         with LOCK:
             sim.mode = "error"
@@ -581,7 +587,7 @@ class Handler(BaseHTTPRequestHandler):
                 if SIM.worker and SIM.worker.is_alive():
                     SIM._stop = True
                     SIM.worker.join(timeout=10)
-                    SIM._stop = False
+                SIM._stop = False        # 无条件复位：上次「停止」不能毒死新回合
                 SIM.mode = "running"
                 SIM.done = False
                 SIM.result = None
@@ -607,7 +613,7 @@ class Handler(BaseHTTPRequestHandler):
                 if SIM.worker and SIM.worker.is_alive():
                     SIM._stop = True
                     SIM.worker.join(timeout=10)
-                    SIM._stop = False
+                SIM._stop = False        # 无条件复位（与 /api/start 同理）
                 SIM.mode = "batch"
                 SIM.batch = {"running": True, "done": 0,
                              "n": int(req.get("n", 20)), "sr": None,
