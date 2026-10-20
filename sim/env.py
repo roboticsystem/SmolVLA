@@ -17,7 +17,8 @@ import numpy as np
 
 from .sensors import (CAMERA_HFOV_DEG, LIDAR_MAX_RANGE, lidar_scan,
                       photometric_augment, render)
-from .world import CELL, CLASS_CN, COLOR_NAMES, TARGET_CLASSES, make_pedestrians, make_scene
+from .world import (CELL, CLASS_CN, COLOR_NAMES, TARGET_CLASSES,
+                    is_free_dyn, make_pedestrians, make_scene, occ_with_peds)
 
 # 与真机对齐的运动学限制（TT 减速电机小型差速底盘）
 V_MAX = 0.35      # m/s
@@ -54,7 +55,11 @@ class SemanticNavEnv:
                  reward_shaping=1.0, collide_penalty=0.05,
                  task_level=None, goal_image=False, n_instr_per_episode=1,
                  room_w=3.6, room_h=3.4, n_objects_per_room=(1, 3),
-                 success_standoff=0.30, layout=None):
+                 success_standoff=0.30, layout=None,
+                 light_dir=None, light_strength=1.0, glare=0.0, gloss=0.0,
+                 exposure=1.0, flat_wall=False, dyn_peds=False,
+                 accel=0.0, acc_ang=0.0, slip=0.0, odom_drift=0.0,
+                 frame_drop=0.0, act_delay=0, with_depth=False):
         self.seed = seed
         self.cfg = dict(nx=nx, ny=ny, n_peds=n_peds, max_steps=max_steps, dt=dt,
                         obs_size=obs_size, lidar_beams=lidar_beams,
@@ -66,7 +71,13 @@ class SemanticNavEnv:
                         n_instr_per_episode=n_instr_per_episode,
                         room_w=room_w, room_h=room_h,
                         n_objects_per_room=n_objects_per_room,
-                        success_standoff=success_standoff, layout=layout)
+                        success_standoff=success_standoff, layout=layout,
+                        light_dir=light_dir, light_strength=light_strength,
+                        glare=glare, gloss=gloss, exposure=exposure,
+                        flat_wall=flat_wall, dyn_peds=dyn_peds,
+                        accel=accel, acc_ang=acc_ang, slip=slip,
+                        odom_drift=odom_drift, frame_drop=frame_drop,
+                        act_delay=act_delay, with_depth=with_depth)
         self.rng = np.random.default_rng(seed)
         self._ep = 0
         self.scene = None
@@ -244,19 +255,61 @@ class SemanticNavEnv:
     def _obs(self):
         cfg = self.cfg
         pose = self.pose
-        img = render(self.scene, pose, self.peds, width=cfg["obs_size"][0],
-                     height=cfg["obs_size"][1])
+        # ---- 掉帧：画面停在上一帧（真实相机/网络的丢帧）----
+        drop = cfg.get("frame_drop", 0.0) > 0 and self._last_img is not None \
+            and self.rng.random() < cfg["frame_drop"]
+        if drop:
+            img = self._last_img.copy()
+        else:
+            _with_depth = bool(cfg.get("with_depth", False))
+            if _with_depth:
+                img, dep = render(self.scene, pose, self.peds,
+                                  width=cfg["obs_size"][0], height=cfg["obs_size"][1],
+                                  light_dir=cfg.get("light_dir"),
+                                  light_strength=cfg.get("light_strength", 1.0),
+                                  glare=cfg.get("glare", 0.0),
+                                  gloss=cfg.get("gloss", 0.0),
+                                  exposure=cfg.get("exposure", 1.0),
+                                  flat_wall=cfg.get("flat_wall", False),
+                                  return_depth=True)
+                self._last_depth = dep
+            else:
+                img = render(self.scene, pose, self.peds, width=cfg["obs_size"][0],
+                             height=cfg["obs_size"][1],
+                             light_dir=cfg.get("light_dir"),
+                             light_strength=cfg.get("light_strength", 1.0),
+                             glare=cfg.get("glare", 0.0), gloss=cfg.get("gloss", 0.0),
+                             exposure=cfg.get("exposure", 1.0),
+                             flat_wall=cfg.get("flat_wall", False))
+            self._last_img = img.copy()
         if cfg["camera_augment"] > 0:
             img = photometric_augment(img, self.rng, strength=cfg["camera_augment"])
         lid = lidar_scan(self.scene, pose, n_beams=cfg["lidar_beams"],
-                         noise_std=cfg["lidar_noise"], rng=self.rng)
-        state = np.concatenate([pose, self.last_action]).astype(np.float32)
+                         noise_std=cfg["lidar_noise"], rng=self.rng,
+                         grid=(occ_with_peds(self.scene, self.peds)
+                               if cfg.get("dyn_peds") else None))
+        # ---- 里程计漂移：上报给策略的位姿带随机游走偏差 ----
+        # 真值仍在 `self.pose`（判成功/碰撞都用真值），只有**观测里的 state**
+        # 被污染 —— 这正是真机「里程计慢慢偏了」的样子，也解释了为什么特权基线
+        # （用 env.pose）不受影响而 VLA 会受影响。
+        rep = pose
+        if cfg.get("odom_drift", 0.0) > 0:
+            self._drift = self._drift + self.rng.normal(
+                0.0, cfg["odom_drift"], 2) * cfg["dt"]
+            self._drift_yaw += float(self.rng.normal(0.0, cfg["odom_drift"] * 0.5))
+            rep = np.array([pose[0] + self._drift[0], pose[1] + self._drift[1],
+                            pose[2] + self._drift_yaw], dtype=np.float64)
+        state = np.concatenate([rep, self.last_action]).astype(np.float32)
         out = {"image": img, "lidar": lid.astype(np.float32), "state": state,
                "instruction": self.task["instruction"], "task_level": self.task["level"]}
         if cfg["goal_image"]:                      # E3：目标图像（回合内不变，只渲染一次）
             if getattr(self, "_gimg", None) is None:
                 self._gimg = self.goal_image()
             out["goal_image"] = self._gimg
+        if cfg.get("with_depth", False):
+            # 深度图（米，float32）：真实深度相机/单目深度估计的输入形态，
+            # 用于「RGB vs RGB+D」双模态消融（论文2 的多传感器融合对照）
+            out["depth"] = np.asarray(self._last_depth, dtype=np.float32)
         return out
 
     # ------------------------------------------------------------ API
@@ -286,6 +339,13 @@ class SemanticNavEnv:
         self.last_action = np.zeros(2, dtype=np.float32)
         self.steps = 0
         self.path_len = 0.0
+        # 退化状态（加减速斜坡 / 轮滑 / 里程计漂移 / 掉帧 / 执行器延迟）
+        self._v_cmd = 0.0
+        self._w_cmd = 0.0
+        self._last_img = None
+        self._drift = np.zeros(2, dtype=np.float64)
+        self._drift_yaw = 0.0
+        self._act_q = []
         self.prev_dist = float(np.linalg.norm(self.task["goal"] - self.pose[:2]))
         self.d0 = self.prev_dist
         self.min_dist = self.prev_dist
@@ -310,14 +370,37 @@ class SemanticNavEnv:
 
         v, w = float(a[0]), float(a[1])
         th = self.pose[2]
-        nx = self.pose[0] + v * np.cos(th) * dt
-        ny = self.pose[1] + v * np.sin(th) * dt
+        # ---- 执行器延迟：动作排队 k 步后才生效（真机串口/网络延迟）----
+        delay = int(cfg.get("act_delay", 0) or 0)
+        if delay > 0:
+            self._act_q.append(a)
+            a = self._act_q.pop(0) if len(self._act_q) > delay else np.zeros(2)
+            v, w = float(a[0]), float(a[1])
+        # ---- 加减速斜坡：实际速度不能瞬变（电机 + 惯量）----
+        acc = float(cfg.get("accel", 0.0) or 0.0)
+        acc_ang = float(cfg.get("acc_ang", 0.0) or 0.0)
+        if acc > 0:
+            self._v_cmd += float(np.clip(v - self._v_cmd, -acc * dt, acc * dt))
+            v = self._v_cmd
+        if acc_ang > 0:
+            self._w_cmd += float(np.clip(w - self._w_cmd, -acc_ang * dt, acc_ang * dt))
+            w = self._w_cmd
+        # ---- 轮滑：实际位移小于指令位移（地面湿滑/地毯）----
+        slip = 1.0
+        p_slip = float(cfg.get("slip", 0.0) or 0.0)
+        if p_slip > 0 and self.rng.random() < p_slip:
+            slip = float(self.rng.uniform(0.45, 0.85))
+        nx = self.pose[0] + v * slip * np.cos(th) * dt
+        ny = self.pose[1] + v * slip * np.sin(th) * dt
         nth = th + w * dt
         nth = (nth + np.pi) % (2 * np.pi) - np.pi
 
-        # 碰撞：不可通行则原地停留
+        # 碰撞：不可通行则原地停留（`dyn_peds` 打开时行人也算障碍）
         moved = np.hypot(nx - self.pose[0], ny - self.pose[1])
-        if self.scene.is_free((nx, ny), margin=ROBOT_RADIUS * 0.6):
+        _free = (is_free_dyn(self.scene, (nx, ny), self.peds, ROBOT_RADIUS * 0.6)
+                 if cfg.get("dyn_peds")
+                 else self.scene.is_free((nx, ny), margin=ROBOT_RADIUS * 0.6))
+        if _free:
             self.pose = np.array([nx, ny, nth])
             self.path_len += moved
         else:

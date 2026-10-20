@@ -20,6 +20,7 @@ from sim.env import calibrated_env, navigate_metrics, grid_value
 from sim.baselines import (RandomPolicy, OraclePolicy, RandomTargetPolicy,
                            SweepDetectorPolicy)
 from sim.follow import (FollowEnv, OracleFollow, ReactiveFollow, FollowPolicyE4)
+from sim.planner import GeodesicWindowPolicy
 from sim.world import segment_free
 
 LOCK = threading.Lock()
@@ -53,6 +54,7 @@ class Sim:
         self.live = None          # 跟随模式：实时 距离/可见/带内
         self.fenv = None          # 跟随环境（懒创建，按 scenario 复用）
         self.aenv = None          # 公寓场景导航环境（懒创建）
+        self.avenvs = {}          # 各固定布局的导航环境缓存（公寓/走廊/仓库…）
         self.scene_name = "apartment"
         self.active_env = None    # 当前回合使用的环境（清晰相机渲染用）
         self.batch = {"running": False, "done": 0, "n": 0, "sr": None,
@@ -191,86 +193,25 @@ class VLAPolicy:
         return np.asarray(acts[0], np.float64)
 
 
-class FieldFollower:
-    """**公寓场景专用**的测地场跟随器（demo 用，不影响论文基线）。
+class FieldFollower(GeodesicWindowPolicy):
+    """**公寓/固定户型专用**的测地场跟随器（demo 用，不影响论文基线）。
+
+    实现已上移到 `sim/planner.GeodesicWindowPolicy`（CLI 评测与网页共用一份），
+    这里只保留一个带名字的子类，方便网页策略下拉显示「field」。
 
     为什么不用 `OraclePolicy`：它是在 8×6 m **单房间**标定场景（无墙无门）上
     调出来的 —— 避障减速 + 前瞻窗口的组合在门洞两侧墙角会陷入
     「贴墙 → 前方光束 <0.2 m → v=0 → 脱困自旋 → 又贴墙」的死循环
     （公寓 15 个跨房间目标实测 12 个失败）。而论文的 oracle 数据必须
-    保持原实现，所以这里另写一个纯场梯度跟随器：
-
-    - 每步在机器人周边 ±0.4 m 窗口找**测地场最小**的自由格作为临时瞄准点；
-    - 角度差直接比例转向、无避障接管（场路径本身在膨胀栅格上，天然无碰撞）；
-    - 卡住时窗口里总有更小的场值（场只会经门洞传播），因而无局部极小。
+    保持原实现，所以另用**窗口式测地场规划器**：窄走廊/S 形走廊/仓库
+    实测 4/4 成功（`oracle`/`planner_oracle` 在这些场景只有 0~1/4）。
     """
 
     name = "field"
 
-    def __init__(self, k_ang=3.0, win=14):
-        self.k_ang = float(k_ang)
-        self.win = int(win)
-        self._f = None
-        self._g = None
-
-    def reset(self, env=None):
-        self._f = None
-        self._g = None
-
-    def act(self, obs, env):
-        goal = np.asarray(env.task["goal"], dtype=float)
-        if self._f is None or self._g is None or not np.allclose(goal, self._g):
-            self._f = env._shortest_path_len(goal)
-            self._g = goal.copy()
-        f = self._f
-        H, W = f.shape
-        r, c = env.scene.w2c(env.pose[:2])
-        r, c = int(r), int(c)
-        # 候选格按「场值 + 距离惩罚」排序，取第一个**直线可达**的
-        # （纯取窗口最小会切家具角：目标格自由但连线穿角 → 顶死）
-        cand = []
-        for dr in range(-self.win, self.win + 1):
-            for dc in range(-self.win, self.win + 1):
-                rr, cc = r + dr, c + dc
-                if 0 <= rr < H and 0 <= cc < W and f[rr, cc] >= 0:
-                    v = float(f[rr, cc]) + 0.15 * np.hypot(dr, dc) * CELL_C
-                    cand.append((v, rr, cc))
-        if not cand:
-            return np.array([0.0, 0.5])
-        # 末段直取：贴近目标且视线可达时直接瞄准目标中心
-        # （成功由 env 的「包围盒表面距离 ≤0.30 m」判据触发，无需精确停靠）
-        if env.d_surf == env.d_surf and env.d_surf < 0.9 and \
-                segment_free(env.scene, env.pose[:2], goal, 0.11):
-            ang = float(np.arctan2(goal[1] - env.pose[1],
-                                   goal[0] - env.pose[0]) - env.pose[2])
-            ang = (ang + np.pi) % (2 * np.pi) - np.pi
-            v = env.cfg["v_max"] * float(np.clip(1.0 - abs(ang) / np.pi * 1.4,
-                                                 0.2, 1.0))
-            w = float(np.clip(self.k_ang * ang,
-                              -env.cfg["w_max"], env.cfg["w_max"]))
-            return np.array([v, w])
-        cand.sort()
-        tgt = None
-        for _, rr, cc in cand:          # 全量扫描：前 N 个可能全被墙角挡住
-            p = env.scene.c2w((rr, cc))
-            if segment_free(env.scene, env.pose[:2], p, 0.11):
-                tgt = p
-                break
-        if tgt is None:
-            return np.array([0.0, 0.6])
-        ang = float(np.arctan2(tgt[1] - env.pose[1], tgt[0] - env.pose[0])
-                    - env.pose[2])
-        ang = (ang + np.pi) % (2 * np.pi) - np.pi
-        # 大角度先原地转向（边走边转会在墙角来回顶）
-        if abs(ang) > 1.0:
-            return np.array([0.0, float(np.clip(self.k_ang * ang,
-                                                -env.cfg["w_max"], env.cfg["w_max"]))])
-        v = env.cfg["v_max"] * float(np.clip(1.0 - abs(ang) / np.pi * 1.4, 0.2, 1.0))
-        w = float(np.clip(self.k_ang * ang, -env.cfg["w_max"], env.cfg["w_max"]))
-        d = float(np.linalg.norm(goal - env.pose[:2]))
-        if d < 0.9:
-            v *= max(0.3, d / 0.9)
-        return np.array([v, w])
+    def __init__(self, **kw):
+        kw.setdefault("use_gt", True)
+        super().__init__(**kw)
 
 
 CELL_C = 0.05          # 与 sim.world.CELL 一致（独立常量，避免循环导入）
@@ -383,9 +324,14 @@ def make_policy(name, env=None):
     if name == "follow_e4":
         return FollowPolicyE4(use_kalman=True, use_depth=True,
                               use_gamma=True, use_enhance=True)
+    if name == "geodesic":
+        return FieldFollower()      # 窗口测地场上界（新固定布局）
     if name == "oracle" and env is not None and \
-            getattr(env.scene, "name", "") == "apartment":
-        return FieldFollower()      # 公寓场景换专用跟随器（见类注释）
+            getattr(env.scene, "name", "") in LAYOUT_STEPS:
+        # **固定户型**（公寓/窄走廊/S 形走廊/仓库）统一换测地场上界：
+        # 原版 OraclePolicy 在门洞/货架端头会陷入贴墙死循环（实测 0~1/4），
+        # 论文主结果仍用 CLI 的原始 oracle，不受影响。
+        return FieldFollower()
     return {"oracle": OraclePolicy, "sweep": SweepDetectorPolicy,
             "random_target": RandomTargetPolicy, "random": RandomPolicy,
             "vla": VLAPolicy}[name]()
@@ -413,8 +359,26 @@ def apply_instruction(env, instr):
     return False
 
 
+# 各固定布局的步数上限（场景越大路径越长，步数按测地尺度放宽）
+LAYOUT_STEPS = {"apartment": 350, "apartment_s": 300, "apartment_l": 450,
+                 "corridor": 700, "s_corridor": 700, "warehouse": 650}
+
+# **硬件退化族**（论文1/2 报告的 sim-to-real 差距来源；默认全关，保全论文数字）
+DEGRADE_KW = {
+    "none": {},
+    "slip": dict(slip=0.25),                  # 轮滑：实际位移小于指令
+    "odom": dict(odom_drift=0.03),            # 里程计漂移：上报位姿带偏差
+    "drop": dict(frame_drop=0.25),            # 掉帧：画面停在上一帧
+    "delay": dict(act_delay=3),               # 执行器/网络延迟：动作延后生效
+    "accel": dict(accel=0.5, acc_ang=1.0),    # 加减速斜坡：速度不能瞬变
+    "peds": dict(dyn_peds=True, n_peds=3),    # 行人作为动态障碍（挡激光/可撞）
+    "combo": dict(slip=0.2, odom_drift=0.02, frame_drop=0.15, act_delay=2,
+                  accel=0.5, acc_ang=1.0, dyn_peds=True, n_peds=2),
+}
+
+
 def _pick_env(sim, policy_name, scenario, scene_name=None):
-    """按策略与场景选择环境（导航/跟随 × 标定实验场景/公寓，均懒创建复用）。"""
+    """按策略与场景选择环境（导航/跟随 × 标定实验场景/公寓/新场景，均懒创建复用）。"""
     scene_name = scene_name or "lab"
     if policy_name.startswith("follow"):
         sc = scenario or "normal"
@@ -423,7 +387,7 @@ def _pick_env(sim, policy_name, scenario, scene_name=None):
         key = (sc, scene_name)
         if sim.fenv is None or getattr(sim.fenv, "_key", None) != key:
             # tour 全屋巡回路程约 45 m → 步数大幅放宽；跟随更紧、人速更慢
-            steps = 2200 if sc == "tour" else 300
+            steps = 2200 if sc == "tour" else LAYOUT_STEPS.get(scene_name, 300)
             kw = dict(want_dist=1.1, target_speed=0.15) if sc == "tour" else {}
             sim.fenv = FollowEnv(seed=0, max_steps=steps, scenario=sc,
                                  camera_augment=0.25,
@@ -431,19 +395,28 @@ def _pick_env(sim, policy_name, scenario, scene_name=None):
                                  **kw)
             sim.fenv._key = key
         return sim.fenv
-    if scene_name == "apartment":
-        if sim.aenv is None:
-            # 公寓 11.4×8.6 m 远大于 8×6 标定场景，路径更长 → 步数上限放宽
-            sim.aenv = calibrated_env(layout="apartment", max_steps=350)
-        return sim.aenv
+    if scene_name in LAYOUT_STEPS:
+        # 固定户型（公寓/窄走廊/S 形走廊/仓库…）：按布局缓存，步数按尺度放宽
+        env = sim.avenvs.get(scene_name)
+        if env is None:
+            env = calibrated_env(layout=scene_name,
+                                 max_steps=LAYOUT_STEPS[scene_name])
+            sim.avenvs[scene_name] = env
+            if scene_name == "apartment":
+                sim.aenv = env
+        return env
     return sim.env
 
 
 def run_episode(sim, policy_name, seed, level, collect_only=False,
-                instruction=None, scenario=None, scene_name=None):
+                instruction=None, scenario=None, scene_name=None, degrade=None):
     env = _pick_env(sim, policy_name, scenario, scene_name)
     follow = policy_name.startswith("follow")
     sim.active_env = env
+    # 硬件退化族：在 reset **之前**写入 cfg（n_peds 决定场景里生成几个行人，
+    # 必须在建场景前生效）
+    for k, v in DEGRADE_KW.get(degrade or "none", {}).items():
+        env.cfg[k] = v
     obs = env.reset(seed=seed)
     pol = make_policy(policy_name, env=env)
     pol.reset(env=env)
@@ -527,11 +500,11 @@ def run_episode(sim, policy_name, seed, level, collect_only=False,
 
 
 def worker_single(sim, policy_name, seed, level, instruction=None, scenario=None,
-                  scene_name=None):
+                  scene_name=None, degrade=None):
     try:
         res = run_episode(sim, policy_name, seed, level,
                           instruction=instruction, scenario=scenario,
-                          scene_name=scene_name)
+                          scene_name=scene_name, degrade=degrade)
         with LOCK:
             if sim._stop:
                 res = dict(res, stopped=True)    # 「⏹ 停止」终止：标注为手动停止
@@ -547,9 +520,13 @@ def worker_single(sim, policy_name, seed, level, instruction=None, scenario=None
 
 
 def _batch_scenes(scene_name):
-    """批量评测的场景集合：'multi' → 标定场地 + 公寓（跨场景联合统计）。"""
+    """批量评测的场景集合：'multi' → 跨场景联合统计（论文4 的多规模实验口径）。
+
+    覆盖三种体量：标定单房间（论文主场景）/ 公寓 11.4×8.6 m / 仓库 14×10 m
+    —— 规模跨度足够看出「场景大小对成功率/步数的影响」。
+    """
     if scene_name in ("multi", "all"):
-        return ["lab", "apartment"]
+        return ["lab", "apartment", "warehouse"]
     return [scene_name]
 
 
@@ -614,7 +591,7 @@ def _batch_stats(rows, ref_rows=None):
 
 
 def worker_batch(sim, policy_name, n, level, scene_name=None, scenario=None,
-                 repeats=1, ref_policy=None):
+                 repeats=1, ref_policy=None, degrade=None):
     """批量评测：**可跨场景 + 可重复多次 + 可配对参考基线**。
 
     - 跨场景：`scene_name='multi'` 时在「标定场地 + 公寓」两种场地上跑同一批种子，
@@ -638,13 +615,13 @@ def worker_batch(sim, policy_name, n, level, scene_name=None, scenario=None,
                     seed = 9000 + ep * 37 + 100000 * rep
                     res = run_episode(sim, policy_name, seed, level,
                                       collect_only=True, scene_name=sc,
-                                      scenario=scenario)
+                                      scenario=scenario, degrade=degrade)
                     res.update(scene=sc, rep=rep, seed=seed)
                     rows.append(res)
                     if ref_policy:
                         r2 = run_episode(sim, ref_policy, seed, level,
                                          collect_only=True, scene_name=sc,
-                                         scenario=scenario)
+                                         scenario=scenario, degrade=degrade)
                         r2.update(scene=sc, rep=rep, seed=seed)
                         ref_rows.append(r2)
                     done += 1
@@ -737,7 +714,7 @@ class Handler(BaseHTTPRequestHandler):
                     target=worker_single,
                     args=(SIM, SIM.policy_name, SIM.seed, SIM.level,
                           req.get("instruction"), req.get("scenario"),
-                          req.get("scene")),
+                          req.get("scene"), req.get("degrade")),
                     daemon=True)
                 SIM.worker.start()
             self._json({"ok": True})
@@ -762,7 +739,8 @@ class Handler(BaseHTTPRequestHandler):
                           int(req.get("n", 20)), req.get("level"),
                           req.get("scene"), req.get("scenario"),
                           int(req.get("repeats", 1)),
-                          req.get("ref_policy") or None), daemon=True)
+                          req.get("ref_policy") or None,
+                          req.get("degrade")), daemon=True)
                 SIM.worker.start()
             self._json({"ok": True})
         elif self.path == "/api/voice":

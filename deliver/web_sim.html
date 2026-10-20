@@ -15,6 +15,7 @@ table{border-collapse:collapse;font-size:13px}td,th{border:1px solid #444;paddin
 <div class="panel">
 策略 <select id="policy">
 <option value="oracle">oracle 全知规划（上界）</option>
+<option value="geodesic">geodesic 窗口测地场（新布局上界）</option>
 <option value="sweep" selected>sweep 扫描检测（论文基线）</option>
 <option value="random_target">random_target 随机游走（下界）</option>
 <option value="random">random 纯随机</option>
@@ -27,14 +28,28 @@ table{border-collapse:collapse;font-size:13px}td,th{border:1px solid #444;paddin
 <option value="L3">L3 空间关系</option></select>
 场景 <select id="scn"><option value="apartment" selected>三室两厅公寓（演示）</option>
 <option value="lab">标定实验场景（论文）</option>
-<option value="multi">多场景联合（公寓+标定）</option></select>
+<option value="corridor">1.5m 窄走廊（论文1）</option>
+<option value="s_corridor">S 形窄走廊（论文1）</option>
+<option value="warehouse">仓库货架作业区（论文2/4）</option>
+<option value="apartment_s">公寓·紧凑档 0.82×</option>
+<option value="apartment_l">公寓·放大档 1.22×</option>
+<option value="multi">多场景联合（跨场景统计）</option></select>
 遮挡场景 <select id="scen" style="display:none"><option value="normal">normal 常规</option>
 <option value="tour">tour 全屋巡回（公寓专用）</option>
 <option value="short_occl">short_occl 短遮挡 1.6s</option>
 <option value="long_occl">long_occl 长遮挡 3.8s</option>
 <option value="light_shift">light_shift 光照突变</option>
 <option value="narrow">narrow 窄道穿行</option>
-<option value="dim">dim 弱光</option><option value="backlight">backlight 逆光</option></select>
+<option value="dim">dim 弱光</option><option value="backlight">backlight 逆光</option>
+<option value="sunset">sunset 夕阳强逆光</option>
+<option value="gloss">gloss 反光地面</option>
+<option value="shadow">shadow 侧光阴影</option>
+<option value="plain_wall">plain_wall 纯白无纹理墙</option></select>
+硬件退化 <select id="deg"><option value="none">无</option>
+<option value="slip">轮滑</option><option value="odom">里程计漂移</option>
+<option value="drop">掉帧</option><option value="delay">执行器延迟</option>
+<option value="accel">加减速斜坡</option><option value="peds">行人动态障碍</option>
+<option value="combo">组合退化</option></select>
 起始种子 <input id="seed" type="number" value="9000" style="width:90px">
 <button onclick="start()">▶ 单回合演示</button>
 回合数 <input id="n" type="number" value="20" style="width:70px">
@@ -65,9 +80,10 @@ table{border-collapse:collapse;font-size:13px}td,th{border:1px solid #444;paddin
 const statusEl = document.getElementById('status');
 async function post(u,d){const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d||{})});return r.json()}
 policy.onchange=()=>{scen.style.display=policy.value.startsWith('follow')?'':'none'};
-function start(){post('/api/start',{policy:policy.value,seed:+seed.value,level:level.value||null,scenario:scen.value,scene:scn.value})}
+function start(){post('/api/start',{policy:policy.value,seed:+seed.value,level:level.value||null,scenario:scen.value,scene:scn.value,degrade:deg.value})}
 function batch(){post('/api/batch',{policy:policy.value,n:+n.value,repeats:(+rep.value||1),
- ref_policy:(refpol.value||null),level:level.value||null,scenario:scen.value,scene:scn.value})}
+ ref_policy:(refpol.value||null),level:level.value||null,scenario:scen.value,scene:scn.value,
+ degrade:deg.value})}
 function stopB(){post('/api/stop')}
 // ---- 语音：浏览器录音(16k 单声道 WAV) → /api/voice → 自动用归一化指令启动 SmolVLA 回合 ----
 async function recWav(sec){
@@ -101,7 +117,7 @@ function sendText(){const t=saytext.value.trim();if(!t)return;
  if(p.startsWith('follow')){p='vla';policy.value='vla';scen.style.display='none';
   vstate.innerHTML='指令「'+t+'」（跟随策略不接收指令，已自动切换 SmolVLA）';}
  else vstate.textContent='指令「'+t+'」';
- post('/api/start',{policy:p,seed:+seed.value,instruction:t,scenario:scen.value,scene:scn.value})}
+ post('/api/start',{policy:p,seed:+seed.value,instruction:t,scenario:scen.value,scene:scn.value,degrade:deg.value})}
 // ================= 2D 平面图（小地图，含房间名） =================
 const FURN={chair:['#cd6b5c','#9c463a'],table:['#b98a5a','#8a6236'],sofa:['#6e87c4','#4a5f96'],
  bed:['#8fa3d9','#63779f'],shelf:['#8b7355','#644f38'],plant:['#5fa46b','#3f7a4a'],

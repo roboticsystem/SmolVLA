@@ -156,8 +156,8 @@ def make_scene(seed: int = 0, nx: int = 3, ny: int = 2, room_w: float = 3.6,
     `layout="apartment"` 时返回固定的「三室两厅」户型（演示用），
     其余参数被忽略；默认 None 保持原有随机 MultiRoom（论文实验用）。
     """
-    if layout == "apartment":
-        return make_apartment_scene(seed)
+    if layout in LAYOUTS:
+        return LAYOUTS[layout](seed)
     rng = np.random.default_rng(seed)
     rooms, (xmin, xmax, ymin, ymax) = _layout(nx, ny, room_w, room_h, wall, seed)
 
@@ -308,10 +308,14 @@ _APARTMENT_FURNITURE = [
 _APARTMENT_SPAWN = (2.60, 1.00)             # 客厅（玄关侧），面向沙发/电视
 
 
-def make_apartment_scene(seed: int = 0) -> Scene:
-    """固定「三室两厅」户型场景（确定性，`seed` 仅保持接口兼容）。"""
-    del seed
-    xmin, ymin, xmax, ymax = 0.0, 0.0, 11.4, 8.6
+def _build_fixed_scene(name, rooms, floors, doors, furniture, spawn, bounds,
+                       door_rgb=(201, 160, 99)):
+    """由「房间矩形 + 门洞 + 家具清单」构建固定户型场景。
+
+    抽出来是为了让公寓 / 窄走廊 / S 形走廊 / 仓库四类场景共用同一套
+    栅格化与占据图逻辑（论文1 的窄走廊、论文2/4 的仓库货架都靠它扩展）。
+    """
+    xmin, xmax, ymin, ymax = bounds
     Wg = int(np.ceil((xmax - xmin) / CELL))
     Hg = int(np.ceil((ymax - ymin) / CELL))
     sem = np.full((Hg, Wg), WALL, dtype=np.uint8)
@@ -326,18 +330,16 @@ def make_apartment_scene(seed: int = 0) -> Scene:
         rgb[r0:r1, c0:c1] = np.array(
             rgbv if rgbv is not None else SEMANTICS[val][1], dtype=np.uint8)
 
-    for name, (x0, y0, x1, y1) in _APARTMENT_ROOMS:
-        carve(x0, y0, x1, y1, FREE, _APARTMENT_FLOORS[name])
-    for d in _APARTMENT_DOORS:
-        carve(*d, DOOR, (201, 160, 99))
+    for nm, (x0, y0, x1, y1) in rooms:
+        carve(x0, y0, x1, y1, FREE, floors.get(nm))
+    for d in doors:
+        carve(*d, DOOR, door_rgb)
 
     objects = [Obj(cls, color, (x, y), half)
-               for cls, color, x, y, half in _APARTMENT_FURNITURE]
-    rooms = [rect for _, rect in _APARTMENT_ROOMS]
-    scene = Scene(sem, rgb, objects, np.array(_APARTMENT_SPAWN), np.pi / 2.0,
-                  rooms, (xmin, xmax, ymin, ymax), name="apartment")
+               for cls, color, x, y, half in furniture]
+    scene = Scene(sem, rgb, objects, np.array(spawn, dtype=np.float64),
+                  np.pi / 2.0, [rect for _, rect in rooms], bounds, name=name)
 
-    # 家具画进栅格（语义 + 颜色 + 深色描边增强俯视观感）
     dark = (60, 56, 52)
     for o in objects:
         r0, c0, r1, c1 = scene.cell_bbox(o.xy, o.half)
@@ -351,8 +353,169 @@ def make_apartment_scene(seed: int = 0) -> Scene:
         scene._stamp_occ(o)
     scene._door_cells = []
     scene._room_of_obj = {}
-    scene.room_names = list(_APARTMENT_ROOMS)     # 前端房间名标注用
+    scene.room_names = list(rooms)      # 前端房间名标注用：(名称, 矩形) 对
     return scene
+
+
+def _scale_door(d, s):
+    """门洞随场景缩放：**开口宽度保持不变**（真实世界的门宽不随房间变大），
+    只缩放位置与墙厚。
+
+    `s == 1` 时**原样返回**：缩放公式里的 `cy ± dy/2` 会把 1.30 变成
+    1.3000000000000003，除以 CELL 后 floor/ceil 的结果整整差一格（5 cm 墙沿），
+    会让重构后的公寓栅格与历史结果不可比。
+    """
+    if abs(s - 1.0) < 1e-9:
+        return tuple(d)
+    x0, y0, x1, y1 = d
+    dx, dy = x1 - x0, y1 - y0
+    if dx <= dy:                      # 墙薄在 x 方向 → 开口沿 y
+        cy = 0.5 * (y0 + y1) * s
+        return (round(x0 * s, 6), round(cy - dy / 2.0, 6),
+                round(x1 * s, 6), round(cy + dy / 2.0, 6))
+    cx = 0.5 * (x0 + x1) * s
+    return (round(cx - dx / 2.0, 6), round(y0 * s, 6),
+            round(cx + dx / 2.0, 6), round(y1 * s, 6))
+
+
+def make_apartment_scene(seed: int = 0, scale: float = 1.0) -> Scene:
+    """固定「三室两厅」户型场景（确定性，`seed` 仅保持接口兼容）。
+
+    `scale` 用于做**场景规模阶梯**（论文4 的 45×35 / 75×45 / 100×60 三档做法）：
+    0.82 / 1.0 / 1.22 三档共用同一套家具相对布局，门宽保持 1.2~1.4 m。
+    """
+    del seed
+    s = float(scale)
+    rooms = [(nm, tuple(v * s for v in rect)) for nm, rect in _APARTMENT_ROOMS]
+    doors = [_scale_door(d, s) for d in _APARTMENT_DOORS]
+    furn = [(cls, color, x * s, y * s, half * s)
+            for cls, color, x, y, half in _APARTMENT_FURNITURE]
+    spawn = (_APARTMENT_SPAWN[0] * s, _APARTMENT_SPAWN[1] * s)
+    bounds = (0.0, 11.4 * s, 0.0, 8.6 * s)
+    scene = _build_fixed_scene("apartment", rooms, _APARTMENT_FLOORS, doors,
+                               furn, spawn, bounds)
+    scene.spawn_theta = np.pi / 2.0
+    return scene
+
+
+# ---------------------------------------------------------------- 窄走廊 / S 形走廊
+# 参照论文1《基于嵌入式视觉的室内无人车可行走路径的识别系统研究》§5.3：
+#   「宽度仅为 1.5 米的走廊」，前方单侧与双侧交错放置多个纸箱，
+#   地面为大理石瓷砖（存在反光纹理倒影）。
+# 我们的版本保留「1.5 m 净宽 + 交错障碍 + 尽端目标」三要素，
+# 差别是障碍用语义类别的家具（椅子/沙发）而非纯纸箱，以复用同一套
+# L1/L2/L3 指令与目标判据。
+_CORRIDOR_ROOMS = [
+    ("走廊前段", (0.18, 0.18, 8.50, 1.68)),      # 净宽 1.50 m
+    ("走廊后段", (7.00, 1.68, 8.80, 9.60)),      # 净宽 1.80 m，L 形拐角
+]
+_CORRIDOR_FLOORS = {"走廊前段": (214, 208, 196), "走廊后段": (214, 208, 196)}
+# 障碍布置约束：**同侧可交错，对侧不得在 x 上重叠**（否则两侧夹出一个 0.26 m
+# 的死缝，膨胀栅格下直接断路 —— 实测踩过：s 形走廊曾整条不可达）。
+# 另一条约束：家具靠墙放，保证剩余净宽 ≥0.9 m（扣除膨胀后仍可通行）。
+_CORRIDOR_FURNITURE = [
+    ("chair", "black", 2.20, 0.45, 0.22),        # 下侧
+    ("tv", "white", 4.20, 0.45, 0.18),
+    ("chair", "black", 6.20, 0.45, 0.22),
+    ("plant", "yellow", 3.20, 1.42, 0.22),       # 上侧（与下侧 x 不重叠）
+    ("tv", "black", 5.20, 1.42, 0.18),
+    ("table", "yellow", 8.30, 3.10, 0.40),       # 靠右墙
+    ("plant", "green", 8.45, 6.20, 0.22),       # 靠右墙
+    ("box", "white", 8.30, 9.05, 0.25),          # 尽端唯一「箱子」→ L1 可达
+]
+_CORRIDOR_SPAWN = (0.90, 0.93)
+
+
+def make_corridor_scene(seed: int = 0) -> Scene:
+    """1.5 m 窄走廊（L 形拐角）——对齐论文1 §5.3.1 的窄走廊工况。"""
+    del seed
+    scene = _build_fixed_scene(
+        "corridor", _CORRIDOR_ROOMS, _CORRIDOR_FLOORS, [], _CORRIDOR_FURNITURE,
+        _CORRIDOR_SPAWN, (0.0, 8.7, 0.0, 9.8))
+    scene.spawn_theta = 0.0                    # 面向 +x（沿走廊前进）
+    return scene
+
+
+_S_CORRIDOR_ROOMS = [
+    ("S前段", (0.18, 0.18, 6.20, 1.88)),        # 净宽 1.70 m
+    ("S竖段", (4.50, 1.88, 6.20, 5.20)),
+    ("S中段", (0.18, 5.20, 6.20, 6.70)),
+    ("S后段", (0.18, 6.70, 1.88, 10.20)),       # 净宽 1.70 m
+]
+_S_CORRIDOR_FLOORS = {k: (214, 208, 196) for k, _ in _S_CORRIDOR_ROOMS}
+_S_CORRIDOR_FURNITURE = [
+    ("chair", "black", 1.60, 0.45, 0.22),        # S前段 下侧
+    ("tv", "white", 2.80, 0.45, 0.18),
+    ("plant", "yellow", 3.90, 1.62, 0.22),       # S前段 上侧
+    ("chair", "black", 1.90, 1.62, 0.22),        # 与上/下侧 x 均不重叠
+    ("chair", "white", 5.30, 3.10, 0.22),        # S竖段
+    ("tv", "black", 5.30, 4.40, 0.18),
+    ("chair", "white", 3.60, 5.95, 0.22),        # S中段 下侧
+    ("tv", "black", 2.20, 5.95, 0.18),
+    ("plant", "green", 0.90, 6.45, 0.22),       # S中段 上侧
+    ("table", "yellow", 5.40, 0.95, 0.40),       # 靠右墙
+    ("box", "white", 1.00, 9.60, 0.25),          # 尽端唯一「箱子」
+]
+_S_CORRIDOR_SPAWN = (0.90, 0.93)
+
+
+def make_s_corridor_scene(seed: int = 0) -> Scene:
+    """S 形窄走廊 —— 对齐论文1 §5.4.2 的 S 型路径跟踪工况（此处改为
+    「长距离绕行到尽端目标」的导航工况）。"""
+    del seed
+    scene = _build_fixed_scene(
+        "s_corridor", _S_CORRIDOR_ROOMS, _S_CORRIDOR_FLOORS, [],
+        _S_CORRIDOR_FURNITURE, _S_CORRIDOR_SPAWN, (0.0, 6.4, 0.0, 10.4))
+    scene.spawn_theta = 0.0
+    return scene
+
+
+# ---------------------------------------------------------------- 仓库货架场景
+# 参照论文2《基于多传感器的室内自动搬运机器人的研究与实现》§6.2 的
+# 「货到人」仓库（井字形货架 + 拣选工位 + 活动货柜），与论文4 的
+# 「载货点—卸货点—停车点」分区；此处用同一套语义类别表达：
+#   货架 = shelf（书架语义）、货箱 = box、工位台 = table。
+_WAREHOUSE_ROOMS = [("仓库", (0.18, 0.18, 13.82, 9.82))]
+_WAREHOUSE_FLOORS = {"仓库": (198, 198, 194)}
+_WAREHOUSE_FURNITURE = [
+    # 3 排货架，每排 3 段（段间留 0.2 m），排间通道 2.2 m
+    ("shelf", "black", 2.60, 1.60, 0.50), ("shelf", "black", 2.60, 3.20, 0.50),
+    ("shelf", "black", 2.60, 4.80, 0.50),
+    ("shelf", "yellow", 6.00, 1.60, 0.50), ("shelf", "yellow", 6.00, 3.20, 0.50),
+    ("shelf", "yellow", 6.00, 4.80, 0.50),
+    ("shelf", "blue", 9.40, 1.60, 0.50), ("shelf", "blue", 9.40, 3.20, 0.50),
+    ("shelf", "blue", 9.40, 4.80, 0.50),
+    # 拣选工位（右侧）
+    ("table", "white", 12.60, 6.60, 0.45), ("table", "white", 11.20, 8.20, 0.45),
+    ("table", "green", 12.90, 8.30, 0.45),
+    # 地面货箱（避开出生点 (0.90, 0.90) 的 0.2 m 净空）
+    ("box", "white", 1.90, 0.80, 0.25), ("box", "black", 7.60, 7.20, 0.25),
+    ("box", "green", 3.40, 8.60, 0.25),
+    ("plant", "green", 13.20, 1.00, 0.22),
+    ("chair", "blue", 10.40, 8.40, 0.22),
+]
+_WAREHOUSE_SPAWN = (0.90, 0.90)
+
+
+def make_warehouse_scene(seed: int = 0) -> Scene:
+    """仓库货架作业场景（货架 + 工位 + 地面货箱）——对齐论文2/4 的作业语境。"""
+    del seed
+    scene = _build_fixed_scene(
+        "warehouse", _WAREHOUSE_ROOMS, _WAREHOUSE_FLOORS, [],
+        _WAREHOUSE_FURNITURE, _WAREHOUSE_SPAWN, (0.0, 14.0, 0.0, 10.0))
+    scene.spawn_theta = 0.0
+    return scene
+
+
+# 布局注册表：新增场景只需在此登记（env / web 侧用 layout 名选择）
+LAYOUTS = {
+    "apartment": lambda s: make_apartment_scene(s, 1.0),
+    "apartment_s": lambda s: make_apartment_scene(s, 0.82),   # 紧凑档
+    "apartment_l": lambda s: make_apartment_scene(s, 1.22),   # 放大档
+    "corridor": make_corridor_scene,                          # 1.5 m 窄走廊
+    "s_corridor": make_s_corridor_scene,                      # S 形窄走廊
+    "warehouse": make_warehouse_scene,                        # 仓库货架
+}
 
 
 # ---------------------------------------------------------------- 行人
@@ -362,6 +525,37 @@ def segment_free(scene: "Scene", a, b, radius: float, n: int = 24) -> bool:
     b = np.asarray(b, dtype=np.float64)
     for t in np.linspace(0.0, 1.0, n):
         if not scene.is_free(a + (b - a) * t, margin=radius):
+            return False
+    return True
+
+
+def occ_with_peds(scene: "Scene", peds=()):
+    """静态占据图 + **行人动态足迹**。
+
+    为什么需要：此前行人**不进占据栅格** —— 既不会被激光雷达看到，也不会与
+    机器人碰撞，等于「全程没有动态障碍」。真实室内（论文1 §5.3.2 的行人横穿、
+    论文2 的多机避让）里行人必须挡激光、必须能被撞到。
+
+    默认**不启用**（`cfg['dyn_peds']=False`）：论文里已记录的基线数字是在
+    「静态障碍」口径下测的，打开会改变 SR/SPL，必须作为**对照实验**单独报。
+    """
+    if not peds:
+        return scene.occ
+    occ = scene.occ.copy()
+    for p in peds:
+        r = float(getattr(p, "radius", 0.25))
+        r0, c0, r1, c1 = scene.cell_bbox(p.xy, r)
+        occ[r0:r1, c0:c1] = True
+    return occ
+
+
+def is_free_dyn(scene: "Scene", xy, peds=(), margin: float = 0.0) -> bool:
+    """自由空间判定 + 行人动态避让（用于碰撞检测）。"""
+    if not scene.is_free(xy, margin=margin):
+        return False
+    for p in peds:
+        r = margin + float(getattr(p, "radius", 0.25))
+        if float(np.hypot(xy[0] - p.xy[0], xy[1] - p.xy[1])) < r:
             return False
     return True
 

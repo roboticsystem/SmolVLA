@@ -136,16 +136,70 @@ def _shade(rgb, d, max_range):
     return np.clip(np.asarray(rgb, dtype=np.float64) * f[..., None], 0, 255).astype(np.uint8)
 
 
+def _shift_mask(a, dr, dc):
+    """布尔图平移（out[r,c] = a[r-dr, c-dc]），越界填 False。"""
+    out = np.zeros_like(a)
+    H, W = a.shape
+    r0, r1 = max(0, dr), min(H, H + dr)
+    c0, c1 = max(0, dc), min(W, W + dc)
+    if r1 <= r0 or c1 <= c0:
+        return out
+    out[r0:r1, c0:c1] = a[r0 - dr:r1 - dr, c0 - dc:c1 - dc]
+    return out
+
+
+def light_mask(scene, light_dir, max_len=6.0):
+    """方向光下的**受光图**：True = 该格未被墙体遮挡（被光照）。
+
+    做法：沿光线行进方向逐步回溯，用栅格平移累积遮挡（比逐格射线快 ~100 倍）。
+    结果按 (场景, 方向) 缓存 —— 同一场景同一太阳方位只算一次。
+
+    这是论文1《嵌入式视觉可行走路径识别》里「阴影/逆光工况」的真实成因：
+    地面出现大面积阴影 → 深度/分割在阴影边界失效 → 路径偏移。
+    """
+    key = ("light", round(float(light_dir) % (2 * np.pi), 3), round(max_len, 2))
+    cache = getattr(scene, "_light_cache", None)
+    if cache is None:
+        cache = {}
+        scene._light_cache = cache
+    if key in cache:
+        return cache[key]
+    occ = scene.wall_grid
+    du, dv = np.cos(light_dir), np.sin(light_dir)      # col(x) / row(y) 分量
+    K = int(max_len / CELL)
+    shadow = np.zeros_like(occ)
+    for k in range(1, K + 1):
+        d = k * CELL
+        dr = int(round(d * dv))
+        dc = int(round(d * du))
+        if dr == 0 and dc == 0:
+            continue
+        shadow |= _shift_mask(occ, dr, dc)              # 朝光源方向回溯
+    lit = ~shadow
+    cache[key] = lit
+    return lit
+
+
 def render(scene, pose, pedestrians=(), width=160, height=120,
            hfov_deg=CAMERA_HFOV_DEG, max_range=LIDAR_MAX_RANGE,
            cam_h=CAMERA_HEIGHT, ceiling=(238, 238, 244), floor=(206, 200, 188),
-           texture=True, fog_strength=0.45, fog_color=(150, 160, 175)):
+           texture=True, fog_strength=0.45, fog_color=(150, 160, 175),
+           light_dir=None, light_strength=1.0, glare=0.0, gloss=0.0,
+           exposure=1.0, flat_wall=False, return_depth=False):
     """第一人称 RGB 渲染（针孔模型 + 逐列深度测试）。
 
     为缩小 sim-to-real 视觉差距，加入三项廉价但有效的真实感处理：
     - **纹理**：墙体按命中格的哈希做逐格色彩抖动
     - **光照**：墙面垂直渐变 + 地面按透视距离衰减
     - **雾化**：按距离向雾色混合
+
+    新增**真实退化几何**（对齐论文1 的逆光/反光/无纹理工况）：
+    - `light_dir`：**方向光方向**（光线行进方向，弧度）→ 按 `light_mask`
+      在地面/墙面投出**真实的遮挡阴影**（墙后走廊变暗）；
+    - `glare`：光源入镜时的**眩光/过曝泛白**（论文1：WDR 被击穿 → 掩码溢出）；
+    - `gloss`：**镜面反光地面**（大理石/环氧地坪）沿光向拉出的高光带；
+    - `exposure`：全局曝光（<1 变暗，模拟弱光/傍晚）；
+    - `flat_wall`：**纯白无纹理墙**（论文1 的失效边界：掩码溢出墙面）。
 
     Returns:
         img (height, width, 3) uint8
@@ -163,6 +217,9 @@ def render(scene, pose, pedestrians=(), width=160, height=120,
     rows_idx = np.arange(height)[:, None]
     img = np.empty((height, width, 3), dtype=np.uint8)
     img[:] = np.array(ceiling, dtype=np.uint8)
+    # **深度缓冲**（米）：天花板=无穷远（用 max_range 占位）、地面按透视距离、
+    # 墙体按命中距离、sprite 按其距离 —— 供深度相机观测/双模态消融使用。
+    depth = np.full((height, width), float(max_range), dtype=np.float32)
 
     # ---- 地面：按透视行距计算深度并衰减 ----
     below = rows_idx - horizon
@@ -174,9 +231,38 @@ def render(scene, pose, pedestrians=(), width=160, height=120,
     fsh = fsh * (1 - fog_f) + fog_c[None, None, :] * fog_f
     mask_floor_all = below > 0.5
     img[:] = np.where(mask_floor_all[..., None], np.clip(fsh, 0, 255).astype(np.uint8), img)
+    depth[:] = np.where(mask_floor_all, np.broadcast_to(floor_dist, (height, width)),
+                        depth)
+
+    # ---- 方向光：地面阴影 + 镜面高光带 ----
+    lit = None
+    if light_dir is not None:
+        lit = light_mask(scene, light_dir)
+        sc = scene
+        ang = ang_off[None, :] + th
+        wx = x + floor_dist * np.cos(ang)
+        wy = y + floor_dist * np.sin(ang)
+        gc_ = np.clip(((wx - sc.bounds[0]) / CELL).astype(np.int64), 0, sc.W - 1)
+        gr_ = np.clip(((wy - sc.bounds[2]) / CELL).astype(np.int64), 0, sc.H - 1)
+        shadow_f = lit[gr_, gc_].astype(np.float64)[:, :, None]
+        fsh = fsh * (1.0 - 0.45 * (1.0 - shadow_f) * light_strength)
+        if gloss > 0.0:
+            du, dv = np.cos(light_dir), np.sin(light_dir)
+            rel_x = wx - x
+            rel_y = wy - y
+            perp = np.abs(-dv * rel_x + du * rel_y)          # 到光轴的垂距
+            band = np.exp(-(perp / 0.35) ** 2)
+            fall = np.clip(1.0 - floor_dist / max_range, 0.0, 1.0) ** 0.5
+            fsh = fsh + (255.0 * 0.45 * gloss * band * fall)[:, :, None]
+        img[:] = np.where(mask_floor_all[..., None],
+                          np.clip(fsh, 0, 255).astype(np.uint8), img)
 
     # ---- 墙体列 ----
-    wall_rgb = np.array(SEMANTICS[1][1], dtype=np.float64)
+    if flat_wall:
+        # 纯白无纹理墙（论文1 失效边界）：无逐格抖动、无垂直渐变
+        wall_rgb = np.array((238, 238, 238), dtype=np.float64)
+    else:
+        wall_rgb = np.array(SEMANTICS[1][1], dtype=np.float64)
     hw = SEMANTICS[1][2]
     d_safe = np.maximum(dist_wall, 1e-3)
     topf = horizon - f * (hw - cam_h) / d_safe
@@ -185,7 +271,7 @@ def render(scene, pose, pedestrians=(), width=160, height=120,
     bot = np.clip(np.round(botf), 0, height).astype(np.int64)
 
     # 纹理：命中格哈希 → 逐列抖动系数
-    if texture:
+    if texture and not flat_wall:
         ri = np.clip(wrow, 0, scene.H - 1)
         ci = np.clip(wcol, 0, scene.W - 1)
         hsh = ((ri * 73856093) ^ (ci * 19349663)) % 997
@@ -198,13 +284,21 @@ def render(scene, pose, pedestrians=(), width=160, height=120,
     fog_w = np.clip(fog_strength * dist_wall / max_range, 0.0, 1.0)
     wall_col = base * dist_f[:, None]
     wall_col = wall_col * (1 - fog_w[:, None]) + fog_c[None, :] * fog_w[:, None]
+    if lit is not None:
+        # 墙的受光：取命中格沿光向再前进一格（代表墙面朝向光的一侧）
+        du, dv = np.cos(light_dir), np.sin(light_dir)
+        gr_ = np.clip(wrow + int(round(0.5 * dv)), 0, scene.H - 1)
+        gc_ = np.clip(wcol + int(round(0.5 * du)), 0, scene.W - 1)
+        w_lit = lit[gr_, gc_].astype(np.float64)[:, None]
+        wall_col = wall_col * (1.0 - 0.35 * (1.0 - w_lit) * light_strength)
 
     mask_wall = (rows_idx >= top[None, :]) & (rows_idx < bot[None, :])
     span = np.maximum(bot - top, 1)[None, :]
     rel = np.clip((rows_idx - top[None, :]) / span, 0.0, 1.0)   # 0=顶 1=底
-    light = (0.78 + 0.22 * rel)                                  # 顶部稍暗
+    light = np.ones_like(rel) if flat_wall else (0.78 + 0.22 * rel)
     wall_px = wall_col[None, :, :] * light[..., None]
     img[:] = np.where(mask_wall[..., None], np.clip(wall_px, 0, 255).astype(np.uint8), img)
+    depth[:] = np.where(mask_wall, np.broadcast_to(dist_wall, (height, width)), depth)
 
     zbuf = dist_wall.copy()
 
@@ -258,9 +352,27 @@ def render(scene, pose, pedestrians=(), width=160, height=120,
         block = img[r0:r1, c0c:c1c, :]
         # col2 为逐行色 (nrows,3)，按选中的列广播
         block[:, cols_sel] = col2[:, None, :].astype(np.uint8)
+        dblock = depth[r0:r1, c0c:c1c]
+        dblock[:, cols_sel] = d
         zbuf[c0c:c1c] = np.where(vis, d, sub)
 
-    return img
+    # ---- 全局曝光 + 逆光眩光（光源入镜 → 过曝泛白，论文1 的 WDR 击穿）----
+    out = img.astype(np.float64)
+    if exposure != 1.0:
+        out *= float(exposure)
+    if glare > 0.0 and light_dir is not None:
+        src = light_dir + np.pi                      # 光源所在方向
+        da = (src - th + np.pi) % (2 * np.pi) - np.pi
+        if abs(da) < np.deg2rad(hfov_deg) / 2.0:
+            xs = (width - 1) / 2.0 + f * np.tan(da)
+            ys = 0.18 * height                       # 光源偏画面上方
+            dx = (np.arange(width)[None, :] - xs) / (0.45 * width)
+            dy = (np.arange(height)[:, None] - ys) / (0.55 * height)
+            w = glare * np.exp(-(dx ** 2 + dy ** 2))
+            w = np.clip(w, 0.0, 1.0)[:, :, None]
+            out = out * (1.0 - w) + 255.0 * w        # 泛白（高光溢出）
+    img = np.clip(out, 0, 255).astype(np.uint8)
+    return (img, depth) if return_depth else img
 
 
 def photometric_augment(img, rng, strength=0.25):

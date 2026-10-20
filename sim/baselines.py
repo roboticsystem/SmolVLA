@@ -17,7 +17,8 @@ from __future__ import annotations
 import numpy as np
 
 from .env import V_MAX, W_MAX
-from .planner import PlannerOraclePolicy, PlannerPolicy, PlannerRandomTargetPolicy
+from .planner import (GeodesicRandomTargetPolicy, GeodesicWindowPolicy,
+                      PlannerOraclePolicy, PlannerPolicy, PlannerRandomTargetPolicy)
 from .sensors import CAMERA_HFOV_DEG, LIDAR_MAX_RANGE
 from .world import CELL, COLORS
 
@@ -1163,7 +1164,10 @@ POLICIES = {"random": RandomPolicy, "frontier": FrontierPolicy,
             "reactive": ReactiveGoalPolicy, "oracle_smooth": SmoothOraclePolicy,
             "planner": PlannerPolicy, "planner_oracle": PlannerOraclePolicy,
             "planner_random": PlannerRandomTargetPolicy, "sweep": SweepPolicy,
-            "sweep_det": SweepDetectorPolicy}
+            "sweep_det": SweepDetectorPolicy,
+            # 窗口测地场上界（新增固定布局用；见 planner.GeodesicWindowPolicy）
+            "geodesic": GeodesicWindowPolicy,
+            "geodesic_random": GeodesicRandomTargetPolicy}
 
 
 def make_policy(name, **kw):

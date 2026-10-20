@@ -50,14 +50,30 @@ from .env import CALIBRATED, ROBOT_RADIUS, SemanticNavEnv
 from .perception import detect
 from .sensors import (CAMERA_HEIGHT, CAMERA_HFOV_DEG, LIDAR_MAX_RANGE, lidar_scan,
                       photometric_augment, raycast, render)
-from .world import COLORS, segment_free, CELL
+from .world import COLORS, segment_free, CELL, is_free_dyn, occ_with_peds
 
 VEST_COLOR = "red"          # 马甲色：用调色板里的 red，**必须场景唯一**
 PERSON_H = 1.70             # 人体高（真机用「已知人体高度」反推距离）
 PERSON_R = 0.25
 BAND = (0.9, 2.6)           # 期望距离带
 SCENARIOS = ("normal", "short_occl", "long_occl", "light_shift", "narrow",
-             "dim", "backlight")
+             "dim", "backlight", "sunset", "gloss", "shadow", "plain_wall",
+             "crowd")
+
+# **场景 → 真实光照/材质几何**（对齐论文1《嵌入式视觉可行走路径识别》的
+# 逆光、反光地面、无纹理白墙工况；不再只用单一 photometric 强度旋钮）：
+#   light_dir : 方向光行进方向（弧度）；glare : 逆光眩光/过曝；
+#   gloss     : 镜面反光地面；exposure : 全局曝光；flat_wall : 纯白无纹理墙。
+# `sunset`/`backlight` 的光来自**相机前方**（人在窗前 → 目标被逆光冲白）。
+SCENARIO_LIGHT = {
+    "normal":     dict(light_dir=None, glare=0.0, gloss=0.0, exposure=1.0),
+    "dim":        dict(light_dir=None, glare=0.0, gloss=0.0, exposure=0.45),
+    "backlight":  dict(light_dir=np.pi, glare=0.55, gloss=0.0, exposure=1.0),
+    "sunset":     dict(light_dir=np.pi, glare=0.80, gloss=0.15, exposure=0.75),
+    "gloss":      dict(light_dir=np.pi / 2, glare=0.0, gloss=0.75, exposure=1.0),
+    "shadow":     dict(light_dir=np.pi / 2, glare=0.0, gloss=0.0, exposure=1.0),
+    "plain_wall": dict(light_dir=None, glare=0.0, gloss=0.0, exposure=1.0),
+}
 
 # **目标速度必须低于机器人上限**，否则「跟不住」是物理必然、不是策略问题。
 # 实测教训：最初取 0.55 m/s，而 `V_MAX = 0.35 m/s` —— 连 oracle（用真值）
@@ -258,6 +274,10 @@ class FollowEnv(SemanticNavEnv):
         #    图像里一个马甲像素都没有）。
         # 需要多房间/狭窄通道时由 `scenario` 或显式传 `nx/ny` 覆盖。
         kw.setdefault("n_peds", 0)          # 跟随场景默认无额外行人，干扰由 scenario 控制
+        if self.scenario == "crowd":
+            # **人群干扰**：额外行人也会挡激光、也会被撞到（论文1 §5.3.2 的
+            # 「行人横穿」、论文2 的多机避让都是这类工况）
+            kw["n_peds"] = 2
         for k, v in CALIBRATED.items():
             if k in ("max_steps", "camera_augment"):
                 continue
@@ -429,6 +449,23 @@ class FollowEnv(SemanticNavEnv):
         # ---- 逐回合记账 ----
         self.obs_log = []            # 每步 (真值距离, 真值方位, 可见, 在带内)
         self.cfg["camera_augment"] = self._aug_base
+        # 光照/材质退化几何（按 scenario 设定，整回合生效）
+        lit = SCENARIO_LIGHT.get(self.scenario, SCENARIO_LIGHT["normal"])
+        cfg["glare"] = lit.get("glare", 0.0)
+        cfg["gloss"] = lit.get("gloss", 0.0)
+        cfg["exposure"] = lit.get("exposure", 1.0)
+        cfg["flat_wall"] = (self.scenario == "plain_wall")
+        # 光的方位**相对初始朝向**：`backlight/sunset` 的光源放在人（相机）正前方
+        # —— 目标被逆光冲白；`gloss/shadow` 放侧向 90°，地面拉出光带/长阴影。
+        # 用绝对方向会因机器人转向而失效（实测：光源在 +x、相机朝 +y 时
+        # 眩光完全不入镜，逆光场景名不副实）。
+        if lit.get("light_dir") is not None:
+            if self.scenario in ("backlight", "sunset"):
+                cfg["light_dir"] = th0 + np.pi          # 光从正前方射来
+            else:
+                cfg["light_dir"] = th0 + np.pi / 2      # 侧向光（光带/阴影）
+        else:
+            cfg["light_dir"] = None
         self._light_switched = False
         return self._obs()
 
@@ -472,14 +509,33 @@ class FollowEnv(SemanticNavEnv):
         bearing, dist, _n = r
         return float(bearing), float(dist)
 
+    def _dyn_obs(self):
+        """动态障碍列表：**只有干扰行人**，不含被跟随者。
+
+        为什么被跟随者不算障碍：市售跟随产品对「目标人体区域」做**激光滤波**
+        （人腿的回波被剔除，否则底盘会一直绕着人转、永远贴不上去）。
+        实测：把被跟随者塞进激光/碰撞集合后，反应式基线把人当成要避的障碍，
+        short_occl 的 TCR 从 70.3% 掉到 20.2%（它不敢靠近，就永远进不了带内）。
+
+        干扰行人（`crowd` 场景）**不滤波**：它们是真正的动态障碍，会挡激光、
+        会被撞到（论文1 §5.3.2 行人横穿、论文2 多机避让）。
+        """
+        return list(getattr(self, "peds", []) or [])
+
     def _obs(self):
         cfg = self.cfg
         img = render(self.scene, self.pose, [self.target],
-                     width=cfg["obs_size"][0], height=cfg["obs_size"][1])
+                     width=cfg["obs_size"][0], height=cfg["obs_size"][1],
+                     light_dir=cfg.get("light_dir"),
+                     light_strength=cfg.get("light_strength", 1.0),
+                     glare=cfg.get("glare", 0.0), gloss=cfg.get("gloss", 0.0),
+                     exposure=cfg.get("exposure", 1.0),
+                     flat_wall=cfg.get("flat_wall", False))
         if cfg["camera_augment"] > 0:
             img = photometric_augment(img, self.rng, strength=cfg["camera_augment"])
         lid = lidar_scan(self.scene, self.pose, n_beams=cfg["lidar_beams"],
-                         noise_std=cfg["lidar_noise"], rng=self.rng)
+                         noise_std=cfg["lidar_noise"], rng=self.rng,
+                         grid=occ_with_peds(self.scene, self._dyn_obs()))
         state = np.concatenate([self.pose, self.last_action]).astype(np.float32)
         # 目标**真值**只作为 `gt_target` 提供给 oracle 基线与指标；
         # `reactive` 与 VLA 一律走 `_perceived`，保证对照公平。
@@ -498,10 +554,15 @@ class FollowEnv(SemanticNavEnv):
                 self.steps >= cfg["max_steps"] // 2:
             self._light_switched = True
             cfg["camera_augment"] = min(0.85, self._aug_base + 0.55)
+            # 同时把光照几何切成**逆光**（比纯光度扰动更接近真实失效模式：
+            # 论文1 §5.3「傍晚直面走廊尽头西晒阳光，WDR 被击穿、画面大面积过曝泛白」）
+            cfg["light_dir"] = np.pi
+            cfg["glare"] = 0.6
         elif self.scenario == "dim" and not getattr(self, "_dim_on", False):
             # **弱光**：整回合亮度压低（模拟灯没开 / 傍晚）
             self._dim_on = True
             cfg["camera_augment"] = min(0.95, self._aug_base + 0.45)
+            cfg["exposure"] = SCENARIO_LIGHT["dim"]["exposure"]
         elif self.scenario == "backlight" and not getattr(self, "_bl_on", False):
             # **逆光**：高对比 + 强色偏（目标背对窗户）
             self._bl_on = True
@@ -514,7 +575,7 @@ class FollowEnv(SemanticNavEnv):
         nx = self.pose[0] + v * np.cos(th) * dt
         ny = self.pose[1] + v * np.sin(th) * dt
         nth = (th + w * dt + np.pi) % (2 * np.pi) - np.pi
-        if self.scene.is_free((nx, ny), margin=ROBOT_RADIUS * 0.6):
+        if is_free_dyn(self.scene, (nx, ny), self._dyn_obs(), ROBOT_RADIUS * 0.6):
             self.pose = np.array([nx, ny, nth])
             self.path_len += float(np.hypot(nx - self.pose[0], 0.0))
         else:
