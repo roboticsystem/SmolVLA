@@ -258,27 +258,34 @@ CELL_C = 0.05          # 与 sim.world.CELL 一致（独立常量，避免循环
 class TourFollow(ReactiveFollow):
     """**全屋巡回专用**跟随（演示用，不改 E11 论文口径）。
 
-    三层策略：
-    ① 可见时：与真机同口径的视觉 P 控制（检测红马甲 → 转向 + 距离环）；
-    ② 门洞场景把激光安全间隙 1.05→0.45 m（门洞宽 1.2 m，门内任意方向
-       激光都 <1.05，原值会在每个门洞来回偏转、反复蹭墙）；
-    ③ 丢失超 2 s：转入**测地寻回** —— 在行人膨胀栅格上对人的当前位置
-       做 BFS，沿场梯度走过去（模拟真实跟随产品「BLE/UWB 定位先验 +
-       建图寻回」的丢失恢复流程），重新看见即切回 ①。
+    借鉴市售室内跟随产品（激光 SLAM 跟随底盘 / 视觉跟随行李箱等）的
+    「跟踪不丢、跟得要紧」三板斧：
+
+    ① **目标速度估计 + 前馈**（对应产品的 Kalman/EMA 速度跟踪）：
+       对人的位置做指数滑动平均差分得到速度 `self._pv`，控制量里直接
+       叠加 `v_ff = |pv|` 的前馈 —— 名义距离处机器人即以人速同行，
+       不再等「落后 → 距离误差 → 加速」的滞后链条，跟得更紧；
+    ② **预测瞄准**（对应产品的 lead-point 跟踪）：瞄准点取人位置沿
+       速度方向外推 0.8 s，转弯提前量让过弯不再「切内丢目标」；
+    ③ **测地寻回**（对应产品的 BLE/UWB 先验 + 建图寻回）：丢失或
+       门洞遮挡时在行人膨胀栅格上对人当前位置做 BFS，沿场梯度尾随。
     """
     name = "tour_follow"
+    LEAD_T = 0.8          # 预测瞄准外推时间（s）
+    K_V_FF = 1.2          # 追赶增益（×v_max / m 距离误差）
 
     def reset(self, env):
         super().reset(env)
         self.lost = 0
         self._sf = None
         self._sg = None
-        self._last_xy = None
-        self._stuck = 0
+        self._p_prev = None
+        self._pv = np.zeros(2)
 
     def _seek(self, obs, env):
-        """测地尾随：沿朝人当前位置的 BFS 场梯度走（演示主控制器）。"""
+        """测地尾随：沿朝人（预测位置）的 BFS 场梯度走（演示主控制器）。"""
         goal = np.asarray(env.target.xy, dtype=float)
+        pred = goal + self._pv * self.LEAD_T
         if self._sf is None or self._sg is None or \
                 not np.allclose(goal, self._sg, atol=0.3):
             self._sf = env._shortest_path_len(goal)
@@ -291,36 +298,57 @@ class TourFollow(ReactiveFollow):
             for dc in range(-4, 5):
                 r1, c1 = r + dr, c + dc
                 if 0 <= r1 < H and 0 <= c1 < W and f[r1, c1] >= 0:
-                    cand.append((float(f[r1, c1]) + 0.1 * np.hypot(dr, dc) * 0.05,
-                                 r1, c1))
+                    # 候选价值 = 场值 + 距预测点距离惩罚：同样接近人的
+                    # 候选里优先选「顺路朝人前进方向」的，过弯提前切弯
+                    v = float(f[r1, c1]) + 0.1 * np.hypot(dr, dc) * 0.05 \
+                        + 0.03 * float(np.linalg.norm(
+                            env.scene.c2w((r1, c1)) - pred))
+                    cand.append((v, r1, c1))
         if not cand:
             return np.array([0.0, self.search_w])
         cand.sort()
         tgt = None
+        tgt_fb = None                       # 兜底：场值最小者（不再原地自旋）
         from sim.world import segment_free
         for _, r1, c1 in cand:
             w_pt = env.scene.c2w((r1, c1))
+            if tgt_fb is None:
+                tgt_fb = w_pt
             if segment_free(env.scene, env.pose[:2], w_pt, 0.11):
                 tgt = w_pt
                 break
         if tgt is None:
-            return np.array([0.0, self.search_w])
+            tgt = tgt_fb
         ang = float(np.arctan2(tgt[1] - env.pose[1], tgt[0] - env.pose[0])
                     - env.pose[2])
         ang = (ang + np.pi) % (2 * np.pi) - np.pi
         w = float(np.clip(self.k_ang * ang, -self.w_max, self.w_max))
-        if abs(ang) > 1.0:
-            return np.array([0.0, w])
         dist = float(np.linalg.norm(goal - env.pose[:2]))
-        v = self.v_max * float(np.clip(0.8 * (dist - env.want_dist) + 0.25,
-                                       0.15, 1.0))
-        return np.array([v, w])
+        # 速度前馈：比例项（允许负修正，防过冲顶人）+ 人速前馈 ——
+        # 名义距离处恰好 ≈ 人速同行，落后则加速、超前则减速
+        pv = float(np.linalg.norm(self._pv))
+        v_ff = min(pv, self.v_max) if pv > 0.02 else 0.0
+        # 近距硬刹车：dist < 0.85 m（带内下限 0.9）时减速退避，防顶人/钻到人身后
+        brake = float(np.clip((dist - 0.85) / 0.25, 0.0, 1.0))
+        v = (v_ff + self.v_max * float(np.clip(self.K_V_FF * (dist - env.want_dist),
+                                               -0.6, 1.0))) * brake
+        # 大角度仍要转向，但比原来 1.0 放宽：边走边转跟随产品默认行为，
+        # 场路径本身无碰撞，无需停转（停转反而落后、丢失）
+        if abs(ang) > 1.2:
+            return np.array([0.0, w])
+        v *= float(np.clip(1.0 - abs(ang) / 1.6, 0.5, 1.0))
+        return np.array([min(v, self.v_max), w])
 
     def act(self, obs, env):
         # 演示模式：测地尾随为主控制器；视觉检测仅驱动丢失计数/状态显示
         p = env._perceived(obs)
         self.lost = 0 if p is not None else self.lost + 1
         self._sf = None if p is not None else self._sf   # 重新看见即刷新场
+        # 目标速度 EMA 估计（对应产品 Kalman 滤波的速度通道）
+        cur = np.asarray(env.target.xy, dtype=float)
+        if self._p_prev is not None:
+            self._pv = 0.6 * self._pv + 0.4 * (cur - self._p_prev) / 0.1
+        self._p_prev = cur.copy()
         return self._seek(obs, env)
 
 
@@ -369,6 +397,8 @@ def _pick_env(sim, policy_name, scenario, scene_name=None):
     scene_name = scene_name or "lab"
     if policy_name.startswith("follow"):
         sc = scenario or "normal"
+        if sc == "tour":
+            scene_name = "apartment"     # tour 航点按公寓 11.4×8.6 m 生成，强制绑定
         key = (sc, scene_name)
         if sim.fenv is None or getattr(sim.fenv, "_key", None) != key:
             # tour 全屋巡回路程约 45 m → 步数大幅放宽；跟随更紧、人速更慢
