@@ -54,6 +54,7 @@ class Sim:
         self.fenv = None          # 跟随环境（懒创建，按 scenario 复用）
         self.aenv = None          # 公寓场景导航环境（懒创建）
         self.scene_name = "apartment"
+        self.active_env = None    # 当前回合使用的环境（清晰相机渲染用）
         self.batch = {"running": False, "done": 0, "n": 0, "sr": None,
                       "spl": None, "ne": None, "rows": []}
         self.worker = None
@@ -103,9 +104,21 @@ class Sim:
                     lidar.append([float(self.pose[0] + r * np.cos(a)),
                                   float(self.pose[1] + r * np.sin(a))])
             if self.step % 2 == 0 or self.done:
+                # 显示用「清晰机位」：320×240、低雾化、无光度噪声 ——
+                # 与模型实际吃的 160×120 含噪观测分开，观感与口径互不影响
+                try:
+                    from sim.sensors import render as _render
+                    env2 = self.active_env
+                    peds = ([env2.target] if hasattr(env2, "target")
+                            else env2.peds)
+                    disp = _render(env2.scene, env2.pose, peds,
+                                   width=320, height=240, fog_strength=0.15,
+                                   cam_h=0.85)
+                except Exception:                           # noqa: BLE001
+                    disp = self.obs["image"]
                 ok, buf = cv2.imencode(".jpg", cv2.cvtColor(
-                    self.obs["image"], cv2.COLOR_RGB2BGR),
-                    [cv2.IMWRITE_JPEG_QUALITY, 70])
+                    disp, cv2.COLOR_RGB2BGR),
+                    [cv2.IMWRITE_JPEG_QUALITY, 85])
                 self.img_b64 = base64.b64encode(buf.tobytes()).decode()
         traj = self.traj[::max(1, len(self.traj) // 300)]
         return {"mode": self.mode, "policy": self.policy_name, "seed": self.seed,
@@ -379,6 +392,7 @@ def run_episode(sim, policy_name, seed, level, collect_only=False,
                 instruction=None, scenario=None, scene_name=None):
     env = _pick_env(sim, policy_name, scenario, scene_name)
     follow = policy_name.startswith("follow")
+    sim.active_env = env
     obs = env.reset(seed=seed)
     pol = make_policy(policy_name, env=env)
     pol.reset(env=env)

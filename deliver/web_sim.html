@@ -55,6 +55,9 @@ table{border-collapse:collapse;font-size:13px}td,th{border:1px solid #444;paddin
 <script src="/static/three.min.js"></script>
 <script src="/static/OrbitControls.js"></script>
 <script>
+// 注意：不能用裸全局 `status`（撞上浏览器内置 window.status 字符串，
+// innerHTML 赋值被静默忽略 → 状态栏永远显示"等待开始"）
+const statusEl = document.getElementById('status');
 async function post(u,d){const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d||{})});return r.json()}
 policy.onchange=()=>{scen.style.display=policy.value.startsWith('follow')?'':'none'};
 function start(){post('/api/start',{policy:policy.value,seed:+seed.value,level:level.value||null,scenario:scen.value,scene:scn.value})}
@@ -235,7 +238,7 @@ async function loop(){try{const s=await(await fetch('/api/state')).json();draw(s
   '<span class="bad big">✘ 未成功</span>')+'<br>剩余距离 NE: '+r.ne.toFixed(2)+
   ' m | SPL: '+r.spl.toFixed(3)+' | 全程最小距离: '+r.min_dist.toFixed(2)+' m';
  if(s.mode==='error')st+='<br><span class="bad">错误: '+(r&&r.error||'')+'</span>';
- status.innerHTML=st;
+ statusEl.innerHTML=st;
  let b='—';if(s.batch.n)b='进度 '+s.batch.done+'/'+s.batch.n+'<br>SR '+s.batch.sr+'% | SPL '+
   s.batch.spl+' | NE '+s.batch.ne+' m';
  if(s.batch.rows&&s.batch.rows.length){b+='<table><tr><th>#</th><th>指令</th><th>SR</th><th>NE</th></tr>'+
