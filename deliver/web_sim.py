@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -23,6 +24,9 @@ from sim.world import segment_free
 
 LOCK = threading.Lock()
 HTML_FILE = "web_sim.html"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STATIC = {"three.min.js": "application/javascript",
+          "OrbitControls.js": "application/javascript"}
 
 
 class Sim:
@@ -67,13 +71,23 @@ class Sim:
         ok, buf = cv2.imencode(".png", cv2.cvtColor(small, cv2.COLOR_RGB2BGR))
         self.map_png = base64.b64encode(buf.tobytes()).decode()
         b = sc.bounds
+        # 3D 视图用：墙体栅格（2×2 最大池化到 0.1 m 格）+ 家具真实高度
+        sem = sc.sem
+        h2, w2 = sem.shape[0] // 2, sem.shape[1] // 2
+        p = sem[:h2 * 2, :w2 * 2].reshape(h2, 2, w2, 2)
+        walls = (p == 1).any(axis=(1, 3))
         self.map_meta = {"b": [float(b[0]), float(b[1]), float(b[2]), float(b[3])],
                          "w": int(small.shape[1]), "h": int(small.shape[0]),
+                         "name": sc.name,
+                         "walls": "".join("1" if v else "0"
+                                          for row in walls for v in row),
+                         "wh": [int(w2), int(h2)], "cell": 0.1,
                          "rooms": [{"name": n, "rect": [float(v) for v in rect]}
                                    for n, rect in getattr(sc, "room_names", [])],
                          "objs": [{"cls": o.cls, "color": o.color,
                                    "xy": [float(o.xy[0]), float(o.xy[1])],
-                                   "half": float(o.half)} for o in sc.objects]}
+                                   "half": float(o.half),
+                                   "h": float(o.height)} for o in sc.objects]}
 
     def snapshot(self):
         import cv2
@@ -409,7 +423,16 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if self.path == "/":
+        if self.path.startswith("/static/") and \
+                self.path[len("/static/"):] in STATIC:
+            fn = os.path.join(BASE_DIR, self.path.lstrip("/"))
+            body = open(fn, "rb").read()
+            self.send_response(200)
+            self.send_header("Content-Type", STATIC[self.path[len("/static/"):]])
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/":
             body = open(HTML_FILE, "rb").read()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")

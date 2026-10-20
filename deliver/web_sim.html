@@ -3,13 +3,13 @@
 body{font-family:system-ui,'Microsoft YaHei';background:#111;color:#eee;margin:0;padding:16px}
 h1{font-size:20px;margin:0 0 12px} .row{display:flex;gap:14px;flex-wrap:wrap}
 canvas,img{background:#000;border:1px solid #444}
-#map{width:640px;height:480px}#cam{width:320px;height:240px}
+#gl{width:640px;height:480px;cursor:grab}#map{width:480px;height:360px}#cam{width:320px;height:240px}
 .panel{background:#1b1b1b;border:1px solid #333;border-radius:8px;padding:10px;margin-bottom:12px}
 button,select,input{background:#2a2a2a;color:#eee;border:1px solid #555;border-radius:6px;padding:6px 10px;font-size:14px}
 button{cursor:pointer}button:hover{background:#3a3a3a}
 #status{font-size:15px;line-height:1.7} .ok{color:#6f6;font-weight:bold}.bad{color:#f66;font-weight:bold}
 table{border-collapse:collapse;font-size:13px}td,th{border:1px solid #444;padding:4px 10px}
-.big{font-size:18px;font-weight:bold}
+.big{font-size:18px;font-weight:bold} .hint{color:#888;font-size:12px}
 </style></head><body>
 <h1>SmolVLA 室内语义导航 · 仿真演示系统（三室两厅公寓演示 / E1 标定场景可切换）</h1>
 <div class="panel">
@@ -40,17 +40,20 @@ table{border-collapse:collapse;font-size:13px}td,th{border:1px solid #444;paddin
 <button onclick="stopB()">⏹ 停止</button>
 <div style="margin-top:8px">
 <button onclick="voice()" style="background:#7a3030">🎤 语音指令（录音 4s）</button>
-<input id="saytext" placeholder="或手动输入指令：去红色的植物旁边 / 去椅子旁边" style="width:300px">
+<input id="saytext" placeholder="或手动输入指令：去白色的箱子旁边 / 去沙发旁边" style="width:300px">
 <button onclick="sendText()">发送</button> <span id="vstate"></span></div>
 </div>
 <div class="row">
-<div class="panel"><b>俯视地图</b><br><canvas id="map" width="640" height="480"></canvas></div>
+<div class="panel"><b>3D 场景</b> <span class="hint">（拖拽旋转 / 滚轮缩放 / 右键平移）</span><br>
+<canvas id="gl" width="640" height="480"></canvas></div>
 <div><div class="panel"><b>车载相机</b><br><img id="cam"><br>
 <div id="status" class="panel" style="margin-top:10px;min-width:320px">等待开始…</div></div></div>
 <div class="panel" style="min-width:280px"><b>批量评测结果</b><div id="batch">—</div></div>
 </div>
+<div class="panel" style="max-width:520px"><b>2D 平面图（含房间名）</b><br><canvas id="map" width="480" height="360"></canvas></div>
+<script src="/static/three.min.js"></script>
+<script src="/static/OrbitControls.js"></script>
 <script>
-let meta=null;
 async function post(u,d){const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d||{})});return r.json()}
 policy.onchange=()=>{scen.style.display=policy.value.startsWith('follow')?'':'none'};
 function start(){post('/api/start',{policy:policy.value,seed:+seed.value,level:level.value||null,scenario:scen.value,scene:scn.value})}
@@ -83,41 +86,139 @@ async function voice(){
  if(r.ok){policy.value='vla';post('/api/start',{policy:'vla',seed:+seed.value,instruction:r.instruction})}}
 function sendText(){const t=saytext.value.trim();if(!t)return;vstate.textContent='指令「'+t+'」';
  post('/api/start',{policy:policy.value,seed:+seed.value,instruction:t,scenario:scen.value,scene:scn.value})}
-// ---- 精绘：房间地板/家具/房间名（公寓场景） ----
+// ================= 2D 平面图（小地图，含房间名） =================
 const FURN={chair:['#cd6b5c','#9c463a'],table:['#b98a5a','#8a6236'],sofa:['#6e87c4','#4a5f96'],
  bed:['#8fa3d9','#63779f'],shelf:['#8b7355','#644f38'],plant:['#5fa46b','#3f7a4a'],
  box:['#c9a05a','#96703a'],tv:['#3a3a40','#1e1e26']};
 function rr(c,x,y,w,h,r){c.beginPath();c.moveTo(x+r,y);c.arcTo(x+w,y,x+w,y+h,r);c.arcTo(x+w,y+h,x,y+h,r);c.arcTo(x,y+h,x,y,r);c.arcTo(x,y,x+w,y,r);c.closePath()}
-function draw(s){const c=map.getContext('2d');c.fillStyle='#111';c.fillRect(0,0,640,480);
+function draw(s){const c=map.getContext('2d');c.fillStyle='#111';c.fillRect(0,0,480,360);
  if(!s.map_meta)return;const m=s.map_meta;
- if(mapImg.src!==s.map&&s.map){mapImg.onload=()=>{c.drawImage(mapImg,0,0,640,480)};mapImg.src=s.map}
- c.drawImage(mapImg,0,0,640,480);
- const X=x=>(x-m.b[0])/(m.b[1]-m.b[0])*640, Y=y=>480-(y-m.b[2])/(m.b[3]-m.b[2])*480;
- // 家具精绘（圆角矩形 + 描边 + 高光），盖在底图色块上
+ if(mapImg.src!==s.map&&s.map){mapImg.onload=()=>{c.drawImage(mapImg,0,0,480,360)};mapImg.src=s.map}
+ c.drawImage(mapImg,0,0,480,360);
+ const X=x=>(x-m.b[0])/(m.b[1]-m.b[0])*480, Y=y=>360-(y-m.b[2])/(m.b[3]-m.b[2])*360;
  for(const o of (m.objs||[])){const fc=FURN[o.cls];if(!fc)continue;
-  const w=2*o.half/(m.b[1]-m.b[0])*640,h=2*o.half/(m.b[3]-m.b[2])*480;
-  const px=X(o.xy[0])-w/2,py=Y(o.xy[1])-h/2,r=Math.min(5,w/3,h/3);
+  const w=2*o.half/(m.b[1]-m.b[0])*480,h=2*o.half/(m.b[3]-m.b[2])*360;
+  const px=X(o.xy[0])-w/2,py=Y(o.xy[1])-h/2,r=Math.min(4,w/3,h/3);
   c.fillStyle=fc[0];rr(c,px,py,w,h,r);c.fill();
-  c.strokeStyle=fc[1];c.lineWidth=1.5;c.stroke();
-  c.fillStyle='rgba(255,255,255,.35)';rr(c,px+1.5,py+1.5,Math.max(1,w-3),Math.max(1,h*0.3),r*0.6);c.fill()}
- // 房间名
- c.font='bold 13px sans-serif';c.textAlign='center';c.textBaseline='middle';
+  c.strokeStyle=fc[1];c.lineWidth=1.2;c.stroke()}
+ c.font='bold 11px sans-serif';c.textAlign='center';c.textBaseline='middle';
  for(const rm of (m.rooms||[])){const[gx0,gy0,gx1,gy1]=rm.rect;
   const cx=X((gx0+gx1)/2),cy=Y((gy0+gy1)/2);
   c.strokeStyle='rgba(0,0,0,.45)';c.lineWidth=3;c.strokeText(rm.name,cx,cy);
   c.fillStyle='#5a5248';c.fillText(rm.name,cx,cy)}
  c.textAlign='start';c.textBaseline='alphabetic';
- if(s.goal){c.fillStyle='#2f2';c.beginPath();c.arc(X(s.goal[0]),Y(s.goal[1]),7,0,7);c.fill();
-  c.fillStyle='#fff';c.font='11px sans-serif';c.fillText('目标',X(s.goal[0])+9,Y(s.goal[1])-6)}
- if(s.target){c.fillStyle='#f44';c.beginPath();c.arc(X(s.target[0]),Y(s.target[1]),9,0,7);c.fill();
-  c.fillStyle='#fff';c.font='bold 11px sans-serif';c.fillText('人',X(s.target[0])+11,Y(s.target[1])+4)}
+ if(s.goal){c.fillStyle='#2f2';c.beginPath();c.arc(X(s.goal[0]),Y(s.goal[1]),6,0,7);c.fill()}
+ if(s.target){c.fillStyle='#f44';c.beginPath();c.arc(X(s.target[0]),Y(s.target[1]),7,0,7);c.fill()}
  c.strokeStyle='#f9933b';c.lineWidth=1;
  for(const p of s.lidar){c.beginPath();c.moveTo(X(s.pose[0]),Y(s.pose[1]));c.lineTo(X(p[0]),Y(p[1]));c.stroke()}
  if(s.traj.length>1){c.strokeStyle='#4af';c.lineWidth=2;c.beginPath();
   s.traj.forEach((p,i)=>i?c.lineTo(X(p[0]),Y(p[1])):c.moveTo(X(p[0]),Y(p[1])));c.stroke()}
  if(s.pose){c.save();c.translate(X(s.pose[0]),Y(s.pose[1]));c.rotate(-s.pose[2]);
-  c.fillStyle='#4af';c.beginPath();c.moveTo(12,0);c.lineTo(-8,-7);c.lineTo(-8,7);c.closePath();c.fill();c.restore()}}
+  c.fillStyle='#4af';c.beginPath();c.moveTo(9,0);c.lineTo(-6,-5);c.lineTo(-6,5);c.closePath();c.fill();c.restore()}}
+const mapImg=new Image();
+// ================= 3D 场景（three.js，可拖拽旋转） =================
+const FURN3D={chair:0xcd6b5c,table:0xb98a5a,sofa:0x6e87c4,bed:0x8fa3d9,
+ shelf:0x8b7355,plant:0x5fa46b,box:0xc9a05a,tv:0x3a3a40};
+const ROOM3D={'客厅':0x9a8760,'餐厅':0x9a8760,'厨房':0x6e8290,'卫生间':0x6e8290,
+ '走廊':0x84847a,'主卧':0x8f7a78,'次卧':0x78869a,'书房':0x7a8a78};
+let renderer,cam3,scene3,controls,statG,dyn={},statKey='';
+function init3d(){
+ renderer=new THREE.WebGLRenderer({antialias:true,canvas:gl});
+ renderer.setSize(640,480,false);renderer.setPixelRatio(window.devicePixelRatio);
+ renderer.shadowMap.enabled=true;renderer.shadowMap.type=THREE.PCFSoftShadowMap;
+ scene3=new THREE.Scene();scene3.background=new THREE.Color(0x14171c);
+ scene3.fog=new THREE.Fog(0x14171c,25,60);
+ cam3=new THREE.PerspectiveCamera(50,640/480,0.05,120);
+ scene3.add(new THREE.AmbientLight(0xffffff,.55));
+ const dir=new THREE.DirectionalLight(0xfff1dd,.95);
+ dir.position.set(6,14,5);dir.castShadow=true;
+ dir.shadow.camera.left=-9;dir.shadow.camera.right=9;
+ dir.shadow.camera.top=9;dir.shadow.camera.bottom=-9;
+ dir.shadow.camera.far=45;dir.shadow.mapSize.set(2048,2048);
+ scene3.add(dir);
+ scene3.add(new THREE.HemisphereLight(0x8899bb,0x332f28,.35));
+ controls=new THREE.OrbitControls(cam3,gl);
+ controls.enableDamping=true;controls.dampingFactor=.08;controls.maxPolarAngle=Math.PI/2.05;}
+function buildStatic(m){
+ if(statG){scene3.remove(statG);
+  statG.traverse(o=>{if(o.geometry)o.geometry.dispose();if(o.material&&o.material.dispose)o.material.dispose()})}
+ statG=new THREE.Group();
+ const cx=(m.b[0]+m.b[1])/2,cz=(m.b[2]+m.b[3])/2;
+ controls.target.set(cx,0,cz);cam3.position.set(cx+7,13,cz+13);
+ // 地面（基底 + 各房间地板色）
+ const base=new THREE.Mesh(new THREE.PlaneGeometry(m.b[1]-m.b[0]+2,m.b[3]-m.b[2]+2),
+  new THREE.MeshStandardMaterial({color:0x3a3630,roughness:.95}));
+ base.rotation.x=-Math.PI/2;base.position.set(cx,0,cz);base.receiveShadow=true;statG.add(base);
+ for(const rm of (m.rooms||[])){const[gx0,gy0,gx1,gy1]=rm.rect;
+  const f=new THREE.Mesh(new THREE.PlaneGeometry(gx1-gx0,gy1-gy0),
+   new THREE.MeshStandardMaterial({color:ROOM3D[rm.name]||0x777770,roughness:.9}));
+  f.rotation.x=-Math.PI/2;
+  f.position.set((gx0+gx1)/2,.02,(gy0+gy1)/2);f.receiveShadow=true;statG.add(f)}
+ // 家具（按真实高度立起来的实体块）
+ for(const o of (m.objs||[])){
+  const h=Math.max(.06,o.h||.5),col=FURN3D[o.cls]||0x999999;
+  const geo=o.cls==='plant'?new THREE.CylinderGeometry(o.half*.7,o.half*.9,h,12)
+        :new THREE.BoxGeometry(2*o.half,h,2*o.half);
+  const mesh=new THREE.Mesh(geo,new THREE.MeshStandardMaterial({color:col,roughness:.75}));
+  mesh.position.set(o.xy[0],h/2,o.xy[1]);mesh.castShadow=true;mesh.receiveShadow=true;
+  statG.add(mesh)}
+ // 墙体（InstancedMesh：0.1m 格 × 1.8m 高）
+ const W=m.wh[0],cell=m.cell,cells=[];
+ for(let i=0;i<m.walls.length;i++)if(m.walls[i]==='1')cells.push(i);
+ const wg=new THREE.BoxGeometry(cell,1.8,cell);
+ const wm=new THREE.MeshStandardMaterial({color:0x8d949e,roughness:.85});
+ const inst=new THREE.InstancedMesh(wg,wm,cells.length);
+ const m4=new THREE.Matrix4();
+ cells.forEach((idx,i)=>{const r=(idx/W)|0,c=idx%W;
+  m4.setPosition(m.b[0]+(c+.5)*cell,.9,m.b[2]+(r+.5)*cell);inst.setMatrixAt(i,m4)});
+ inst.castShadow=true;inst.receiveShadow=true;statG.add(inst);
+ // 目标（绿球）与被跟随者（红衣人形）
+ dyn.goal=new THREE.Mesh(new THREE.SphereGeometry(.13,16,12),
+  new THREE.MeshStandardMaterial({color:0x22cc44,emissive:0x116622}));
+ dyn.goal.visible=false;statG.add(dyn.goal);
+ dyn.person=new THREE.Group();
+ const body=new THREE.Mesh(new THREE.CylinderGeometry(.16,.2,1.1,12),
+  new THREE.MeshStandardMaterial({color:0xcc3327,roughness:.7}));
+ body.position.y=.62;body.castShadow=true;dyn.person.add(body);
+ const head=new THREE.Mesh(new THREE.SphereGeometry(.12,12,10),
+  new THREE.MeshStandardMaterial({color:0xe8c39a}));
+ head.position.y=1.32;dyn.person.add(head);
+ dyn.person.visible=false;statG.add(dyn.person);
+ // 轨迹线 / 激光线
+ dyn.traj=new THREE.Line(new THREE.BufferGeometry(),
+  new THREE.LineBasicMaterial({color:0x44aaff}));
+ dyn.traj.frustumCulled=false;statG.add(dyn.traj);
+ dyn.lidar=new THREE.LineSegments(new THREE.BufferGeometry(),
+  new THREE.LineBasicMaterial({color:0xf9933b,transparent:true,opacity:.35}));
+ dyn.lidar.frustumCulled=false;statG.add(dyn.lidar);
+ // 机器人（车体 + 朝向箭头）
+ dyn.robot=new THREE.Group();
+ const rb=new THREE.Mesh(new THREE.BoxGeometry(.30,.12,.26),
+  new THREE.MeshStandardMaterial({color:0x2f6fb0,roughness:.6}));
+ rb.position.y=.10;rb.castShadow=true;dyn.robot.add(rb);
+ const arrow=new THREE.Mesh(new THREE.ConeGeometry(.07,.18,10),
+  new THREE.MeshStandardMaterial({color:0x66ccff}));
+ arrow.rotation.x=Math.PI/2;arrow.rotation.z=Math.PI/2;
+ arrow.position.set(.18,.16,0);dyn.robot.add(arrow);
+ statG.add(dyn.robot);
+ scene3.add(statG);}
+function updateDyn(s){
+ if(!dyn.robot)return;
+ if(s.goal){dyn.goal.visible=true;dyn.goal.position.set(s.goal[0],.15,s.goal[1])}else dyn.goal.visible=false;
+ if(s.target){dyn.person.visible=true;dyn.person.position.set(s.target[0],0,s.target[1])}else dyn.person.visible=false;
+ dyn.robot.position.set(s.pose[0],0,s.pose[1]);dyn.robot.rotation.y=-s.pose[2];
+ if(s.traj&&s.traj.length)dyn.traj.geometry.setFromPoints(s.traj.map(p=>new THREE.Vector3(p[0],.06,p[1])));
+ const lp=[];for(const p of s.lidar){lp.push(new THREE.Vector3(s.pose[0],.25,s.pose[1]),
+  new THREE.Vector3(p[0],.25,p[1]))}
+ dyn.lidar.geometry.setFromPoints(lp);}
+init3d();
+(function anim(){requestAnimationFrame(anim);controls.update();renderer.render(scene3,cam3)})();
+// ================= 主循环 =================
 async function loop(){try{const s=await(await fetch('/api/state')).json();draw(s);
+ const m=s.map_meta;
+ if(m&&m.walls){const key=m.name+'|'+m.b.join(',')+'|'+m.walls.length+'|'+(m.objs||[]).length;
+  if(key!==statKey){statKey=key;buildStatic(m)}
+  updateDyn(s)}
  if(s.image)cam.src='data:image/jpeg;base64,'+s.image;
  const r=s.result;let st='指令: '+(s.instruction||'—')+'<br>层级: '+s.level+' | 步数: '+s.step+
   ' | 策略: '+s.policy+' | seed: '+s.seed;
@@ -140,6 +241,5 @@ async function loop(){try{const s=await(await fetch('/api/state')).json();draw(s
   s.batch.rows.map((r,i)=>'<tr><td>'+(s.batch.done-s.batch.rows.length+i+1)+'</td><td>'+r.instruction+
   '</td><td>'+(r.success?'✔':'✘')+'</td><td>'+(r.ne!=null?r.ne.toFixed(2):('TCR '+r.TCR+'%'))+'</td></tr>').join('')+'</table>'}
  batch.innerHTML=b}catch(e){}setTimeout(loop,120)}
-const mapImg=new Image();
 loop();
 </script></body></html>
