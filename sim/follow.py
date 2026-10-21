@@ -34,8 +34,10 @@
 | 可见率 | 目标可见步数占比（不受距离带约束，用于分离「遮挡」与「距离没控好」） |
 
 > **口径提醒**：本仿真是**任务与指标的建立**，不是真机结论。
-> 真机（E11 主体）需在同一指标定义下重测，且目标距离要用
-> 「已知人体高度 + 针孔模型」反推并**先标定测距误差**（大纲 §8 风险表已列）。
+> 真机（E11 主体）需在同一指标定义下重测；目标距离**不能**用「已知人体高度 +
+> 针孔模型」反推（头顶必被裁切，E1b 标定误差 379%/61%），
+> 我方用**底边接地法**（0.8–2.0 m 相对误差 ≤3.5%），
+> 并据此把跟随工作带限定为 **[0.8, 2.0] m**（详见 `E14_本轮实验结果汇总.md` §2）。
 """
 from __future__ import annotations
 
@@ -909,8 +911,292 @@ class FollowPolicyE4(ReactiveFollow):
         return np.array([v, w])
 
 
+# ================================================================ E11c 跟随阶段机 + 三级脱困
+STAGE_FOLLOW, STAGE_STATIC, STAGE_LOST, STAGE_SEARCH = "follow", "static", "lost", "search"
+STAGE_ORDER = (STAGE_FOLLOW, STAGE_STATIC, STAGE_LOST, STAGE_SEARCH)
+
+
+class FollowPolicyStage(FollowPolicyE4):
+    """**显式跟随阶段机 + 三级脱困策略**（E11c）。
+
+    借鉴对象：
+      · 论文4 表 3-5 的**阶段触发规则**（由可观测状态驱动自动切换，各阶段有各自判据）；
+      · 论文3 §2.4 的**三级脱困**（速度调节 → 原地等待 → 局部重规划）。
+
+    ## 四阶段（每个阶段有**各自的成功判据**）
+
+    | 阶段 | 触发条件 | 该阶段的成功判据 |
+    |---|---|---|
+    | `follow` 跟随中 | 目标可见且**在运动** | 误差 ≤ 期望带 |
+    | `static` 目标静止 | 目标可见且**静止** | 误差 ≤ 静止容差（更严） |
+    | `lost` 目标离场 | 目标**刚**不可见（丢失 < `escalate_s`） | 能否在 T 秒内重新获取 |
+    | `search` 搜索态 | 丢失 ≥ `escalate_s` | 能否重新获取 |
+
+    ## 三级脱困（逐级升级）
+
+    | 级别 | 触发条件 | 动作 | 代价 |
+    |---|---|---|---|
+    | L1 速度调节 | 前方净空 < `clear_l1` | 按净空比例减速 | 速度损失 |
+    | L2 原地等待 | 净空持续不足 `stuck_steps` 步 | 原地停住 | 等待时长 |
+    | L3 局部重规划 | 等待累计 > `replan_after` 秒 | A\\* 局部重规划并沿路走 | 重规划耗时 (ms) |
+
+    默认 E4 模块**全关** ⇒ 与 `ReactiveFollow` 基线行为等价（只多了状态机与脱困），
+    因此消融表里「基线 / +阶段机 / +阶段机+脱困」三行可直接对照。
+    """
+
+    name = "reactive_stage"
+
+    def __init__(self, clear_l1=0.55, stuck_steps=8, replan_after=1.0,
+                 escalate_s=3.0, static_speed=0.05, use_replan=True,
+                 use_stage=True, use_l1=True, use_l2=True, use_l3=True, **kw):
+        super().__init__(**kw)
+        self.clear_l1 = float(clear_l1)
+        self.stuck_steps = int(stuck_steps)
+        self.replan_after = float(replan_after)
+        self.escalate_s = float(escalate_s)
+        self.static_speed = float(static_speed)
+        self.use_replan = bool(use_replan)
+        self.use_stage = bool(use_stage)
+        # **逐级消融开关**（论文2 式 5-8 的逐项消融口径）
+        self.use_l1 = bool(use_l1)
+        self.use_l2 = bool(use_l2)
+        self.use_l3 = bool(use_l3)
+        self._planner = None
+        self.reset_stats()
+
+    # ------------------------------------------------------------ 状态与统计
+    def reset_stats(self):
+        self.stage = STAGE_FOLLOW
+        self.lost_t = 0.0
+        self.stuck_n = 0
+        self.wait_t = 0.0
+        self.replan_path = None
+        self.replan_idx = 0
+        self.last_target_xy = None
+        self.prev_pose = None
+        self.prev_dist = None
+        self.stats = {
+            "stage_time": {s: 0.0 for s in STAGE_ORDER},
+            "stage_trans": {s: 0 for s in STAGE_ORDER},
+            "l1": {"n": 0, "t": 0.0},
+            "l2": {"n": 0, "t": 0.0},
+            "l3": {"n": 0, "t": 0.0},
+            "replan_ms": [],
+            "replan_fail": 0,
+        }
+
+    def reset(self, env):
+        super().reset(env)
+        self.reset_stats()
+
+    # ------------------------------------------------------------ 工具
+    @staticmethod
+    def _front_clear(obs, half_deg=20.0):
+        """前方 ±`half_deg` 内的**最小激光净空**（米）。
+
+        扇区取窄（±20°）而不是宽（±30°）：跟随时侧向常有行人/桌角，
+        用宽扇区会把「旁边有东西」误判成「前面被堵」，导致无谓停车。
+        """
+        lid = np.asarray(obs["lidar"], dtype=float)
+        ang = np.linspace(-np.pi, np.pi, lid.size, endpoint=False)
+        front = lid[np.abs(ang) <= np.deg2rad(half_deg)]
+        return float(front.min()) if front.size else 9.0
+
+    # ------------------------------------------------------------ 阶段机
+    def _update_stage(self, seen, env, dist=None):
+        """按可观测状态推进阶段机（论文4 表 3-5 的触发规则）。"""
+        dt = float(env.cfg["dt"])
+        if seen:
+            # 「目标是否静止」用**目标的真值速度**判定：这是**环境状态**
+            # （任务阶段的定义），不是感知量，因此不构成「作弊」，但必须在论文里写明。
+            # 注意不能用「相对速度小」当判据——那会把「跟随良好」误判成「目标静止」，
+            # 反而让机器人一直用半速跟随（实测 TCR 从 99.4% 掉到 88.3%）。
+            sp = float(getattr(env.target, "speed", 0.0))
+            new = STAGE_STATIC if sp < self.static_speed else STAGE_FOLLOW
+            self.lost_t = 0.0
+        else:
+            self.lost_t += dt
+            new = STAGE_LOST if self.lost_t < self.escalate_s else STAGE_SEARCH
+        if new != self.stage:
+            self.stats["stage_trans"][new] += 1
+            self.stage = new
+        self.stats["stage_time"][self.stage] += dt
+
+    # ------------------------------------------------------------ 三级脱困
+    def _replan(self, obs, env):
+        """L3：**局部重规划**（A\\* 到感知到的目标位置），返回是否成功。"""
+        import time
+        if self._planner is None:
+            from .planner import AStarPolicy
+            self._planner = AStarPolicy(plan_clearance=0.15, clear_cost=2.0)
+        goal = self.last_target_xy
+        if goal is None:
+            # 从未看见目标 → 沿当前朝向前方 1.5 m 做「探路式」局部规划
+            th = float(env.pose[2])
+            goal = np.asarray(env.pose[:2], dtype=float) + \
+                1.5 * np.array([np.cos(th), np.sin(th)])
+        t0 = time.perf_counter()
+        try:
+            path = self._planner._astar(env, goal)
+        except Exception:
+            path = None
+        self.stats["replan_ms"].append((time.perf_counter() - t0) * 1000.0)
+        self.stats["l3"]["n"] += 1
+        self.stats["l3"]["t"] += float(env.cfg["dt"])
+        if not path:
+            self.stats["replan_fail"] += 1
+            self.replan_path = None
+            return False
+        self.replan_path = [np.asarray(p, dtype=float) for p in path]
+        self.replan_idx = 0
+        return True
+
+    def _path_bearing(self, env, lookahead=0.6):
+        """沿重规划路径取前视路点的 (方位角, 距离)。"""
+        if not self.replan_path:
+            return None
+        while (self.replan_idx < len(self.replan_path) - 1 and
+               float(np.hypot(*(self.replan_path[self.replan_idx] -
+                                np.asarray(env.pose[:2], dtype=float)))) < lookahead):
+            self.replan_idx += 1
+        rel = self.replan_path[self.replan_idx] - np.asarray(env.pose[:2], dtype=float)
+        d = float(np.hypot(*rel))
+        b = float(np.arctan2(rel[1], rel[0]) - env.pose[2])
+        return (b + np.pi) % (2 * np.pi) - np.pi, d
+
+    def _unstick(self, obs, env, v_cmd, dist=None):
+        """三级脱困。返回 `(v, level)`，level ∈ {0,1,2,3}。
+
+        **卡住判据**用「**想走却一步没动**」（指令速度 > 0 而实际位移 = 0），
+        而不是单看净空：跟随时前方净空 < 1 m 是常态（目标就在那附近），
+        若拿净空当卡住判据，机器人会在正常跟随时不停停车 —— 实测把 TCR 从
+        100% 打到 96.7%。净空只用于 **L1 速度调节**（预防性减速）。
+
+        **L1 还要满足「确实需要靠近目标」**：目标本来就在带内时，前方净空小
+        多半是**目标自己**在那儿，此时减速只会拉低跟随质量
+        （crowd 场景实测 TCR 87.5% → 82.0%）。
+        """
+        dt = float(env.cfg["dt"])
+        pose = np.asarray(env.pose[:2], dtype=float)
+        moved = 0.0
+        if self.prev_pose is not None:
+            moved = float(np.hypot(*(pose - self.prev_pose)))
+        self.prev_pose = pose
+
+        clear = self._front_clear(obs)
+        wants_move = v_cmd > 0.05
+        # 卡住 = **想走却一步没动**（FollowEnv 碰撞时位姿原地不动，只更新朝向）。
+        # 用绝对位移阈值 0.015 m 会把「指令速度很小」也判成卡住
+        # （v=0.06 m/s × dt=0.1 s ⇒ 位移 0.006 m < 0.015 m），故用严格零位移。
+        stuck_now = bool(wants_move and moved < 1e-6)
+        needs_approach = bool(dist is None or dist > env.want_dist + 0.3)
+
+        # ---- L1：速度调节（净空不足 **且** 需要靠近目标 ⇒ 减速）----
+        scale = 1.0
+        if self.use_l1 and clear < self.clear_l1 and needs_approach:
+            self.stats["l1"]["n"] += 1
+            self.stats["l1"]["t"] += dt
+            lo = 0.30
+            scale = float(np.clip((clear - lo) / max(1e-3, self.clear_l1 - lo), 0.0, 1.0))
+            v_cmd = v_cmd * scale
+
+        if not stuck_now:
+            self.stuck_n = 0
+            # 等待计时**缓慢衰减**而非清零：短暂的「顶一下又松开」也应累计成
+            # 一次较长的等待，否则每次脱离就把计时清掉，L3 永远触发不了
+            # （实测 L3 触发 0 次）。衰减系数 0.8 兼顾「抖一下不算卡死」。
+            self.wait_t *= 0.8
+            return v_cmd, 1 if scale < 1.0 else 0
+
+        # ---- L2：原地等待（连续多步「想走却没动」）----
+        self.stuck_n += 1
+        if not self.use_l2 or self.stuck_n < self.stuck_steps:
+            return v_cmd, 1
+        self.stats["l2"]["n"] += 1
+        self.stats["l2"]["t"] += dt
+        v = 0.0
+        self.wait_t += dt
+        if not self.use_l3 or self.wait_t < self.replan_after:
+            return v, 2
+
+        # ---- L3：局部重规划 ----
+        ok = self._replan(obs, env)
+        if ok:
+            # 重规划成功后**复位**，否则会每帧重复规划（实测 L3 每回合十余次）
+            self.stuck_n = 0
+            self.wait_t = 0.0
+            return v, 3
+        self.wait_t = 0.0
+        self.stuck_n = 0
+        return v, 2
+
+    # ------------------------------------------------------------ 主循环
+    def act(self, obs, env):
+        img = obs["image"]
+        if self.use_enhance:
+            img = auto_enhance(img)
+        r = detect_person(img, lidar=obs.get("lidar"))
+        seen = r is not None
+        bearing = float(r[0]) if seen else 0.0
+        dist = float(r[1]) if seen else 0.0
+        if seen and self.use_depth:
+            m = self._detect(img)
+            if m is not None:
+                H, W = img.shape[:2]
+                f = (W / 2.0) / np.tan(np.deg2rad(CAMERA_HFOV_DEG) / 2.0)
+                xs = np.where(m.any(axis=0))[0]
+                wpx = max(2.0, float(xs.max() - xs.min() + 1))
+                dist = 0.5 * (dist + f * 2.0 * PERSON_R / wpx)
+        if seen:
+            a_ = env.pose[2] + bearing
+            self.last_target_xy = env.pose[:2] + dist * np.array([np.cos(a_), np.sin(a_)])
+            if self.use_kalman:
+                self.kf.update(self.last_target_xy)
+        else:
+            self.prev_dist = None
+        if self.use_stage:
+            self._update_stage(seen, env, dist if seen else None)
+
+        # ---- 阶段 → 行为 ----
+        if self.stage in (STAGE_FOLLOW, STAGE_STATIC) and seen:
+            hd = steer_with_avoidance(obs, env, bearing)
+            slow = 1.0 if abs(hd - bearing) < np.deg2rad(20) else 0.45
+            w = float(np.clip(self.k_ang * hd, -self.w_max, self.w_max))
+            if self.stage == STAGE_STATIC:
+                # 目标静止 ⇒ 速度上限减半（避免冲撞静止目标）
+                v = float(np.clip(self.k_v * (dist - env.want_dist),
+                                  -self.v_max * 0.3, self.v_max * 0.5))
+            else:
+                v = float(np.clip(self.k_v * (dist - env.want_dist),
+                                  -self.v_max * 0.6, self.v_max))
+            v *= slow
+        elif self.stage == STAGE_LOST and not seen:
+            a = self._on_lost(obs, env)
+            v, w = float(a[0]), float(a[1])
+        elif self.stage == STAGE_SEARCH and not seen:
+            # 搜索态：转速更大（扩大扫描范围），速度压到 0
+            v, w = 0.0, self.search_w * 1.6
+        else:
+            # 阶段机关闭时退化为父类行为；可见但处于 lost/search 的边界情形
+            a = self._on_lost(obs, env) if not seen else np.array([0.0, self.search_w])
+            v, w = float(a[0]), float(a[1])
+
+        # ---- 三级脱困 ----
+        v, level = self._unstick(obs, env, v, dist if seen else None)
+        if level == 3:
+            pb = self._path_bearing(env)
+            if pb is not None:
+                b, d = pb
+                hd = steer_with_avoidance(obs, env, b)
+                w = float(np.clip(self.k_ang * hd, -self.w_max, self.w_max))
+                v = float(np.clip(self.k_v * (d - env.want_dist),
+                                  -self.v_max * 0.6, self.v_max * 0.5))
+        return np.array([v, w])
+
+
 POLICIES = {"random": RandomFollow, "reactive": ReactiveFollow, "oracle": OracleFollow,
             "reactive_e4": FollowPolicyE4}
+POLICIES["stage"] = FollowPolicyStage
 
 # E4 消融：模块开关组合。`baseline` 与 `ReactiveFollow` 等价（全关），
 # 其余每行**只开一个模块** —— 这样才能把增益归到具体模块上。
