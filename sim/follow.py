@@ -829,17 +829,28 @@ class FollowPolicyE4(ReactiveFollow):
     name = "reactive_e4"
 
     def __init__(self, use_kalman=False, use_depth=False, use_gamma=False,
-                 use_enhance=False, **kw):
+                 use_enhance=False, enhance_strength=1.0,
+                 gamma_clear_lo=0.5, gamma_clear_hi=1.5,
+                 kf_q=0.35, kf_r=0.55, **kw):
         super().__init__(**kw)
         self.use_kalman = bool(use_kalman)
         self.use_depth = bool(use_depth)
         self.use_gamma = bool(use_gamma)
         self.use_enhance = bool(use_enhance)
-        self.kf = KalmanTracker()
+        # **E4b 超参敏感性可调项**（默认值 = 原硬编码值 ⇒ 行为完全不变）：
+        #   `enhance_strength` = α：自适应图像增强强度
+        #   `gamma_clear_lo/hi` = γ：空间约束因子的净空映射（减速起点与斜率跨度）
+        #   `kf_q/kf_r`        = λ_id：卡尔曼外推的过程噪声/观测噪声
+        self.enhance_strength = float(enhance_strength)
+        self.gamma_clear_lo = float(gamma_clear_lo)
+        self.gamma_clear_hi = float(gamma_clear_hi)
+        self.kf_q = float(kf_q)
+        self.kf_r = float(kf_r)
+        self.kf = KalmanTracker(q=self.kf_q, r=self.kf_r)
 
     def reset(self, env):
         super().reset(env)
-        self.kf = KalmanTracker(dt=env.cfg["dt"])
+        self.kf = KalmanTracker(q=self.kf_q, r=self.kf_r, dt=env.cfg["dt"])
 
     def _detect(self, img):
         """检测马甲色块，返回其像素掩码（供深度融合用）或 None。"""
@@ -858,7 +869,7 @@ class FollowPolicyE4(ReactiveFollow):
     def act(self, obs, env):
         img = obs["image"]
         if self.use_enhance:
-            img = auto_enhance(img)
+            img = auto_enhance(img, self.enhance_strength)
         r = detect_person(img, lidar=obs.get("lidar"))
         if r is None:
             return self._on_lost(obs, env)
@@ -885,7 +896,8 @@ class FollowPolicyE4(ReactiveFollow):
             ang = np.linspace(-np.pi, np.pi, lid.size, endpoint=False)
             front = lid[np.abs(ang) <= np.deg2rad(30)]
             clear = float(front.min()) if front.size else 9.0
-            v *= float(np.clip((clear - 0.5) / 1.5, 0.5, 1.0))
+            v *= float(np.clip((clear - self.gamma_clear_lo) / self.gamma_clear_hi,
+                               0.5, 1.0))
         w = float(np.clip(self.k_ang * hd, -self.w_max, self.w_max))
         v = float(np.clip(v, -self.v_max * 0.6, self.v_max)) * slow
         return np.array([v, w])
@@ -1134,7 +1146,7 @@ class FollowPolicyStage(FollowPolicyE4):
     def act(self, obs, env):
         img = obs["image"]
         if self.use_enhance:
-            img = auto_enhance(img)
+            img = auto_enhance(img, self.enhance_strength)
         r = detect_person(img, lidar=obs.get("lidar"))
         seen = r is not None
         bearing = float(r[0]) if seen else 0.0

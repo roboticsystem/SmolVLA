@@ -68,9 +68,11 @@ _LOG_SHAPE = np.log(_SHAPE_ARR)
 class Detection:
     """一次检测结果。`bearing` 为**相对车头**的方位角（弧度）。"""
 
-    __slots__ = ("bearing", "dist", "cls", "color", "height", "half", "n_px", "surf")
+    __slots__ = ("bearing", "dist", "cls", "color", "height", "half", "n_px", "surf",
+                 "hit_bearing")
 
-    def __init__(self, bearing, dist, cls, color, height, half, n_px, surf=float("nan")):
+    def __init__(self, bearing, dist, cls, color, height, half, n_px, surf=float("nan"),
+                 hit_bearing=float("nan")):
         self.bearing = float(bearing)
         # `dist` = 由色块底边按地面几何反推的**中心距**（近距离会饱和，见 `detect`）
         self.dist = float(dist)
@@ -84,6 +86,11 @@ class Detection:
         # f·cam_h/(H−horizon) ≈ 0.75 m（判据就是 0.30 m！），而表观尺寸在
         # 0.30 m 处物体已纵向溢出画面（254 px vs 图高 120 px）。
         self.surf = float(surf)
+        # `hit_bearing` = 激光命中点（色块角跨度内**读数最小**的那一束）的方位角，
+        # 相对车头（与 `bearing` 同系）。**仅当 `detect(want_hit=True)` 时有效**。
+        # 用途：末段停靠要「朝真实表面点走」，而单目 `bearing` 指的是色块**中心**
+        # （有检测方位误差），激光命中点才是真正会被撞到的那个表面点。
+        self.hit_bearing = float(hit_bearing)
 
     def __repr__(self):
         return (f"<{self.color} {self.cls} bearing={np.rad2deg(self.bearing):+.1f}° "
@@ -142,7 +149,8 @@ def _pixel_labels(img, tol=16.0):
 
 def detect(img, hfov_deg=CAMERA_HFOV_DEG, cam_h=CAMERA_HEIGHT,
            max_range=MAX_RANGE, tol=16.0, min_px=40, col_consistency=True,
-           max_col_std=6.0, min_fill=0.65, max_shape_err=0.50, lidar=None):
+           max_col_std=6.0, min_fill=0.65, max_shape_err=0.50, lidar=None,
+           want_hit=False):
     """从一帧 RGB 图里检测候选物体。
 
     Args:
@@ -154,6 +162,8 @@ def detect(img, hfov_deg=CAMERA_HFOV_DEG, cam_h=CAMERA_HEIGHT,
         lidar: (n_beams,) 一帧激光（360°）。**强烈建议传入**：它用来按列把
             色块切成「属于同一物体」的若干簇，解决「物体与墙并在一起」
             （占漏检 95.7%）。不传时退化为纯几何。
+        want_hit: 是否额外返回**激光命中点方位**（`Detection.hit_bearing`）。
+            默认 **False**（行为与既有完全一致）；末段停靠控制器才需要它。
 
     Returns:
         list[Detection]
@@ -179,16 +189,28 @@ def detect(img, hfov_deg=CAMERA_HFOV_DEG, cam_h=CAMERA_HEIGHT,
 
         不用单束：单束可能打到更近的遮挡物或擦不到物体而打到墙上（实测都有）。
         取跨度内的最小值在几何上正好对应「到包围盒表面的最短距离」——**就是成功判据**。
+
+        `want_hit=True` 时额外返回**命中点的方位角**（那一束最小读数所在的角），
+        它是「真正会被撞到的表面点」的方向；单目 `bearing` 指的是色块**中心**，
+        两者在检测有方位误差时并不一致 —— 末段停靠要靠它对准。
         """
         if _lv is None or _lv.size == 0:
-            return float("nan")
+            return (float("nan"), float("nan")) if want_hit else float("nan")
         nl = _lv.size
         cols = np.arange(int(c0), max(int(c0) + 1, int(c1)), dtype=np.float64)
         angs = np.arctan((cols - (W - 1) / 2.0) / f)
         bi = np.round(((angs + np.pi) / (2 * np.pi)) * nl).astype(np.int64) % nl
         v = _lv[bi]
-        v = v[np.isfinite(v)]
-        return float(v.min()) if v.size else float("nan")
+        ok = np.isfinite(v)
+        if not ok.any():
+            return (float("nan"), float("nan")) if want_hit else float("nan")
+        v = v[ok]
+        ang_ok = angs[ok]
+        k = int(np.argmin(v))
+        dmin = float(v[k])
+        if want_hit:
+            return dmin, float(ang_ok[k])
+        return dmin
 
     dets = []
     # **逐颜色做二维连通域**。早先用「逐列合并」会把整幅画面并成一个 blob
@@ -322,12 +344,16 @@ def detect(img, hfov_deg=CAMERA_HFOV_DEG, cam_h=CAMERA_HEIGHT,
                     # - `clip_bot=True` ：色块底边触到图像下沿 → 地面公式**饱和**（0.752 m），
                     #   此时唯一可用的量是激光在角跨度内的最小读数
                     _sw = sw
+                    _hit = float("nan")
                     if clip_bot:
-                        _surf = _lidar_surf(ccx - _sw / 2.0, ccx + _sw / 2.0)
+                        if want_hit:
+                            _surf, _hit = _lidar_surf(ccx - _sw / 2.0, ccx + _sw / 2.0)
+                        else:
+                            _surf = _lidar_surf(ccx - _sw / 2.0, ccx + _sw / 2.0)
                     else:
                         _surf = d - half_e
                     dets.append(Detection(ang, d, cls, name, h, half_e, npx_s // kk,
-                                          surf=_surf))
+                                          surf=_surf, hit_bearing=_hit))
     return dets
 
 

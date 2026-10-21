@@ -888,7 +888,7 @@ class SweepDetectorPolicy:
                  stop_eps=0.14, dock_dist=0.8, max_dw=0.55, emergency=0.26,
                  v_max=V_MAX, w_max=W_MAX, scan_dir=1.0, det_every=2,
                  rel_tol_deg=50.0, use_det_dist=True, det_kw=None,
-                 use_lidar_dist=False,
+                 use_lidar_dist=False, want_hit=False,
                  # `mem_ttl` 默认 25：实测 200 回合下 16.7% → 33%+，
                  # 是当前唯一稳定有效的组件（物体静止，短期记忆能补上「暂时看不见」）。
                  mem_ttl=25, mem_merge=0.7, scan_arc=1.5 * 3.141592653589793,
@@ -913,7 +913,11 @@ class SweepDetectorPolicy:
         # 而成功判据是 0.30 m —— 该公式在判据附近失效（数据集里检测距离的最小值
         # 恰为 0.74 m 可证），所以 `stop_eps`/`dock_dist` 的减速逻辑**永不触发**。
         self.use_lidar_dist = use_lidar_dist
+        # `want_hit`：让感知层额外返回**激光命中点方位**（末段停靠要用）。
+        # 默认 False ⇒ 行为与既有完全一致。
+        self.want_hit = bool(want_hit)
         self._last_surf = float('nan')
+        self._last_hit = float('nan')
         self.det_kw = dict(det_kw or {})
         # `nn_det` 给的是 checkpoint 路径时，改用**监督学习的检测器**（见 sim/nn_detector.py）。
         # 它比颜色-连通域强得多（同口径：召回 64.8%→100%、判类 74.3%→85.2%、颜色 88.6%→100%）。
@@ -996,8 +1000,12 @@ class SweepDetectorPolicy:
         if self._nn is not None:
             dets = self._nn.detect(obs["image"])
         else:
-            dets = detect(obs["image"], lidar=obs.get("lidar"), **self.det_kw)
+            kw = dict(self.det_kw)
+            if self.want_hit:
+                kw["want_hit"] = True
+            dets = detect(obs["image"], lidar=obs.get("lidar"), **kw)
         self._last_surf = float('nan')
+        self._last_hit = float('nan')
         self._mem_update(dets, env)
         if self._map is not None:
             self._map.update(env.robot_pose(), obs.get("lidar"), dets, self._t)
@@ -1028,6 +1036,8 @@ class SweepDetectorPolicy:
                             best = t
                         break
             if best is not None:
+                self._last_surf = float(getattr(best, "surf", float("nan")))
+                self._last_hit = float(getattr(best, "hit_bearing", float("nan")))
                 a = env.robot_pose()[2] + best.bearing
                 return (best.bearing, best.dist,
                         env.robot_pose()[:2] + best.dist * np.array([np.cos(a), np.sin(a)]))
@@ -1036,7 +1046,9 @@ class SweepDetectorPolicy:
         if d is None:
             return self._from_memory(env, want_color, want_cls, ref_cls, rel)
         # 记下命中的**激光表面距**（`use_lidar_dist` 的停靠判据要用）
+        # 与**激光命中点方位**（末段停靠的对准判据要用）
         self._last_surf = float(getattr(d, "surf", float("nan")))
+        self._last_hit = float(getattr(d, "hit_bearing", float("nan")))
         a = env.robot_pose()[2] + d.bearing
         return (d.bearing, d.dist,
                 env.robot_pose()[:2] + d.dist * np.array([np.cos(a), np.sin(a)]))
@@ -1160,12 +1172,102 @@ class SweepDetectorPolicy:
         return np.array([float(np.clip(v, 0.0, self.v_max)), w], dtype=np.float32)
 
 
+class SweepDetDock(SweepDetectorPolicy):
+    """**末段停靠示范**（主创新 A 的新增子模块；对应诊断报告 §4.26.5 的待解问题）。
+
+    ## 要解决的问题（`主创新A_诊断报告.md` §4.26.5）
+
+    现有示范策略（`sweep_det`）是「**全速冲刺、靠恰好擦过判据**」的：
+
+    | 现象 | 机制 |
+    |---|---|
+    | 末段不知道自己在接近 | 单目地面几何在 **0.752 m 饱和**，而成功判据是「到包围盒表面 ≤ **0.30 m**」 |
+    | 数据里没有精细末段控制 | 数据集里 `|v| = 0` 的帧**全部来自扫描**（原地转）；各段最后 5 帧 `|v|` 均值 0.249 m/s，仍是巡航速度 |
+    | 模型「擦不到」 | 模型轨迹与示范不完全相同（观测抖动 + 动作采样噪声），「恰好穿过 0.30 m 球」的概率下降 ⇒ 保留率卡在 67–74% |
+
+    §4.26.4 已经排除过「单纯让它减速」：减速会吃掉时间预算，
+    示范自身 SR 从 33.0% 掉到 21.5%（`dock_dist` 2.0 / 3.5），
+    **说明「冲进去」本身在这个任务里更有效**。
+
+    ## 本策略的做法
+
+    末段用**激光**（近距唯一不失手的量）补上信息，用**两段式**控制补上策略：
+
+    ```
+    表面距 > dock_win(0.9 m)   → 完全沿用原巡航行为（不改变时间预算）
+    dock_win ≥ 表面距 > dock_stop(0.22 m)
+        ├─ 已对准（|命中方位| ≤ align_tol）→ **全速冲刺**（v = v_max）
+        └─ 未对准                          → **低速转向对准**（限 align_max_steps 步）
+    表面距 ≤ dock_stop(0.22 m)  → **停住**（此时已必然命中：0.22 ≤ 0.30）
+    ```
+
+    三个要点：
+    1. **距离**用 `Detection.surf`（激光表面距），**方向**用 `Detection.hit_bearing`
+       （激光命中点方位 —— 真正会被撞到的那个表面点，而非色块中心）；
+    2. **对准后不减速反而加速**（原行为因单目饱和而只能维持 0.268 m/s，
+       本策略用 v_max = 0.35 m/s 冲刺）⇒ 既提高触达确定性，**又不吃时间预算**；
+    3. **停住在 0.22 m 而不是撞上去** ⇒ 数据里首次出现**可学的末段停靠样本**
+       （`|v| → 0` 且 `w = 0`，与扫描的 `w ≠ 0` 可区分）。
+    """
+
+    name = "sweep_det_dock"
+
+    def __init__(self, dock_win=0.9, dock_target=0.25, dock_k=0.8,
+                 align_tol_deg=6.0, align_v=0.08, align_max_steps=12, **kw):
+        kw.setdefault("use_lidar_dist", True)
+        kw.setdefault("want_hit", True)
+        super().__init__(**kw)
+        self.dock_win = float(dock_win)
+        self.dock_target = float(dock_target)
+        self.dock_k = float(dock_k)
+        self.align_tol = float(np.deg2rad(align_tol_deg))
+        self.align_v = float(align_v)
+        self.align_max_steps = int(align_max_steps)
+        self._align_n = 0
+
+    def reset(self, env=None):
+        super().reset(env)
+        self._align_n = 0
+
+    def act(self, obs, env):
+        v, w = super().act(obs, env)
+        hit = self._last
+        if hit is None:
+            return np.array([v, w], dtype=np.float32)
+        surf = self._last_surf
+        hb = self._last_hit
+        if not np.isfinite(surf) or surf > self.dock_win:
+            # **未进入末段**：完全沿用父类行为（含其扫描/记忆/绕障逻辑）
+            self._align_n = 0
+            return np.array([v, w], dtype=np.float32)
+        # ---- 末段：先对准，再微调逼近到判据内 ----
+        if np.isfinite(hb) and abs(hb) > self.align_tol and \
+                self._align_n < self.align_max_steps:
+            # **未对准 ⇒ 低速转向修正**（限步数，不无限期耗在原地）
+            self._align_n += 1
+            w = float(np.clip(self.k_ang * hb, -self.w_max, self.w_max))
+            return np.array([self.align_v, w], dtype=np.float32)
+        self._align_n = 0
+        # **已对准 ⇒ 微调逼近**：`v` 按「距目标停距的余量」成比例，
+        # 于是**减速发生在最后 0.45 m 之内**（不吃掉时间预算，
+        # 与 §4.26.4 中 `dock_dist` 2.0/3.5 那种「从中距离就开始减速」不同），
+        # 且最终**停在 0.25 m**（判据 0.30 m 内留 0.05 m 余量），
+        # 而不是「冲过去撞在物体上」。
+        v = float(np.clip((surf - self.dock_target) * self.dock_k, 0.0, self.v_max))
+        if np.isfinite(hb):
+            w = float(np.clip(self.k_ang * hb, -self.w_max, self.w_max))
+        return np.array([v, w], dtype=np.float32)
+
+
 POLICIES = {"random": RandomPolicy, "frontier": FrontierPolicy,
             "oracle": OraclePolicy, "random_target": RandomTargetPolicy,
             "reactive": ReactiveGoalPolicy, "oracle_smooth": SmoothOraclePolicy,
             "planner": PlannerPolicy, "planner_oracle": PlannerOraclePolicy,
             "planner_random": PlannerRandomTargetPolicy, "sweep": SweepPolicy,
             "sweep_det": SweepDetectorPolicy,
+            # **末段停靠示范**（主创新 A 新增子模块；见类 docstring 与
+            # 主创新A_诊断报告 §4.26.5 的待解问题）
+            "sweep_det_dock": SweepDetDock,
             # 窗口测地场上界（新增固定布局用；见 planner.GeodesicWindowPolicy）
             "geodesic": GeodesicWindowPolicy,
             "geodesic_random": GeodesicRandomTargetPolicy,
