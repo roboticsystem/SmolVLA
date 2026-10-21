@@ -83,7 +83,7 @@ TARGET_SPEED = 0.22
 V_FRAC = 0.90               # 基线允许使用的速度上限占 `V_MAX` 的比例
 
 
-def detect_person(img, lidar=None):
+def detect_person(img, lidar=None, want_px=False):
     """**跟随任务专用的目标感知**：找马甲色块 → 用**底边行号**反推距离。
 
     为什么不能直接用 `perception.detect`：那套检测器是按**家具**调的
@@ -136,6 +136,11 @@ def detect_person(img, lidar=None):
         return None
     d = float(f * CAMERA_HEIGHT / (r1 - horizon))
     bearing = float(np.arctan((0.5 * (c0 + c1 - 1) - (W - 1) / 2.0) / f))
+    if want_px:
+        # 额外返回**像素高度**与**相机内参**：供 E1b 的单目测距标定
+        # 对比「底边接地法」与「已知身高反推法」两种口径（见 `scripts/calib_range.py`）。
+        # `r0 == 0` 表示头顶被画面裁掉 → 像素高不可用。
+        return bearing, d, int(len(ys)), int(r1 - r0), float(f), int(r0), int(r1)
     return bearing, d, int(len(ys))
 
 

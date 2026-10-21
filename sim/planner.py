@@ -19,9 +19,11 @@
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 
-from .env import SAFE_CLEARANCE, V_MAX, W_MAX
+from .env import SAFE_CLEARANCE, V_MAX, W_MAX, _dilate
 from .sensors import LIDAR_MAX_RANGE
 from .world import CELL
 
@@ -151,7 +153,7 @@ class PlannerPolicy:
         lid = np.asarray(obs["lidar"], dtype=float)
         n = len(lid)
         ang = np.linspace(-np.pi, np.pi, n, endpoint=False) if n else np.zeros(0)
-        pose = env.pose
+        pose = env.robot_pose()
         goal = np.asarray(env.task["goal"], dtype=float)
         dist_goal = float(np.linalg.norm(goal - pose[:2]))
 
@@ -264,7 +266,7 @@ class PlannerRandomTargetPolicy(PlannerPolicy):
                 continue
             p = np.array([sc.bounds[0] + (c + 0.5) * CELL,
                           sc.bounds[2] + (r + 0.5) * CELL])
-            if float(np.linalg.norm(p - env.pose[:2])) < self.min_dist:
+            if float(np.linalg.norm(p - env.robot_pose()[:2])) < self.min_dist:
                 continue
             return p
         return np.asarray(env.task["goal"], dtype=float).copy()
@@ -272,11 +274,331 @@ class PlannerRandomTargetPolicy(PlannerPolicy):
     def act(self, obs, env):
         self._age += 1
         need = (self._cur is None or self._age > self.replan_steps
-                or float(np.linalg.norm(self._cur - env.pose[:2])) < self.reach_eps)
+                or float(np.linalg.norm(self._cur - env.robot_pose()[:2])) < self.reach_eps)
         if need:
             self._cur = self._pick(env)
             self._age = 0
             self._field = None          # 目标变了 → 强制重算距离场
+        goal_saved = env.task["goal"]
+        env.task["goal"] = self._cur
+        try:
+            return super().act(obs, env)
+        finally:
+            env.task["goal"] = goal_saved
+
+
+class AStarPolicy(PlannerPolicy):
+    """**经典 A\\* 规划器**（8 邻域 + 八分度启发 + 视线捷径）——「传统规划」对照基线。
+
+    为什么必须补这个基线（三条理由）：
+
+    1. **第 3 章选型论证需要**（参考论文4 §1.3 用 A* / Dijkstra / DQN 做五维对比）：
+       我方若只有「测地场梯度」当对照，等于拿稻草人当 A*，评审会追问
+       「你和真正的 A* 比过吗」。
+    2. **E1c 需要路径几何对照**：A\\* 在栅格上给出的是**锯齿状折线**，
+       是「全局最短 ≠ 好路径」的经典反例（κmax 高、净空小）；
+       这正是我方「窗口测地场 + 格精确判据」的价值所在。
+    3. **「最短路径」与「可执行路径」不是一回事**：捷径（string pulling）用
+       **与物理碰撞同口径**的 `segment_free_exact` 做视线检查 ——
+       若换成采样式检查，捷径就会切进桌角（这正是本轮修掉的那个 bug）。
+
+    目标选择与 `PlannerPolicy` 保持一致：**默认使用指令指定的真值目标**，
+    因此 `astar` 与 `geodesic` 的差异只来自**规划几何**，不含语义差异。
+    """
+
+    name = "astar"
+
+    def __init__(self, shortcut=True, replan_every=8, max_expand=300000,
+                 plan_clearance=0.15, clear_cost=2.0, dock_los=0.65, **kw):
+        super().__init__(**kw)
+        self.shortcut = bool(shortcut)
+        self.replan_every = int(replan_every)
+        self.max_expand = int(max_expand)
+        # **最后接近段不做视线校验**（米）：指令目标本身就贴在物体旁，
+        # 严格校验会让机器人停在离目标 0.3–0.5 m 处反复够不着（永远无法判定成功）。
+        # 这一段的安全性由环境的碰撞判据保证（它逐帧检查机器人是否侵入障碍）。
+        self.dock_los = float(dock_los)
+        # **costmap 膨胀半径**（米）：默认与 `env.plan_grid` 一致（0.15 m，恰等于碰撞阈值）。
+        # 若改大（如 0.25 m），机器人**出生点/目标点**常常落在膨胀后的不可通行格内，
+        # 起点吸附会把路径引到墙的另一侧（实测机器人卡在障碍前反复碰撞）。
+        # 因此这里**不靠膨胀取净空**，改用**净空代价**（见 `clear_cost`）。
+        self.plan_clearance = float(plan_clearance)
+        # **净空代价权重**（无量纲）：路径代价 = 长度 × (1 + clear_cost / 净空格数)。
+        # 净空 = 该格到最近不可通行格的距离（格数），在 `env.plan_grid` 上多源 BFS 得到。
+        # 这等价于「尽量远离墙与家具」，与真实 A\\* 系统（如 SMAC 的 clearance cost）
+        # 的做法一致，且**不破坏起终点的可行性**。
+        self.clear_cost = float(clear_cost)
+        self._path = None            # 世界坐标点序列
+        self._path_goal = None
+        self._path_age = 0
+        self._path_idx = 0
+
+    def reset(self, env=None):
+        super().reset(env)
+        self._path = None
+        self._path_goal = None
+        self._path_age = 0
+        self._path_idx = 0
+
+    # ------------------------------------------------------------ A* 本体
+    @staticmethod
+    def _nearest_free(free, r0, c0, max_r=40):
+        """找离 (r0,c0) 最近的自由格（目标点常在物体内部）。
+
+        搜索半径要足够大：目标若落在大件家具（沙发/床）内部，
+        最近自由格可能远达 1 m 以上；半径太小会直接判「不可达」。
+        """
+        H, W = free.shape
+        if 0 <= r0 < H and 0 <= c0 < W and free[r0, c0]:
+            return int(r0), int(c0)
+        for rad in range(1, max_r + 1):
+            r1, r2 = max(0, r0 - rad), min(H, r0 + rad + 1)
+            c1, c2 = max(0, c0 - rad), min(W, c0 + rad + 1)
+            sub = free[r1:r2, c1:c2]
+            if not sub.any():
+                continue
+            rr, cc = np.nonzero(sub)
+            d = (rr + r1 - r0) ** 2 + (cc + c1 - c0) ** 2
+            k = int(np.argmin(d))
+            return int(rr[k] + r1), int(cc[k] + c1)
+        return None, None
+
+    def _astar_grid(self, env):
+        """A\\* 用的**规划栅格**（与 `env.plan_grid` 同口径，缓存在 env 上）。"""
+        cache = getattr(env, "_astar_grid_cache", None)
+        if cache is not None:
+            return cache
+        env._astar_grid_cache = env.plan_grid
+        return env.plan_grid
+
+    @staticmethod
+    def _clearance_map(env, grid):
+        """**净空图**（格数）：每格到最近不可通行格的距离，多源 BFS（缓存在 env 上）。"""
+        cache = getattr(env, "_clearance_cache", None)
+        if cache is not None:
+            return cache
+        from collections import deque
+        H, W = grid.shape
+        dist = np.full((H, W), -1, dtype=np.int32)
+        q = deque()
+        ys, xs = np.nonzero(grid)
+        for y, x in zip(ys, xs):
+            dist[y, x] = 0
+            q.append((int(y), int(x)))
+        while q:
+            y, x = q.popleft()
+            d = dist[y, x] + 1
+            for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < H and 0 <= nx < W and dist[ny, nx] < 0:
+                    dist[ny, nx] = d
+                    q.append((ny, nx))
+        env._clearance_cache = dist
+        return dist
+
+    def _astar(self, env, goal):
+        """8 邻域 A\\*（octile 启发 + **净空代价**），返回起点→目标格的世界坐标序列。"""
+        import heapq
+        sc = env.scene
+        H, W = sc.occ.shape
+        grid = self._astar_grid(env)
+        free = ~grid
+        clear = self._clearance_map(env, grid)
+        sr, sc_ = sc.w2c(np.asarray(env.robot_pose()[:2], dtype=float))
+        gr, gc = sc.w2c(np.asarray(goal, dtype=float))
+        sr, sc_ = int(np.floor(sr)), int(np.floor(sc_))
+        gr, gc = int(np.floor(gr)), int(np.floor(gc))
+        s_r, s_c = self._nearest_free(free, sr, sc_)
+        g_r, g_c = self._nearest_free(free, gr, gc)
+        if s_r is None or g_r is None:
+            return None
+        if (s_r, s_c) == (g_r, g_c):
+            return [np.asarray(goal, dtype=float)]
+
+        def h(r, c):
+            dr, dc = abs(r - g_r), abs(c - g_c)
+            return CELL * (dr + dc) + (CELL * (math.sqrt(2) - 1.0)) * min(dr, dc)
+
+        g = {(s_r, s_c): 0.0}
+        parent = {}
+        open_heap = [(h(s_r, s_c), 0.0, s_r, s_c)]
+        closed = set()
+        n_exp = 0
+        found = False
+        while open_heap:
+            _, gcst, r, c = heapq.heappop(open_heap)
+            if (r, c) in closed:
+                continue
+            closed.add((r, c))
+            n_exp += 1
+            if n_exp > self.max_expand:
+                break
+            if (r, c) == (g_r, g_c):
+                found = True
+                break
+            for dr, dc, step in ((1, 0, 1.0), (-1, 0, 1.0), (0, 1, 1.0), (0, -1, 1.0),
+                                 (1, 1, math.sqrt(2)), (1, -1, math.sqrt(2)),
+                                 (-1, 1, math.sqrt(2)), (-1, -1, math.sqrt(2))):
+                nr, nc = r + dr, c + dc
+                if not (0 <= nr < H and 0 <= nc < W) or not free[nr, nc]:
+                    continue
+                if dr and dc:      # 禁止「切角」：两个正交邻格都必须自由
+                    if not (free[r + dr, c] and free[r, c + dc]):
+                        continue
+                ng = gcst + step * CELL * (1.0 + self.clear_cost / max(1, int(clear[nr, nc])))
+                if ng < g.get((nr, nc), 1e18):
+                    g[(nr, nc)] = ng
+                    parent[(nr, nc)] = (r, c)
+                    heapq.heappush(open_heap, (ng + h(nr, nc), ng, nr, nc))
+        if not found:
+            return None
+        cells = [(g_r, g_c)]
+        cur = (g_r, g_c)
+        while cur in parent:
+            cur = parent[cur]
+            cells.append(cur)
+        cells.reverse()
+        pts = [np.array([sc.bounds[0] + (c + 0.5) * CELL,
+                         sc.bounds[2] + (r + 0.5) * CELL]) for r, c in cells]
+        pts[-1] = np.asarray(goal, dtype=float)
+        return pts
+
+    def _shortcut_path(self, env, pts):
+        """**视线捷径**（string pulling）：把能直连的中间点全部去掉。
+
+        视线检查用 `segment_free_exact`——**与规划栅格同口径**
+        （`radius=self.plan_clearance`），避免捷径切进规划栅格认为不可通行的区域；
+        同时它本身也是格精确的，不会漏掉被占格（这正是本轮修掉的那类 bug）。
+        """
+        from .world import segment_free_exact
+        if len(pts) <= 2:
+            return pts
+        out = [pts[0]]
+        i = 0
+        n = len(pts)
+        while i < n - 1:
+            j = n - 1
+            while j > i + 1:
+                if segment_free_exact(env.scene, pts[i], pts[j],
+                                      radius=self.plan_clearance):
+                    break
+                j -= 1
+            out.append(pts[j])
+            i = j
+        return out
+
+    # ------------------------------------------------------------ 与父类的接口
+    def _field_for(self, env, goal):
+        """A\\* 主路径不需要测地距离场；但**搜索失败时要有兜底**，
+        因此这里仍按父类实现缓存距离场（只在 A\\* 失败时才用到）。"""
+        return super()._field_for(env, goal)
+
+    def _lookahead_point(self, env, field, pose):
+        """沿 A\\* 路径取前视点（父类同名方法被覆盖，仅在 A\\* 失败时回退）。"""
+        goal = np.asarray(env.task["goal"], dtype=float)
+        need = (self._path is None or self._path_goal is None
+                or self._path_age > self.replan_every
+                or not np.allclose(goal, self._path_goal, atol=0.3))
+        if need:
+            pts = self._astar(env, goal)
+            if pts is None:
+                # **兜底**：A\\* 搜索失败（扩展上限/不可达）→ 回退到测地场梯度，
+                # 绝不能「直冲目标」（那会让机器人一头撞进家具、原地卡死）。
+                self._path = None
+                self._path_goal = goal.copy()
+                self._path_age = 0
+                return super()._lookahead_point(env, field, pose)
+            if self.shortcut:
+                pts = self._shortcut_path(env, pts)
+            self._path = pts
+            self._path_goal = goal.copy()
+            self._path_age = 0
+            self._path_idx = 0
+        if self._path is None:
+            return super()._lookahead_point(env, field, pose)
+        self._path_age += 1
+        path = self._path
+        # 找机器人当前最近的路径点（不是「第一个更近的点」——那会永远卡在起点）
+        d = np.linalg.norm(path - pose[:2][None, :], axis=1)
+        i = int(np.argmin(d))
+        i = max(0, min(i, len(path) - 1))
+        # **只走「格精确验证过」的直线段**：从当前位置出发，沿路径前进，
+        # 直到某个路点与当前位置之间不再是「可直线通过」的（视线被障碍挡住）。
+        # 纯追踪会切角，若不校验，机器人在紧贴障碍的拐角处必然碰撞
+        # （实测 A* 基线单回合 100+ 次碰撞）；这一步让「路径跟踪」与
+        # 「路径来源」解耦，E1c 的对比才真正只差路径来源。
+        from .world import segment_free_exact
+        j = i
+        goal_dist = float(np.linalg.norm(np.asarray(env.task["goal"]) - pose[:2]))
+        dock = goal_dist <= self.dock_los      # 最后接近段：目标本身就在物体旁
+        while (j < len(path) - 1
+               and (dock
+                    or segment_free_exact(env.scene, pose[:2], path[j + 1],
+                                          radius=self.plan_clearance))):
+            j += 1
+        # 在 [i, j] 上取前进 `lookahead` 米的点（**段内插值**，
+        # 不能直接取段端点：否则第一段长于 lookahead 时会返回机器人自己 → 原地打转）
+        traveled = 0.0
+        k = i
+        while k < j:
+            seg = float(np.linalg.norm(path[k + 1] - path[k]))
+            if traveled + seg >= self.lookahead:
+                t = (self.lookahead - traveled) / max(seg, 1e-9)
+                self._path_idx = k
+                return path[k] + t * (path[k + 1] - path[k])
+            traveled += seg
+            k += 1
+        self._path_idx = j
+        return path[j]
+
+
+class AStarRandomTargetPolicy(AStarPolicy):
+    """无语义对照：控制器与 `AStarPolicy` **完全相同**，目标随机选。
+
+    与 `geodesic_random` 构成同口径对照（同一套导航机制，只换目标来源）。
+    """
+
+    name = "astar_random"
+
+    def __init__(self, replan_steps=70, min_dist=1.2, reach_eps=0.5, seed=0, **kw):
+        super().__init__(**kw)
+        self.replan_steps = replan_steps
+        self.min_dist = min_dist
+        self.reach_eps = reach_eps
+        self._rng = np.random.default_rng(seed)
+        self._cur = None
+        self._age = 0
+
+    def reset(self, env=None):
+        super().reset(env)
+        self._cur = None
+        self._age = 0
+
+    def _pick(self, env):
+        sc = env.scene
+        H, W = sc.occ.shape
+        m = int(np.ceil(0.35 / CELL))
+        for _ in range(400):
+            r = int(self._rng.integers(m, max(m + 1, H - m)))
+            c = int(self._rng.integers(m, max(m + 1, W - m)))
+            if env.plan_grid[r, c]:
+                continue
+            p = np.array([sc.bounds[0] + (c + 0.5) * CELL,
+                          sc.bounds[2] + (r + 0.5) * CELL])
+            if float(np.linalg.norm(p - env.robot_pose()[:2])) < self.min_dist:
+                continue
+            return p
+        return np.asarray(env.task["goal"], dtype=float).copy()
+
+    def act(self, obs, env):
+        self._age += 1
+        need = (self._cur is None or self._age > self.replan_steps
+                or float(np.linalg.norm(self._cur - env.robot_pose()[:2])) < self.reach_eps)
+        if need:
+            self._cur = self._pick(env)
+            self._age = 0
+            self._path = None
+            self._path_goal = None
         goal_saved = env.task["goal"]
         env.task["goal"] = self._cur
         try:
@@ -331,7 +653,7 @@ class GeodesicWindowPolicy:
                 continue
             p = np.array([sc.bounds[0] + (c + 0.5) * CELL,
                           sc.bounds[2] + (r + 0.5) * CELL])
-            if float(np.linalg.norm(p - env.pose[:2])) < 1.2:
+            if float(np.linalg.norm(p - env.robot_pose()[:2])) < 1.2:
                 continue
             return p
         return np.asarray(env.task["goal"], dtype=float).copy()
@@ -356,7 +678,7 @@ class GeodesicWindowPolicy:
             self._g = goal.copy()
         f = self._f
         H, W = f.shape
-        r, c = map(int, env.scene.w2c(env.pose[:2]))
+        r, c = map(int, env.scene.w2c(env.robot_pose()[:2]))
         cand = []
         for dr in range(-self.win, self.win + 1):
             for dc in range(-self.win, self.win + 1):
@@ -373,7 +695,7 @@ class GeodesicWindowPolicy:
             # **可行性判据必须与物理碰撞判据一致**（格精确版）：
             # 用采样点会漏掉「恰好擦过桌角」的窄缝 → 规划出的路径机器人挤不进去，
             # 表现为顶在障碍角上反复碰撞直到超时（实测教室场景 482 次碰撞）。
-            if segment_free_exact(env.scene, env.pose[:2], p):
+            if segment_free_exact(env.scene, env.robot_pose()[:2], p):
                 tgt = p
                 break
         if tgt is None:
@@ -381,16 +703,16 @@ class GeodesicWindowPolicy:
         # 末段直取：贴近目标且视线可达时直接瞄准目标中心
         ds = env.d_surf
         if ds == ds and ds < 0.9 and \
-                segment_free_exact(env.scene, env.pose[:2], goal):
+                segment_free_exact(env.scene, env.robot_pose()[:2], goal):
             tgt = goal
-        ang = float(np.arctan2(tgt[1] - env.pose[1], tgt[0] - env.pose[0])
-                    - env.pose[2])
+        ang = float(np.arctan2(tgt[1] - env.robot_pose()[1], tgt[0] - env.robot_pose()[0])
+                    - env.robot_pose()[2])
         ang = (ang + np.pi) % (2 * np.pi) - np.pi
         w = float(np.clip(self.k_ang * ang, -env.cfg["w_max"], env.cfg["w_max"]))
         if abs(ang) > 1.0:
             return np.array([0.0, w])
         v = env.cfg["v_max"] * float(np.clip(1.0 - abs(ang) / np.pi * 1.4, 0.2, 1.0))
-        d = float(np.linalg.norm(goal - env.pose[:2]))
+        d = float(np.linalg.norm(goal - env.robot_pose()[:2]))
         if d < 0.9:
             v *= max(0.3, d / 0.9)
         return np.array([v, w])

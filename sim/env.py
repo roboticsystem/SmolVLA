@@ -50,6 +50,13 @@ CALIBRATED = dict(nx=1, ny=1, room_w=8.0, room_h=6.0, n_objects_per_room=(6, 9),
                   n_peds=0, max_steps=200, success_standoff=0.30,
                   lidar_noise=0.01, camera_augment=0.25)
 
+# 各固定户型的**步数预算**（单一来源；`scripts/bench_layouts.py`、`web_sim.py`
+# 与本轮新增的 E1b/E1c 脚本都从这里取，避免不同脚本用不同预算
+# ⇒ SR 不可比）。数值来源：实测 geodesic 策略在该布局上的平均步数 + 余量。
+LAYOUT_STEPS = {"apartment": 350, "apartment_s": 300, "apartment_l": 450,
+                "corridor": 700, "s_corridor": 700, "warehouse": 650,
+                "classroom": 600, "office": 600}
+
 
 def calibrated_env(seed=0, **over):
     """按标定配置建环境；`over` 可覆盖任意项。"""
@@ -70,7 +77,10 @@ class SemanticNavEnv:
                  light_dir=None, light_strength=1.0, glare=0.0, gloss=0.0,
                  exposure=1.0, flat_wall=False, dyn_peds=False,
                  accel=0.0, acc_ang=0.0, slip=0.0, odom_drift=0.0,
-                 frame_drop=0.0, act_delay=0, with_depth=False):
+                 frame_drop=0.0, act_delay=0, with_depth=False,
+                 pose_noise_gauss=0.0, pose_noise_yaw=0.0, pose_noise_drift=0.0,
+                 pose_noise_jump=0.0, pose_noise_jump_mag=0.30,
+                 pose_filter_alpha=1.0, use_pose_est=False):
         self.seed = seed
         self.cfg = dict(nx=nx, ny=ny, n_peds=n_peds, max_steps=max_steps, dt=dt,
                         obs_size=obs_size, lidar_beams=lidar_beams,
@@ -88,7 +98,14 @@ class SemanticNavEnv:
                         flat_wall=flat_wall, dyn_peds=dyn_peds,
                         accel=accel, acc_ang=acc_ang, slip=slip,
                         odom_drift=odom_drift, frame_drop=frame_drop,
-                        act_delay=act_delay, with_depth=with_depth)
+                        act_delay=act_delay, with_depth=with_depth,
+                        pose_noise_gauss=pose_noise_gauss,
+                        pose_noise_yaw=pose_noise_yaw,
+                        pose_noise_drift=pose_noise_drift,
+                        pose_noise_jump=pose_noise_jump,
+                        pose_noise_jump_mag=pose_noise_jump_mag,
+                        pose_filter_alpha=pose_filter_alpha,
+                        use_pose_est=use_pose_est)
         self.rng = np.random.default_rng(seed)
         self._ep = 0
         self.scene = None
@@ -324,6 +341,66 @@ class SemanticNavEnv:
         return out
 
     # ------------------------------------------------------------ API
+    def robot_pose(self):
+        """**机器人自己的位姿**：默认返回真值；`use_pose_est=True` 时返回含误差的估计位姿。
+
+        真机上，策略/控制器拿到的永远是**估计位姿**（编码器里程计 + 激光扫描匹配），
+        不是真值——这是「仿真里位姿完美、真机不完美」这一根本落差的来源。
+
+        打开 `use_pose_est` 后，策略内部凡是问「我现在在哪」的都必须改用
+        `robot_pose()`，于是「**定位误差 → 导航性能**」的敏感度可以在仿真里直接量化
+        （E1b 的仿真侧实验）。
+
+        **默认 `use_pose_est=False` ⇒ `robot_pose()` 返回真值 ⇒ 行为与历史逐位一致。**
+        """
+        if self.cfg.get("use_pose_est"):
+            return self.pose_est
+        return self.pose
+
+    def _update_pose_est(self):
+        """更新带误差的**估计位姿**（E1b）。
+
+        误差模型按真实定位误差的三个来源拆开（对应 `scripts/eval_pose_sensitivity.py`）：
+
+        | 来源 | 参数 | 物理含义 |
+        |---|---|---|
+        | 持久偏差 | `pose_noise_drift`（m/s） | 里程计尺度误差/打滑造成的**随机游走**偏差（最致命：随里程线性累积） |
+        | 白噪声 | `pose_noise_gauss`（m） | 扫描匹配的测量噪声 |
+        | 跳变 | `pose_noise_jump`（概率/步）、`pose_noise_jump_mag`（m） | 匹配失败/特征贫乏导致的**离群帧**（论文2 §3.4 的离群帧问题） |
+
+        另有 `pose_filter_alpha` ∈ (0,1] 模拟**滤波器**的一阶低通（α=1 表示不过滤）。
+        偏航同理：`pose_noise_yaw`（rad）+ 偏置随机游走。
+        """
+        cfg = self.cfg
+        sig = float(cfg.get("pose_noise_gauss", 0.0) or 0.0)
+        sig_y = float(cfg.get("pose_noise_yaw", 0.0) or 0.0)
+        drift = float(cfg.get("pose_noise_drift", 0.0) or 0.0)
+        p_jump = float(cfg.get("pose_noise_jump", 0.0) or 0.0)
+        mag = float(cfg.get("pose_noise_jump_mag", 0.30) or 0.30)
+        if sig <= 0 and sig_y <= 0 and drift <= 0 and p_jump <= 0:
+            self.pose_est = self.pose.copy()
+            return
+        dt = float(cfg.get("dt", 0.1))
+        # 持久偏差：随机游走（随里程累积）
+        self._pose_bias += self.rng.normal(0.0, drift, 2) * dt
+        self._pose_bias_yaw += float(self.rng.normal(0.0, drift * 0.5)) * dt
+        # 离群跳变：按概率注入，之后指数衰减回零（下一帧重新匹配成功）
+        if p_jump > 0 and self.rng.random() < p_jump:
+            self._pose_out = self.rng.normal(0.0, mag, 2)
+        else:
+            self._pose_out *= max(0.0, 1.0 - 3.0 * dt)
+        meas = np.array([self.pose[0] + self._pose_bias[0] + self._pose_out[0]
+                         + float(self.rng.normal(0.0, sig)),
+                         self.pose[1] + self._pose_bias[1] + self._pose_out[1]
+                         + float(self.rng.normal(0.0, sig)),
+                         self.pose[2] + self._pose_bias_yaw
+                         + float(self.rng.normal(0.0, sig_y))], dtype=np.float64)
+        a = float(np.clip(cfg.get("pose_filter_alpha", 1.0) or 1.0, 0.0, 1.0))
+        if a >= 1.0:
+            self.pose_est = meas
+        else:
+            self.pose_est = a * meas + (1.0 - a) * self.pose_est
+
     def reset(self, seed=None, level=None):
         cfg = self.cfg
         if seed is None:
@@ -366,6 +443,11 @@ class SemanticNavEnv:
         self.done = False
         self.start_xy = self.pose[:2].copy()
         self._gimg = None
+        # ---- 位姿估计误差状态（E1b；默认全关 ⇒ 与历史行为逐位一致）----
+        self.pose_est = self.pose.copy()
+        self._pose_bias = np.zeros(2, dtype=np.float64)
+        self._pose_bias_yaw = 0.0
+        self._pose_out = np.zeros(2, dtype=np.float64)
         # SPL 的最优路径长度：起点 → 目标的测地距离（episode 内固定）
         self.lstar = grid_value(self._shortest_path_len(self.task["goal"]),
                                 self.scene, self.start_xy)
@@ -421,6 +503,7 @@ class SemanticNavEnv:
         for p in self.peds:
             p.step(dt)
 
+        self._update_pose_est()
         self.steps += 1
         self.traj.append(self.pose[:2].copy())
         d = float(np.linalg.norm(self.task["goal"] - self.pose[:2]))

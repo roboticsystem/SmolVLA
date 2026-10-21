@@ -23,11 +23,9 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from sim.baselines import make_policy          # noqa: E402
-from sim.env import calibrated_env            # noqa: E402
+from sim.env import calibrated_env, LAYOUT_STEPS   # 步数预算的单一来源在 sim/env.py            # noqa: E402
 
-LAYOUT_STEPS = {"apartment": 350, "apartment_s": 300, "apartment_l": 450,
-                 "corridor": 700, "s_corridor": 700, "warehouse": 650,
-                 "classroom": 600, "office": 600}
+
 
 
 def run(layout, policy_name, episodes, seed0=9000, stride=37):

@@ -17,7 +17,8 @@ from __future__ import annotations
 import numpy as np
 
 from .env import V_MAX, W_MAX
-from .planner import (GeodesicRandomTargetPolicy, GeodesicWindowPolicy,
+from .planner import (AStarPolicy, AStarRandomTargetPolicy,
+                      GeodesicRandomTargetPolicy, GeodesicWindowPolicy,
                       PlannerOraclePolicy, PlannerPolicy, PlannerRandomTargetPolicy)
 from .sensors import CAMERA_HFOV_DEG, LIDAR_MAX_RANGE
 from .world import CELL, COLORS
@@ -93,7 +94,7 @@ class OraclePolicy:
     def act(self, obs, env):
         lidar = obs["lidar"]
         n = len(lidar)
-        pose = env.pose
+        pose = env.robot_pose()
         goal = self._goal(env)
         f = self._field_for(env, goal)
         H, W = f.shape
@@ -298,7 +299,7 @@ class FrontierPolicy:
 
     def act(self, obs, env):
         self._ensure(env)
-        self._integrate(env.pose, obs["lidar"])
+        self._integrate(env.robot_pose(), obs["lidar"])
         self._t += 1
 
         # 卡死脱困（与 OraclePolicy 同一套机制：反应式转向会与目标转向相互抵消）
@@ -306,9 +307,9 @@ class FrontierPolicy:
             self._esc -= 1
             return np.array([0.0, self._esc_dir * self.w_max])
         if self._last_xy is not None:
-            moved_now = float(np.linalg.norm(env.pose[:2] - self._last_xy))
+            moved_now = float(np.linalg.norm(env.robot_pose()[:2] - self._last_xy))
             self._stuck = self._stuck + 1 if moved_now < 2e-3 else 0
-        self._last_xy = env.pose[:2].copy()
+        self._last_xy = env.robot_pose()[:2].copy()
         if self._stuck > 10:
             self._stuck = 0
             self._esc = 12
@@ -319,7 +320,7 @@ class FrontierPolicy:
 
         if self._t % self.replan_every == 1 or self._target is None:
             fr = self._frontiers()
-            rr, cc = self._w2c(np.array([[env.pose[0], env.pose[1]]]))
+            rr, cc = self._w2c(np.array([[env.robot_pose()[0], env.robot_pose()[1]]]))
             dist = self._bfs_from((int(rr[0]), int(cc[0])))
             self._target = None
             if fr.any() and (dist >= 0).any():
@@ -343,7 +344,7 @@ class FrontierPolicy:
             tr, tc = self._target
             tx = self.bounds[0] + (tc + 0.5) * self.res
             ty = self.bounds[2] + (tr + 0.5) * self.res
-            dnow = float(np.hypot(tx - env.pose[0], ty - env.pose[1]))
+            dnow = float(np.hypot(tx - env.robot_pose()[0], ty - env.robot_pose()[1]))
             if self._best_d is None or dnow < self._best_d - 0.1:
                 self._best_d = dnow
                 self._tgt_age = 0
@@ -361,7 +362,7 @@ class FrontierPolicy:
         tr, tc = self._target
         tx = self.bounds[0] + (tc + 0.5) * self.res
         ty = self.bounds[2] + (tr + 0.5) * self.res
-        ang = float(np.arctan2(ty - env.pose[1], tx - env.pose[0]) - env.pose[2])
+        ang = float(np.arctan2(ty - env.robot_pose()[1], tx - env.robot_pose()[0]) - env.robot_pose()[2])
         ang = (ang + np.pi) % (2 * np.pi) - np.pi
 
         lidar = obs["lidar"]
@@ -415,7 +416,7 @@ class RandomTargetPolicy(OraclePolicy):
                 continue
             p = np.array([sc.bounds[0] + (c + 0.5) * CELL,
                           sc.bounds[2] + (r + 0.5) * CELL])
-            if float(np.linalg.norm(p - env.pose[:2])) < self.min_dist:
+            if float(np.linalg.norm(p - env.robot_pose()[:2])) < self.min_dist:
                 continue
             return p
         return np.asarray(env.task["goal"], dtype=float).copy()
@@ -423,7 +424,7 @@ class RandomTargetPolicy(OraclePolicy):
     def _goal(self, env):
         self._age += 1
         need = (self._cur_goal is None or self._age > self.replan_steps
-                or float(np.linalg.norm(self._cur_goal - env.pose[:2])) < self.reach_eps)
+                or float(np.linalg.norm(self._cur_goal - env.robot_pose()[:2])) < self.reach_eps)
         if need:
             self._cur_goal = self._pick(env)
             self._age = 0
@@ -478,7 +479,7 @@ class ReactiveGoalPolicy:
         lid = np.asarray(obs["lidar"], dtype=float)
         n = len(lid)
         ang = np.linspace(-np.pi, np.pi, n, endpoint=False)   # 与 lidar_scan 一致
-        pose = env.pose
+        pose = env.robot_pose()
         g = np.asarray(env.task["goal"], dtype=float)
         dv = g - pose[:2]
         dist = float(np.linalg.norm(dv))
@@ -609,7 +610,7 @@ class SweepPolicy:
         lid = np.asarray(obs["lidar"], dtype=float)
         n = len(lid)
         ang = np.linspace(-np.pi, np.pi, n, endpoint=False) if n else np.zeros(0)
-        pose = env.pose
+        pose = env.robot_pose()
         g = np.asarray(env.task["goal"], dtype=float)
         dv = g - pose[:2]
         dist = float(np.linalg.norm(dv))
@@ -973,8 +974,8 @@ class SweepDetectorPolicy:
         now = self._t
         keep = [m for m in self._mem if now - m[5] <= self.mem_ttl]
         for dt in dets:
-            a = env.pose[2] + dt.bearing
-            p = env.pose[:2] + dt.dist * np.array([np.cos(a), np.sin(a)])
+            a = env.robot_pose()[2] + dt.bearing
+            p = env.robot_pose()[:2] + dt.dist * np.array([np.cos(a), np.sin(a)])
             for m in keep:
                 if m[1] == dt.color and float(np.hypot(*(p - m[0]))) < self.mem_merge:
                     m[0] = 0.5 * (m[0] + p)          # 位置指数平滑，抑制测距抖动
@@ -999,7 +1000,7 @@ class SweepDetectorPolicy:
         self._last_surf = float('nan')
         self._mem_update(dets, env)
         if self._map is not None:
-            self._map.update(env.pose, obs.get("lidar"), dets, self._t)
+            self._map.update(env.robot_pose(), obs.get("lidar"), dets, self._t)
         if not dets:
             return self._from_map(env, want_color, want_cls) or \
                 self._from_memory(env, want_color, want_cls, ref_cls, rel)
@@ -1008,8 +1009,8 @@ class SweepDetectorPolicy:
             # L3：先用世界坐标把「参考物 + 方位」解出来，再挑目标
             # 世界位置 = 自车位姿（里程计可观测） + 相机测得的方位与距离
             def wpos(d):
-                a = env.pose[2] + d.bearing
-                return env.pose[:2] + d.dist * np.array([np.cos(a), np.sin(a)])
+                a = env.robot_pose()[2] + d.bearing
+                return env.robot_pose()[:2] + d.dist * np.array([np.cos(a), np.sin(a)])
 
             refs = [d for d in dets if match([d], cls=ref_cls) is not None]
             tgts = [d for d in dets if match([d], color=want_color, cls=want_cls) is not None]
@@ -1027,18 +1028,18 @@ class SweepDetectorPolicy:
                             best = t
                         break
             if best is not None:
-                a = env.pose[2] + best.bearing
+                a = env.robot_pose()[2] + best.bearing
                 return (best.bearing, best.dist,
-                        env.pose[:2] + best.dist * np.array([np.cos(a), np.sin(a)]))
+                        env.robot_pose()[:2] + best.dist * np.array([np.cos(a), np.sin(a)]))
 
         d = match(dets, color=want_color, cls=want_cls)
         if d is None:
             return self._from_memory(env, want_color, want_cls, ref_cls, rel)
         # 记下命中的**激光表面距**（`use_lidar_dist` 的停靠判据要用）
         self._last_surf = float(getattr(d, "surf", float("nan")))
-        a = env.pose[2] + d.bearing
+        a = env.robot_pose()[2] + d.bearing
         return (d.bearing, d.dist,
-                env.pose[:2] + d.dist * np.array([np.cos(a), np.sin(a)]))
+                env.robot_pose()[:2] + d.dist * np.array([np.cos(a), np.sin(a)]))
 
     def _from_map(self, env, want_color, want_cls):
         """**当前帧没看到目标时，从语义地图里取位置** —— 这是「看不见也知道方向」。
@@ -1048,12 +1049,12 @@ class SweepDetectorPolicy:
         """
         if self._map is None:
             return None
-        cand = self._map.query(color=want_color, cls=want_cls, pose=env.pose)
+        cand = self._map.query(color=want_color, cls=want_cls, pose=env.robot_pose())
         if not cand:
             return None
-        v = cand[0][0] - np.asarray(env.pose[:2])
+        v = cand[0][0] - np.asarray(env.robot_pose()[:2])
         dist = float(np.hypot(*v))
-        a = float(np.arctan2(v[1], v[0]) - env.pose[2])
+        a = float(np.arctan2(v[1], v[0]) - env.robot_pose()[2])
         a = (a + np.pi) % (2 * np.pi) - np.pi
         return a, dist, np.asarray(cand[0][0], dtype=np.float64).copy()
 
@@ -1097,9 +1098,9 @@ class SweepDetectorPolicy:
             if kept:
                 cand = kept
 
-        best = min(cand, key=lambda m: float(np.hypot(*(m[0] - env.pose[:2]))))
-        v = best[0] - env.pose[:2]
-        a = float(np.arctan2(v[1], v[0]) - env.pose[2])
+        best = min(cand, key=lambda m: float(np.hypot(*(m[0] - env.robot_pose()[:2]))))
+        v = best[0] - env.robot_pose()[:2]
+        a = float(np.arctan2(v[1], v[0]) - env.robot_pose()[2])
         a = (a + np.pi) % (2 * np.pi) - np.pi
         return a, float(np.hypot(*v)), np.asarray(best[0], dtype=np.float64).copy()
 
@@ -1107,7 +1108,7 @@ class SweepDetectorPolicy:
         lid = np.asarray(obs["lidar"], dtype=float)
         n = len(lid)
         ang = np.linspace(-np.pi, np.pi, n, endpoint=False) if n else np.zeros(0)
-        pose = env.pose
+        pose = env.robot_pose()
 
         self._t += 1
         if self._last is None or self._t % self.det_every == 1:
@@ -1167,7 +1168,11 @@ POLICIES = {"random": RandomPolicy, "frontier": FrontierPolicy,
             "sweep_det": SweepDetectorPolicy,
             # 窗口测地场上界（新增固定布局用；见 planner.GeodesicWindowPolicy）
             "geodesic": GeodesicWindowPolicy,
-            "geodesic_random": GeodesicRandomTargetPolicy}
+            "geodesic_random": GeodesicRandomTargetPolicy,
+            # 经典 A* 传统规划对照（见 planner.AStarPolicy；E1c 路径几何对比 /
+            # 第 3 章算法选型论证用），astar_random 为同口径无语义对照
+            "astar": AStarPolicy,
+            "astar_random": AStarRandomTargetPolicy}
 
 
 def make_policy(name, **kw):

@@ -661,7 +661,7 @@ def segment_free(scene: "Scene", a, b, radius: float, n: int = 24) -> bool:
     return True
 
 
-def _free_map(scene: "Scene") -> np.ndarray:
+def _free_map(scene: "Scene", k: int = 0) -> np.ndarray:
     """**物理碰撞口径**的自由图（缓存到 scene 上）。
 
     `Scene.is_free(xy, margin)` 的判定是「所在格 ±m 邻域内无障碍」，
@@ -670,35 +670,54 @@ def _free_map(scene: "Scene") -> np.ndarray:
 
     规划器若用别的口径做可行性判断，就会出现「规划说能过、实际过不去」——
     故这里把**与物理判据完全一致**的自由图显式缓存下来。
+
+    **参数 `k`**：膨胀格数。`k=0`（默认）⇒ 用物理口径的 m=3 格（**行为与历史一致**）；
+    `k>0` ⇒ 用指定的膨胀半径（供 A\\* 的 costmap 膨胀半径对齐用，
+    见 `planner.AStarPolicy.plan_clearance`）。不同 k 分别缓存，互不干扰。
     """
+    if k and k > 0:
+        key = f"_free_map_k{k}"
+        fm = getattr(scene, key, None)
+        if fm is None:
+            fm = _square_dilate_free(scene.occ, int(k))
+            setattr(scene, key, fm)
+        return fm
     key = "_free_map3"
     fm = getattr(scene, key, None)
     if fm is None:
         from .env import ROBOT_RADIUS          # 延迟导入：避免循环依赖
         m = int(np.ceil(ROBOT_RADIUS * 0.6 / CELL))
-        occ = scene.occ
-        # 沿行方向膨胀 m 格（每轮膨胀 1 格，用上一轮的结果迭代）
-        row = occ.copy()
-        for _ in range(m):
-            nxt = row.copy()
-            nxt[1:, :] |= row[:-1, :]
-            nxt[:-1, :] |= row[1:, :]
-            row = nxt
-        # 再沿列方向膨胀 m 格 ⇒ (2m+1)² 方形膨胀
-        col = row.copy()
-        for _ in range(m):
-            nxt = col.copy()
-            nxt[:, 1:] |= col[:, :-1]
-            nxt[:, :-1] |= col[:, 1:]
-            col = nxt
-        fm = ~col
-        # 边界：物理判据 `is_free` 会拒绝「格子距栅格边缘不足 m 格」的位置，
-        # 这里同样把它们标成不可用，保证两张图**逐点一致**（实测内部 0 处不一致）。
-        fm[:m, :] = False
-        fm[-m:, :] = False
-        fm[:, :m] = False
-        fm[:, -m:] = False
+        fm = _square_dilate_free(scene.occ, m)
         setattr(scene, key, fm)
+    return fm
+
+
+def _square_dilate_free(occ: np.ndarray, m: int) -> np.ndarray:
+    """占据图做 (2m+1)² **方形**膨胀后取反 → 自由图（含边界处理）。
+
+    边界：物理判据 `is_free` 会拒绝「格子距栅格边缘不足 m 格」的位置，
+    这里同样把它们标成不可用，保证两张图**逐点一致**（实测内部 0 处不一致）。
+    """
+    m = max(0, int(m))
+    # 沿行方向膨胀 m 格（每轮膨胀 1 格，用上一轮的结果迭代）
+    row = occ.copy()
+    for _ in range(m):
+        nxt = row.copy()
+        nxt[1:, :] |= row[:-1, :]
+        nxt[:-1, :] |= row[1:, :]
+        row = nxt
+    # 再沿列方向膨胀 m 格 ⇒ (2m+1)² 方形膨胀
+    col = row.copy()
+    for _ in range(m):
+        nxt = col.copy()
+        nxt[:, 1:] |= col[:, :-1]
+        nxt[:, :-1] |= col[:, 1:]
+        col = nxt
+    fm = ~col
+    fm[:m, :] = False
+    fm[-m:, :] = False
+    fm[:, :m] = False
+    fm[:, -m:] = False
     return fm
 
 
@@ -747,10 +766,18 @@ def segment_free_exact(scene: "Scene", a, b, radius: float = 0.0) -> bool:
 
     做法：解析枚举线段经过的**所有格子**，逐格查「物理口径自由图」
     （= 7×7 方形膨胀的取反，与 `Scene.is_free(margin)` 逐点一致）。
+
+    **参数 `radius`**：要求「中心到障碍 ≥ radius 米」。`radius=0`（默认）⇒ 用物理口径
+    （0.15 m，**与历史行为一致**）；`radius>0` ⇒ 膨胀格数 k = max(3, ceil(radius/CELL))，
+    供 A\\* 的 costmap 膨胀半径对齐用（捷径必须与规划栅格同口径，否则捷径会切进
+    规划栅格认为不可通行的区域）。
     """
     a = np.asarray(a, dtype=np.float64)
     b = np.asarray(b, dtype=np.float64)
-    free = _free_map(scene)
+    k = 0
+    if radius and radius > 0:
+        k = max(3, int(np.ceil(float(radius) / CELL)))
+    free = _free_map(scene, k)
     H, W = free.shape
     r0, c0 = scene.w2c(a)
     r1, c1 = scene.w2c(b)
