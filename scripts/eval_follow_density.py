@@ -30,83 +30,8 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from sim.follow import FollowEnv, FollowPolicyE4              # noqa: E402
-
-# 侧向干扰的**互不重叠**摆位槽位（方位角 °, 距离 m）
-# 早期版本只有 ±45° 两个位置 ⇒ 4 人时第 3/4 个与第 1/2 个重叠，
-# 「行人 2」与「行人 4」的指标逐位相同，密度维度实际只有 2 档有效。
-SIDE_SLOTS = [(40.0, 1.9), (-40.0, 1.9), (65.0, 2.0), (-65.0, 2.0)]
-
-
-def crowding(env, r=2.0):
-    """论文4 口径的拥挤度：半径 r 内的行人数量与占据面积占比。"""
-    peds = list(getattr(env, "peds", []) or [])
-    if not peds:
-        return {"n_in_r": 0, "area_frac": 0.0}
-    xy = env.pose[:2]
-    n = 0
-    area = 0.0
-    for p in peds:
-        d = float(np.linalg.norm(np.asarray(p.xy, dtype=float) - xy))
-        if d <= r:
-            n += 1
-            rad = float(getattr(p, "radius", 0.25))
-            area += np.pi * rad * rad
-    return {"n_in_r": n, "area_frac": float(min(1.0, area / (np.pi * r * r)))}
-
-
-def place_peds(env, n_peds, occlusion):
-    """**受控摆放**行人：密度与遮挡都是**实验变量**，而不是随机碰运气。
-
-    为什么要受控：随机撒的行人常常离机器人 3 m 开外，对跟随毫无影响
-    （实测：0 个与 1 个行人的 TCR/误差/碰撞**逐位相同** ⇒ 行人根本没进入交互），
-    那样得到的「密度分层」是假的。这里把行人摆到**相对机器人初始位姿的指定位置**，
-    并冻结（speed=0、航点=当前位置），使密度与遮挡角**完全可控**。
-    """
-    peds = list(getattr(env, "peds", []) or [])
-    # 行人数不足时无法摆放（FollowEnv 的 n_peds 决定生成个数）
-    while len(peds) < n_peds:
-        break
-    if not peds:
-        return []
-    robot = env.pose[:2].copy()
-    tgt = np.asarray(env.target.xy, dtype=float)
-    v = tgt - robot
-    dist = float(np.linalg.norm(v))
-    u = v / max(dist, 1e-6)                      # 视线方向
-    nrm = np.array([-u[1], u[0]])                # 左法向
-    placed = []
-    for i, p in enumerate(peds):
-        if i >= n_peds:
-            break
-        if occlusion == "full" and i == 0:
-            # 正对视线：放在机器人与目标的连线上（遮挡目标）
-            q = robot + u * max(0.6, 0.6 * dist)
-        elif occlusion == "partial" and i == 0:
-            # 半遮挡：偏离视线 25°
-            ang = np.deg2rad(25.0)
-            d = u * np.cos(ang) + nrm * np.sin(ang)
-            q = robot + d * 1.6
-        else:
-            # 侧向干扰：摆在视线两侧（**不遮挡目标**，但会进入激光避障视野**）
-            # 槽位逐个错开：早期版本用 ±45° 固定两档，导致第 3/4 个行人与
-            # 第 1/2 个**位置完全重叠**，「行人 2」与「行人 4」指标逐位相同
-            # ⇒ 密度维度实际只有 2 档有效。现在用 4 个互不重叠的槽位。
-            slot = i if occlusion == "side" else i - 1
-            ang_deg, rad = SIDE_SLOTS[slot % len(SIDE_SLOTS)]
-            ang = np.deg2rad(ang_deg)
-            d = u * np.cos(ang) + nrm * np.sin(ang)
-            q = robot + d * rad
-        p.xy = np.asarray(q, dtype=np.float64)
-        p.wp = p.xy.copy()                        # 航点=当前位置 ⇒ 原地不动
-        p.speed = 0.0
-        placed.append(p)
-    # 多余的行人挪到远处，避免干扰
-    for p in peds[n_peds:]:
-        p.xy = np.array([env.scene.bounds[0] + 0.4, env.scene.bounds[2] + 0.4])
-        p.wp = p.xy.copy()
-        p.speed = 0.0
-    return placed
+from sim.follow import (FollowEnv, FollowPolicyE4,            # noqa: E402
+                        crowding, place_peds)
 
 
 def run(scenario, n_peds, episodes, policy_kw, radius, occlusion="none",

@@ -19,7 +19,8 @@ import numpy as np
 from sim.env import calibrated_env, navigate_metrics, grid_value
 from sim.baselines import (RandomPolicy, OraclePolicy, RandomTargetPolicy,
                            SweepDetectorPolicy)
-from sim.follow import (FollowEnv, OracleFollow, ReactiveFollow, FollowPolicyE4)
+from sim.follow import (FollowEnv, OracleFollow, ReactiveFollow, FollowPolicyE4,
+                        FollowPolicyStage, place_peds, crowding)
 from sim.planner import GeodesicWindowPolicy
 from sim.world import segment_free
 
@@ -319,6 +320,13 @@ def make_policy(name, env=None):
         if env is not None and getattr(env, "scenario", "") == "tour":
             return TourFollow()      # 全屋巡回：门洞密集，降低激光安全间隙
         return ReactiveFollow()
+    if name == "follow_stage":
+        # E11c：显式跟随阶段机（follow/static/lost/search）+ 三级脱困（L1/L2/L3）
+        return FollowPolicyStage()
+    if name == "follow_stage_s":
+        # E11c 逐级消融的「仅阶段机」臂：关掉 L1/L2/L3 与局部重规划
+        return FollowPolicyStage(use_l1=False, use_l2=False, use_l3=False,
+                                 use_replan=False)
     if name == "follow_oracle":
         return OracleFollow()
     if name == "follow_e4":
@@ -378,18 +386,26 @@ DEGRADE_KW = {
 }
 
 
-def _pick_env(sim, policy_name, scenario, scene_name=None):
-    """按策略与场景选择环境（导航/跟随 × 标定实验场景/公寓/新场景，均懒创建复用）。"""
+def _pick_env(sim, policy_name, scenario, scene_name=None, dens=0):
+    """按策略与场景选择环境（导航/跟随 × 标定实验场景/公寓/新场景，均懒创建复用）。
+
+    `dens`（E11b 人群拥挤度分层）只影响跟随环境：非 0 时让 FollowEnv 生成
+    对应数量的额外行人（随后由 `place_peds` 受控摆位），并参与缓存 key，
+    改密度即重建环境。
+    """
     scene_name = scene_name or "lab"
     if policy_name.startswith("follow"):
         sc = scenario or "normal"
         if sc == "tour":
             scene_name = "apartment"     # tour 航点按公寓 11.4×8.6 m 生成，强制绑定
-        key = (sc, scene_name)
+        dens = int(dens or 0)
+        key = (sc, scene_name, dens)
         if sim.fenv is None or getattr(sim.fenv, "_key", None) != key:
             # tour 全屋巡回路程约 45 m → 步数大幅放宽；跟随更紧、人速更慢
             steps = 2200 if sc == "tour" else LAYOUT_STEPS.get(scene_name, 300)
             kw = dict(want_dist=1.1, target_speed=0.15) if sc == "tour" else {}
+            if dens > 0:
+                kw["n_peds"] = dens
             sim.fenv = FollowEnv(seed=0, max_steps=steps, scenario=sc,
                                  camera_augment=0.25,
                                  layout=scene_name if scene_name != "lab" else None,
@@ -410,15 +426,25 @@ def _pick_env(sim, policy_name, scenario, scene_name=None):
 
 
 def run_episode(sim, policy_name, seed, level, collect_only=False,
-                instruction=None, scenario=None, scene_name=None, degrade=None):
-    env = _pick_env(sim, policy_name, scenario, scene_name)
+                instruction=None, scenario=None, scene_name=None, degrade=None,
+                pose=0.0, dens=0):
+    env = _pick_env(sim, policy_name, scenario, scene_name, dens=dens)
     follow = policy_name.startswith("follow")
     sim.active_env = env
     # 硬件退化族：在 reset **之前**写入 cfg（n_peds 决定场景里生成几个行人，
     # 必须在建场景前生效）
     for k, v in DEGRADE_KW.get(degrade or "none", {}).items():
         env.cfg[k] = v
+    # E1b 定位噪声：策略看到的位姿改用含高斯噪声的估计值（σ 单位：米）。
+    # 环境是跨回合缓存的，所以这里**每回合显式写回**，避免上一次的设置残留。
+    pose = float(pose or 0.0)
+    env.cfg["use_pose_est"] = bool(pose > 0)
+    env.cfg["pose_noise_gauss"] = pose
     obs = env.reset(seed=seed)
+    if follow and int(dens or 0) > 0:
+        # E11b：把额外行人受控摆到机器人初始位姿的侧向槽位（否则随机撒的
+        # 行人远在 3 m 外，密度档位形同虚设）
+        place_peds(env, int(dens), "side")
     pol = make_policy(policy_name, env=env)
     pol.reset(env=env)
     if instruction and not follow:
@@ -452,7 +478,9 @@ def run_episode(sim, policy_name, seed, level, collect_only=False,
                     sim.target = [float(x) for x in env.target.xy]
                     sim.live = {"dist": float(info["dist"]),
                                 "visible": bool(info["visible"]),
-                                "in_band": bool(info["in_band"])}
+                                "in_band": bool(info["in_band"]),
+                                "rho": int(crowding(env, 2.0)["n_in_r"]),
+                                "stage": getattr(pol, "stage", None)}
                     sim.instruction = "跟随红马甲行人"
                     sim.level_str = "follow"
                 else:
@@ -482,17 +510,30 @@ def run_episode(sim, policy_name, seed, level, collect_only=False,
         })
     if follow:
         m = env.metrics()
-        return {"follow": True,
-                "success": float(m["TCR"] >= 0.7 and m["in_band_rate"] >= 0.7),
-                "TCR": round(100 * m["TCR"], 1),
-                "err_mean": round(m["err_mean"], 3),
-                "err_std": round(m["err_std"], 3),
-                "vis_rate": round(100 * m["vis_rate"], 1),
-                "in_band_rate": round(100 * m["in_band_rate"], 1),
-                "n_loss": m["n_loss"],
-                "rec_ms_median": round(m["rec_ms_median"], 1),
-                "steps": steps, "n_collide": m["n_collide"],
-                "instruction": "跟随红马甲行人", "level": "follow", **eng}
+        out = {"follow": True,
+               "success": float(m["TCR"] >= 0.7 and m["in_band_rate"] >= 0.7),
+               "TCR": round(100 * m["TCR"], 1),
+               "err_mean": round(m["err_mean"], 3),
+               "err_std": round(m["err_std"], 3),
+               "vis_rate": round(100 * m["vis_rate"], 1),
+               "in_band_rate": round(100 * m["in_band_rate"], 1),
+               "n_loss": m["n_loss"],
+               "rec_ms_median": round(m["rec_ms_median"], 1),
+               "steps": steps, "n_collide": m["n_collide"],
+               "rho": int(crowding(env, 2.0)["n_in_r"]),
+               "instruction": "跟随红马甲行人", "level": "follow", **eng}
+        # E11c：阶段机停留时长 + 三级脱困触发次数（非阶段机策略无此字段）
+        stg = getattr(pol, "stats", None)
+        if isinstance(stg, dict) and "stage_time" in stg:
+            out["stage_time"] = {k: round(v, 1)
+                                 for k, v in stg["stage_time"].items()}
+            out["stage_trans"] = dict(stg["stage_trans"])
+            out["unstick"] = {"L1": int(stg["l1"]["n"]),
+                              "L2": int(stg["l2"]["n"]),
+                              "L3": int(stg["l3"]["n"])}
+            lat = stg.get("replan_ms") or []
+            out["replan_ms"] = round(float(np.median(lat)), 1) if lat else 0.0
+        return out
     m = navigate_metrics(info)
     return {"success": float(m["SR"]), "spl": float(m["SPL"]), "ne": float(m["NE"]),
             "steps": steps, "min_dist": float(env.min_dist),
@@ -501,11 +542,12 @@ def run_episode(sim, policy_name, seed, level, collect_only=False,
 
 
 def worker_single(sim, policy_name, seed, level, instruction=None, scenario=None,
-                  scene_name=None, degrade=None):
+                  scene_name=None, degrade=None, pose=0.0, dens=0):
     try:
         res = run_episode(sim, policy_name, seed, level,
                           instruction=instruction, scenario=scenario,
-                          scene_name=scene_name, degrade=degrade)
+                          scene_name=scene_name, degrade=degrade,
+                          pose=pose, dens=dens)
         with LOCK:
             if sim._stop:
                 res = dict(res, stopped=True)    # 「⏹ 停止」终止：标注为手动停止
@@ -592,7 +634,7 @@ def _batch_stats(rows, ref_rows=None):
 
 
 def worker_batch(sim, policy_name, n, level, scene_name=None, scenario=None,
-                 repeats=1, ref_policy=None, degrade=None):
+                 repeats=1, ref_policy=None, degrade=None, pose=0.0, dens=0):
     """批量评测：**可跨场景 + 可重复多次 + 可配对参考基线**。
 
     - 跨场景：`scene_name='multi'` 时在「标定场地 + 公寓」两种场地上跑同一批种子，
@@ -616,13 +658,15 @@ def worker_batch(sim, policy_name, n, level, scene_name=None, scenario=None,
                     seed = 9000 + ep * 37 + 100000 * rep
                     res = run_episode(sim, policy_name, seed, level,
                                       collect_only=True, scene_name=sc,
-                                      scenario=scenario, degrade=degrade)
+                                      scenario=scenario, degrade=degrade,
+                                      pose=pose, dens=dens)
                     res.update(scene=sc, rep=rep, seed=seed)
                     rows.append(res)
                     if ref_policy:
                         r2 = run_episode(sim, ref_policy, seed, level,
                                          collect_only=True, scene_name=sc,
-                                         scenario=scenario, degrade=degrade)
+                                         scenario=scenario, degrade=degrade,
+                                         pose=pose, dens=dens)
                         r2.update(scene=sc, rep=rep, seed=seed)
                         ref_rows.append(r2)
                     done += 1
@@ -715,7 +759,9 @@ class Handler(BaseHTTPRequestHandler):
                     target=worker_single,
                     args=(SIM, SIM.policy_name, SIM.seed, SIM.level,
                           req.get("instruction"), req.get("scenario"),
-                          req.get("scene"), req.get("degrade")),
+                          req.get("scene"), req.get("degrade"),
+                          float(req.get("pose") or 0.0),
+                          int(req.get("dens") or 0)),
                     daemon=True)
                 SIM.worker.start()
             self._json({"ok": True})
@@ -741,7 +787,9 @@ class Handler(BaseHTTPRequestHandler):
                           req.get("scene"), req.get("scenario"),
                           int(req.get("repeats", 1)),
                           req.get("ref_policy") or None,
-                          req.get("degrade")), daemon=True)
+                          req.get("degrade"),
+                          float(req.get("pose") or 0.0),
+                          int(req.get("dens") or 0)), daemon=True)
                 SIM.worker.start()
             self._json({"ok": True})
         elif self.path == "/api/voice":
