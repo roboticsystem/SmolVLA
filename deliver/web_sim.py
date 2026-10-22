@@ -18,7 +18,7 @@ import numpy as np
 
 from sim.env import calibrated_env, navigate_metrics, grid_value
 from sim.baselines import (RandomPolicy, OraclePolicy, RandomTargetPolicy,
-                           SweepDetectorPolicy)
+                           SweepDetectorPolicy, ExploreMemoryPolicy)
 from sim.follow import (FollowEnv, OracleFollow, ReactiveFollow, FollowPolicyE4,
                         FollowPolicyStage, place_peds, crowding)
 from sim.planner import GeodesicWindowPolicy
@@ -52,7 +52,8 @@ class Sim:
         self.img_b64 = None
         self.lidar_pts = []
         self.target = None        # 跟随模式：被跟随者（红马甲）位置
-        self.live = None          # 跟随模式：实时 距离/可见/带内
+        self.live = None          # 跟随模式：实时 距离/可见/带内；explore 模式：阶段/覆盖/地标
+        self.mem = None           # explore 模式：机器人记忆栅格（阶段一攒的占据图）
         self.fenv = None          # 跟随环境（懒创建，按 scenario 复用）
         self.aenv = None          # 公寓场景导航环境（懒创建）
         self.avenvs = {}          # 各固定布局的导航环境缓存（公寓/走廊/仓库…）
@@ -129,7 +130,7 @@ class Sim:
                 "level": self.level_str, "pose": self.pose, "traj": traj,
                 "goal": self.goal, "lidar": lidar, "image": self.img_b64,
                 "map": self.map_png, "map_meta": self.map_meta,
-                "target": self.target, "live": self.live,
+                "target": self.target, "live": self.live, "mem": self.mem,
                 "done": self.done, "result": self.result, "batch": self.batch}
 
 
@@ -141,6 +142,26 @@ def cv2_jpeg(rgb):
     ok, buf = cv2.imencode(".jpg", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
                            [cv2.IMWRITE_JPEG_QUALITY, 80])
     return ok, buf.tobytes()
+
+
+def mem_payload(pol, step):
+    """把 ExploreMemoryPolicy 阶段一攒下的记忆栅格编码给前端 2D 叠加显示。
+
+    grid 值 -1/0/1（未知/自由/占据）→ +1 后按 uint8 base64（约 14k 格 ≈ 19 KB），
+    `v` 是步数版本号：前端只在版本变化时重画暗区，避免每帧重画上万格。
+    """
+    fr = pol.front
+    if fr.grid is None:
+        return None
+    g = (np.asarray(fr.grid, dtype=np.int16) + 1).astype(np.uint8)
+    return {"v": int(step),
+            "g": base64.b64encode(g.tobytes()).decode(),
+            "shape": [int(g.shape[0]), int(g.shape[1])],
+            "b": [float(x) for x in fr.bounds],
+            "res": float(fr.res),
+            "phase": pol.phase,
+            "lm": (None if pol.landmark is None
+                   else [float(pol.landmark[0]), float(pol.landmark[1])])}
 
 
 class VLAPolicy:
@@ -334,6 +355,9 @@ def make_policy(name, env=None):
                               use_gamma=True, use_enhance=True)
     if name == "geodesic":
         return FieldFollower()      # 窗口测地场上界（新固定布局）
+    if name == "explore":
+        # 巡屋建图 → 瞥见记地标 → 记忆寻物（两阶段「视野外寻物」演示）
+        return ExploreMemoryPolicy()
     if name == "oracle" and env is not None and \
             getattr(env.scene, "name", "") in LAYOUT_STEPS:
         # **固定户型**（公寓/窄走廊/S 形走廊/仓库）统一换测地场上界：
@@ -447,6 +471,15 @@ def run_episode(sim, policy_name, seed, level, collect_only=False,
         place_peds(env, int(dens), "side")
     pol = make_policy(policy_name, env=env)
     pol.reset(env=env)
+    if policy_name == "explore":
+        # 两阶段（巡屋建图 + 记忆寻物）比单程导航长得多 → 预算 ×5。
+        # （实测晚瞥见种子：瞥见可发生在 ~1350 步，随后还需 ~140 步记忆寻物）
+        # 环境跨回合缓存：原值记在 env 属性上并显式写回，避免乘法复利。
+        if not hasattr(env, "_max_steps0"):
+            env._max_steps0 = int(env.cfg["max_steps"])
+        env.cfg["max_steps"] = env._max_steps0 * 5
+    elif hasattr(env, "_max_steps0"):
+        env.cfg["max_steps"] = env._max_steps0
     if instruction and not follow:
         if not apply_instruction(env, instruction):
             raise RuntimeError("指令「%s」在当前场景中无对应目标"
@@ -455,6 +488,11 @@ def run_episode(sim, policy_name, seed, level, collect_only=False,
     ctrl_ms = []
     if not collect_only:
         sim.refresh_map(env)
+        # explore：预建记忆栅格，第一帧就有「暗区底图」；其他策略清掉残留
+        sim.mem = None
+        if policy_name == "explore":
+            pol.front._ensure(env)
+            sim.mem = mem_payload(pol, 0)
     info = None
     while True:
         if sim._stop:                # 「⏹ 停止」按钮：任何运行中的回合立即终止
@@ -484,9 +522,21 @@ def run_episode(sim, policy_name, seed, level, collect_only=False,
                     sim.instruction = "跟随红马甲行人"
                     sim.level_str = "follow"
                 else:
-                    sim.goal = [float(x) for x in env.task["goal"]]
+                    if policy_name == "explore":
+                        # 阶段一（巡屋）藏起目标点 —— 机器人自己还没瞥见，
+                        # 观众看到的与机器人同信息量；瞥见换段后亮出地标。
+                        if pol.phase == "navigate" and pol.landmark is not None:
+                            sim.goal = [float(pol.landmark[0]),
+                                        float(pol.landmark[1])]
+                        else:
+                            sim.goal = None
+                        sim.live = dict(pol.live)
+                        if steps % 10 == 0:
+                            sim.mem = mem_payload(pol, steps)
+                    else:
+                        sim.goal = [float(x) for x in env.task["goal"]]
+                        sim.live = None
                     sim.target = None
-                    sim.live = None
                     sim.instruction = env.task["instruction"]
                     sim.level_str = str(env.task.get("level", "-"))
                 sim.step = steps
@@ -535,10 +585,20 @@ def run_episode(sim, policy_name, seed, level, collect_only=False,
             out["replan_ms"] = round(float(np.median(lat)), 1) if lat else 0.0
         return out
     m = navigate_metrics(info)
-    return {"success": float(m["SR"]), "spl": float(m["SPL"]), "ne": float(m["NE"]),
-            "steps": steps, "min_dist": float(env.min_dist),
-            "instruction": env.task["instruction"],
-            "level": str(env.task.get("level", "-")), **eng}
+    out = {"success": float(m["SR"]), "spl": float(m["SPL"]), "ne": float(m["NE"]),
+           "steps": steps, "min_dist": float(env.min_dist),
+           "instruction": env.task["instruction"],
+           "level": str(env.task.get("level", "-")), **eng}
+    if policy_name == "explore" and not collect_only:
+        # 两阶段战报：巡屋覆盖了多少、第几步瞥见地标、记忆寻物是否用了乐观补全
+        sim.mem = mem_payload(pol, steps)      # 终版记忆图定格给前端
+        out.update({"phase": pol.phase,
+                    "cover": round(float(pol.cover), 3),
+                    "seen": pol.landmark is not None,
+                    "seen_step": pol.seen_step,
+                    "explore_steps": int(pol.explore_t),
+                    "optim": bool(pol.optim)})
+    return out
 
 
 def worker_single(sim, policy_name, seed, level, instruction=None, scenario=None,
@@ -821,6 +881,7 @@ class Handler(BaseHTTPRequestHandler):
                     SIM.step = 0
                     SIM.traj = []
                     SIM.obs = None
+                    SIM.mem = None
                     SIM.policy_name = pol
                     SIM.seed = int(req.get("seed", 9000))
                     SIM.pose = [float(env.pose[0]), float(env.pose[1]),

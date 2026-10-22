@@ -377,6 +377,585 @@ class FrontierPolicy:
         return np.array([v, w])
 
 
+class ExploreMemoryPolicy:
+    """巡屋建图 → 语义地标记忆 → 记忆寻物（两阶段「视野外寻物」策略）。
+
+    用户设想的「先全屋走一遍记住地图，之后即使摄像头拍不到也能按记忆找到
+    目标」，拆成三件套，前两件直接复用现有组件：
+
+    1. **阶段一 `explore`**：复用 `FrontierPolicy` 全屋前沿探索，激光按里程计
+       累积占据栅格（= 机器人记住的几何地图）；途中做**瞥见判定**——目标在相机
+       HFOV(64.5°) 内、距离 ≤5 m、且到物体表面的视线不穿墙（检测器口径的几何
+       可见，不允许隔墙瞥见）→ 当作检测器触发一次，把目标坐标写进语义地标。
+       瞥见是“看见”的几何替身：记下坐标之前，规划只知道记忆栅格。
+    2. **阶段二 `navigate`**：目标坐标只认瞥见时记下的地标（不读任务真值），
+       路径在记忆栅格上做 BFS 距离场（未知区先按乐观通行，实测不补光会在
+       未知家具上顶死 421 次碰撞；激光因此继续细化墙的位置，但**不重新检测
+       目标**），逼近语义地标——目标在不在相机视野里已经无关。
+    3. 换段条件：已瞥见 **且**（覆盖 ≥45% 或探索 ≥220 步）——先像样地巡一段
+       屋再执行指令；一直没瞥见就继续探索到步数耗尽（结果里 `seen=False`）。
+
+    阶段一复用 `FrontierPolicy` 的建图与前沿选择（同一栅格对象），但控制改为
+    「乐观 BFS 路径场 + 前视跟随」：原版朝前沿格直线追，公寓里会隔着家具/墙
+    顶死（实测 cover 卡 0.17、原地打转、82 次碰撞），路径跟随才绕得过去；
+    `FrontierPolicy` 本身是论文基线，一行不改。阶段二**不再整合新激光**——
+    用的全是“记忆”，地图不会在寻物途中偷偷变新。
+    `live` 字段给网页状态栏显示阶段/覆盖/地标。
+    """
+
+    name = "explore"
+
+    def __init__(self, cover_switch=0.45, min_explore=220, glance_range=6.5,
+                 replan_every=6, lookahead=0.7, v_max=V_MAX, w_max=W_MAX):
+        self.cover_switch = cover_switch
+        self.min_explore = min_explore
+        self.glance_range = glance_range
+        self.replan_every = replan_every
+        self.lookahead = lookahead
+        self.v_max = v_max
+        self.w_max = w_max
+        self.front = FrontierPolicy()
+        self.reset()
+
+    def reset(self, env=None):
+        self.front.reset(env)
+        self.phase = "explore"
+        self.landmark = None        # 语义地标（瞥见后才有；此后导航只认它）
+        self.seen_step = None
+        self.explore_t = 0
+        self.cover = 0.0
+        self.optim = False          # 阶段二是否用过“乐观补全”
+        self._wp = None
+        self._path = None           # 阶段二承诺路径（栅格 cell 列表）
+        self._path_i = 0            # 沿承诺路径的进度
+        self._occ1 = None           # 持久占据记忆：激光见过的墙永不忘
+        self._t = 0
+        self._stuck = 0
+        self._esc = 0
+        self._esc_dir = 1.0
+        self._last_xy = None
+        self._scan = 0               # 进入新房间后的 360° 环视剩余步数
+        self._scanned = set()        # 已环视过的房间（每房间只扫一次）
+        self.live = {"phase": "explore", "cover": 0.0, "seen": False,
+                     "optim": False, "dist": None}
+
+    # ---------- 瞥见（“检测器”的几何替身）----------
+    def _glance(self, env, step):
+        if self.landmark is not None:
+            return True
+        p = env.robot_pose()
+        g = np.asarray(env.task["goal"], dtype=float)
+        dx, dy = float(g[0] - p[0]), float(g[1] - p[1])
+        d = float(np.hypot(dx, dy))
+        if d > self.glance_range:
+            return False
+        ang = float(np.arctan2(dy, dx) - p[2])
+        ang = (ang + np.pi) % (2 * np.pi) - np.pi
+        if abs(ang) > np.deg2rad(CAMERA_HFOV_DEG / 2.0):
+            return False
+        fr = self.front
+        if fr.grid is None:
+            return False
+        # 可见性按**检测器口径**逐格步进射线（CELL 步距，无采样缝隙）：
+        # 第一个撞上的占据格若是**目标物体自己**（中心 Chebyshev ≤ 半宽）→ 瞥见；
+        # 是别的家具/墙 → 被挡。原先两个口径都不对：记忆栅格 LOS 把「没扫过的格」
+        # 和「物体自身占据格」都判遮挡（3 种子 430 次视野内全被误杀），
+        # segment_free(终点=表面) 又在斜视角时把终点落在物体包围盒内部而判死
+        # （9000/9005 共 227 次视野内全部误杀）。
+        oi = env.task.get("obj_index")
+        half = (float(env.scene.objects[oi].half)
+                if oi is not None and 0 <= oi < len(env.scene.objects) else 0.25)
+        u = np.array([dx, dy], dtype=float) / max(d, 1e-6)
+        t = CELL
+        while t < d:
+            xy = p[:2] + u * t
+            if not env.scene.is_free(xy, 0.0):
+                if max(abs(float(xy[0]) - g[0]),
+                       abs(float(xy[1]) - g[1])) > half + 1.5 * CELL:
+                    return False        # 撞到别的东西 → 看不见
+                break                    # 撞到目标物体 → 看见
+            t += CELL
+        self.landmark = np.array([g[0], g[1]], dtype=float)
+        self.seen_step = int(step)
+        return True
+
+    # ---------- 记忆寻物：只读阶段一攒下的栅格 ----------
+    def _remember(self, p):
+        """把 `fr.grid==1` 持久化进 `_occ1`：激光见过的墙**永不忘**。
+
+        `_integrate` 每步会把机器人 ±0.25 m 内的格清成自由（自我清除排在
+        激光标记之后），机器人贴着墙角走时会把真墙格从 `fr.grid` 抹掉 ——
+        记忆栅格因此「说谎」：BFS 觉得可穿墙、路径阻断检查也永不触发
+        （实测 9000：(1.60,2.35) 真值是墙，记忆却是 0，卡死 1200 步）。
+
+        反向的谎言也要修：激光噪声偶尔把**自由格**标成占据并被持久化，
+        膨胀后能把机器人封死在角落（实测 9005：身旁 2 格假占据把北向
+        出口全堵，所有前视弦不可见 → 顶南墙空转 1200 步）。env 的碰撞
+        判定保证机器人 ±3 格盒内真值必然自由，故每步把该盒从记忆里清掉。
+        """
+        g = self.front.grid
+        if g is None:
+            return
+        if self._occ1 is None:
+            self._occ1 = np.zeros(g.shape, dtype=bool)
+        self._occ1 |= (g == 1)
+        r0, c0 = [int(v[0]) for v in self.front._w2c(np.asarray(p[:2])[None, :])]
+        H, W = self._occ1.shape
+        self._occ1[max(0, r0 - 3):r0 + 4, max(0, c0 - 3):c0 + 4] = False
+
+    def _blocked(self, strict, k=None):
+        fr = self.front
+        g = fr.grid
+        occ = (g == 1)
+        if self._occ1 is not None:
+            occ = occ | self._occ1
+        if strict:
+            occ = occ | (g < 0)        # 纯记忆：没走过的区域不信任
+        k = fr._inflate_n if k is None else k
+        if k > 0:
+            H, W = occ.shape
+            b = occ.copy()
+            for dr in range(-k, k + 1):
+                for dc in range(-k, k + 1):
+                    rr0, rr1 = max(0, dr), H + min(0, dr)
+                    cc0, cc1 = max(0, dc), W + min(0, dc)
+                    b[rr0:rr1, cc0:cc1] |= occ[rr0 - dr:rr1 - dr,
+                                                cc0 - dc:cc1 - dc]
+            occ = b
+        return occ
+
+    def _blk_opt(self, p):
+        """乐观膨胀占据 + 放行起点 3×3（与 `_dist_field` 的起点放行同口径）。
+
+        `_dist_field` 规划时会把起点 3×3 清通（机器人可能正贴在膨胀带上），
+        但前视弦检查与路径阻断检查用的 `blk` 若不清同一片区域，规划出来的
+        **路径首格**永远被判为阻断 → 每步重规划 + wp 退化到脚下格原地空转
+        （实测 9007：目标旁终点 (80,52) 只经起点放行可达，两处检查口径不
+        清 → 卡在 (4.15,7.05) 自旋 450 步到超时）。清的是原值已放行的同一
+        片格子，不会给 `_dist_field` 多开新通道。
+        """
+        blk = self._blocked(False)
+        fr = self.front
+        r0, c0 = [int(v[0]) for v in fr._w2c(np.asarray(p[:2])[None, :])]
+        H, W = blk.shape
+        blk[max(0, r0 - 1):r0 + 2, max(0, c0 - 1):c0 + 2] = False
+        return blk
+
+
+
+    def _dist_field(self, blocked, start_rc):
+        from collections import deque
+        H, W = blocked.shape
+        dist = np.full((H, W), -1, np.int32)
+        sr, sc = start_rc
+        if not (0 <= sr < H and 0 <= sc < W):
+            return dist
+        blocked = blocked.copy()
+        # 机器人可能正贴在（膨胀后的）障碍上：放行起点 3×3，否则 BFS 直接失败
+        blocked[max(0, sr - 1):sr + 2, max(0, sc - 1):sc + 2] = False
+        dist[sr, sc] = 0
+        q = deque([(sr, sc)])
+        while q:
+            r, c = q.popleft()
+            d = dist[r, c]
+            for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < H and 0 <= nc < W \
+                        and not blocked[nr, nc] and dist[nr, nc] < 0:
+                    dist[nr, nc] = d + 1
+                    q.append((nr, nc))
+        return dist
+
+    def _waypoint(self, env):
+        fr = self.front
+        p = env.robot_pose()
+        H, W = fr.grid.shape
+        sr, sc = [int(v[0]) for v in fr._w2c(np.array([[p[0], p[1]]]))]
+        gr, gc = [int(v[0]) for v in fr._w2c(self.landmark[None, :])]
+        gr, gc = min(max(gr, 0), H - 1), min(max(gc, 0), W - 1)
+
+        mem = self._dist_field(self._blocked(True), (sr, sc))
+        if mem[gr, gc] >= 0:
+            dist, tr, tc, optim = mem, gr, gc, False
+        else:
+            # 纯记忆到不了 → 乐观补全（把未知当自由）再试
+            opt = self._dist_field(self._blocked(False), (sr, sc))
+            if opt[gr, gc] >= 0:
+                dist, tr, tc, optim = opt, gr, gc, True
+            else:
+                # 目标格被真实障碍围住 → 退到距目标最近的可达格
+                src = opt if (opt >= 0).any() else mem
+                ys, xs = np.nonzero(src >= 0)
+                if ys.size == 0:
+                    return None
+                k = int(np.argmin((ys - gr) ** 2 + (xs - gc) ** 2))
+                dist, tr, tc, optim = src, int(ys[k]), int(xs[k]), True
+        self.optim = bool(optim)
+
+        # 回溯出**完整栅格路径**（机器人 → 目标格），阶段二沿整条路径走：
+        # 逐次 replan 取单个前视航点时，两条等长路线会反复换边 → 机器人
+        # 原地打转（实测 9002/9004 耗光 1750 步）。路径级承诺 + 只有被新
+        # 激光证实阻断才重规划，走过岔口后另一条路自然变长，抖动消失。
+        path = [(int(tr), int(tc))]
+        r, c = int(tr), int(tc)
+        Hh, Ww = dist.shape
+        while int(dist[r, c]) > 0:
+            d = int(dist[r, c])
+            nxt = None
+            for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < Hh and 0 <= nc < Ww and dist[nr, nc] == d - 1:
+                    nxt = (nr, nc)
+                    break
+            if nxt is None:
+                break
+            path.append(nxt)
+            r, c = nxt
+        path.reverse()
+        return path
+
+    def _sync_live(self, env):
+        d_lm = (float(np.hypot(*(self.landmark - env.robot_pose()[:2])))
+                if self.landmark is not None else None)
+        self.live = {"phase": self.phase, "cover": round(float(self.cover), 3),
+                     "seen": self.landmark is not None,
+                     "optim": bool(self.optim),
+                     "dist": None if d_lm is None else round(d_lm, 2)}
+
+    # ---------- 阶段一：前沿探索（建图/选前沿复用 Frontier，控制自己来）----------
+    def _pick_frontier(self, dist):
+        """最近的可达前沿（乐观：未知可通行）；全被黑名单吃掉则清空重选。"""
+        fr = self.front
+        frr, fcc = np.nonzero(fr._frontiers())
+        if frr.size == 0:
+            return None
+        dv = dist[frr, fcc]
+        for attempt in (0, 1):
+            good = dv >= 0
+            if attempt == 0 and fr._blacklist:
+                good &= np.array([(int(a), int(b)) not in fr._blacklist
+                                  for a, b in zip(frr, fcc)])
+            if good.any():
+                idx = np.flatnonzero(good)
+                k = idx[int(np.argmin(dv[idx]))]
+                return (int(frr[k]), int(fcc[k]))
+            fr._blacklist.clear()
+        # 兜底：所有前沿都不可达（记忆里的门被膨胀带/假占据切断了连通）→
+        # 退回「可达自由区里最靠近未知边界的格」，先开到能看见缺口的地方。
+        # 否则 `act` 返回原地自旋，直到超时（实测 9002：154 个前沿全
+        # dist<0、可达区被切在书房里，1350→1750 步位置零位移）。
+        return self._nearest_unknown_edge(dist)
+
+    def _nearest_unknown_edge(self, dist):
+        """可达区内距未知区 ≤4 格（0.4 m）的最近自由格：知识边界的内侧。"""
+        fr = self.front
+        unk = fr.grid < 0
+        H, W = fr.grid.shape
+        near = np.zeros_like(unk)
+        rad = 4
+        for dr in range(-rad, rad + 1):
+            for dc in range(-rad, rad + 1):
+                if dr * dr + dc * dc > rad * rad:
+                    continue
+                near |= np.roll(np.roll(unk, dr, 0), dc, 1)
+        good = near & (dist >= 0) & (fr.grid == 0)
+        for attempt in (0, 1):
+            g = good
+            if attempt == 0 and fr._blacklist:
+                g = good.copy()
+                for r, c in fr._blacklist:
+                    if 0 <= r < H and 0 <= c < W:
+                        g[r, c] = False
+            if g.any():
+                dv = np.where(g, dist, 10 ** 6)
+                k = np.unravel_index(int(np.argmin(dv)), dv.shape)
+                return (int(k[0]), int(k[1]))
+            fr._blacklist.clear()
+        return None
+
+    @staticmethod
+    def _walk(dist, goal_rc, need):
+        """从目标格沿距离场回溯到「距机器人 ≈ need 格」处 → 路径前视航点。
+
+        只回溯 `need` 步会落在**目标旁边**（长路径时等于直线奔目标），
+        必须一直降到 dist≤need 才是真正“沿路往前看 0.7 m”。
+        """
+        r, c = goal_rc
+        H, W = dist.shape
+        if not (0 <= r < H and 0 <= c < W) or dist[r, c] < 0:
+            return None
+        while int(dist[r, c]) > need:
+            d = int(dist[r, c])
+            best = None
+            for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < H and 0 <= nc < W and dist[nr, nc] == d - 1:
+                    best = (nr, nc)
+                    break
+            if best is None:
+                break
+            r, c = best
+        return r, c
+
+    def _steer(self, obs, p, tgt):
+        """朝航点的转向 + 按前方光束连续减速（沿用基线口径，不接管转向绕障）。"""
+        v_w = np.asarray(tgt, dtype=float) - p[:2]
+        d = float(np.hypot(v_w[0], v_w[1]))
+        if d < 1e-3:
+            return np.array([0.0, 0.6 * self.w_max])
+        ang = float(np.arctan2(v_w[1], v_w[0]) - p[2])
+        ang = (ang + np.pi) % (2 * np.pi) - np.pi
+        lid = obs["lidar"]
+        n = len(lid)
+        fwd = beam_index(ang, n)
+        front_d = float(np.min(lid[[(fwd + k) % n for k in range(-5, 6)]]))
+        v = self.v_max * float(np.clip(1.0 - abs(ang) / np.pi * 1.8, 0.0, 1.0))
+        w = float(np.clip(2.0 * ang, -self.w_max, self.w_max))
+        if front_d < 0.45:
+            v *= float(np.clip((front_d - 0.18) / 0.27, 0.0, 1.0))
+        return np.array([v, w])
+
+    def _seg_free(self, a, b, blk):
+        """直线段 a→b 是否穿（膨胀后的）记忆障碍；逐格步进，无采样缝隙。"""
+        fr = self.front
+        d = float(np.hypot(b[0] - a[0], b[1] - a[1]))
+        n = max(2, int(np.ceil(d / (fr.res * 0.5))))
+        H, W = blk.shape
+        for i in range(1, n + 1):            # 从 a 侧第二点起（起点常贴膨胀带）
+            q = a + (b - a) * (i / n)
+            c = int(np.floor((q[0] - fr.bounds[0]) / fr.res))
+            r = int(np.floor((q[1] - fr.bounds[2]) / fr.res))
+            if not (0 <= r < H and 0 <= c < W) or blk[r, c]:
+                return False
+        return True
+
+    @staticmethod
+    def _room_of(env, p):
+        """所在房间名（room_names 矩形命中）；未命名区域返回 None（不环视）。"""
+        for name, rect in getattr(env.scene, "room_names", []):
+            if rect[0] <= p[0] <= rect[2] and rect[1] <= p[1] <= rect[3]:
+                return name
+        return None
+
+    def _explore_act(self, obs, env):
+        fr = self.front
+        fr._ensure(env)
+        fr._integrate(env.robot_pose(), obs["lidar"])
+        self._remember(env.robot_pose())   # 见过的墙持久化（贴墙走时会被自我清除抹掉）
+        self._t += 1
+        p = env.robot_pose()
+        # 卡死脱困（与阶段二共用同一套计数器）
+        if self._esc > 0:
+            self._esc -= 1
+            return np.array([0.0, self._esc_dir * self.w_max])
+        # 进入新房间 → 原地 360° 环视一圈（≈40 步）：模拟真实巡屋的
+        # 「进屋先环视」，也保证瞥见不依赖路过时恰好朝向目标 —— 实测
+        # 9000/9005 在客厅里朝向从没对准过角落目标，全屋 1750 步零瞥见。
+        room = self._room_of(env, p)
+        if room is not None and room not in self._scanned:
+            self._scanned.add(room)
+            self._scan = 40
+        if self._scan > 0:
+            self._scan -= 1
+            self._stuck = 0
+            self._last_xy = p[:2].copy()   # 环视是原地转，不能算卡死
+            return np.array([0.0, self.w_max])
+        if self._last_xy is not None:
+            moved = float(np.linalg.norm(p[:2] - self._last_xy))
+            self._stuck = self._stuck + 1 if moved < 2e-3 else 0
+        self._last_xy = p[:2].copy()
+        if self._stuck > 10:
+            self._stuck = 0
+            self._esc = 12
+            lid = obs["lidar"]
+            nn = len(lid)
+            self._esc_dir = (1.0 if float(np.min(lid[:nn // 2])) >=
+                             float(np.min(lid[nn // 2:])) else -1.0)
+            return np.array([0.0, self._esc_dir * self.w_max])
+
+        # 一张乐观 BFS 场（选前沿 + 路径跟随共用）
+        rc = tuple(int(v[0]) for v in fr._w2c(p[:2][None, :]))
+        blk = self._blocked(False)
+        dist = self._dist_field(blk, rc)
+        frr, fcc = np.nonzero(fr._frontiers())
+        if frr.size and not (dist[frr, fcc] >= 0).any():
+            # 记忆连通被 0.2 m 膨胀带切断（公寓门净宽只有 ~0.6 m，贴框两格就封死）
+            # → 退化到 env 实际的碰撞口径 k=1（0.1 m）重算，还通就继续探索。
+            # 不放宽到 k=0：完全不膨胀会贴着墙规划，env 会拒绝平移（碰撞计数暴涨）。
+            blk1 = self._blocked(False, 1)
+            dist1 = self._dist_field(blk1, rc)
+            if (dist1[frr, fcc] >= 0).any():
+                blk, dist = blk1, dist1
+        if fr._target is None or self._t % fr.replan_every == 1:
+            tgt = self._pick_frontier(dist)
+            if tgt != fr._target:      # 只在换目标时清年龄，否则黑名单永不触发
+                fr._target, fr._best_d, fr._tgt_age = tgt, None, 0
+        if fr._target is None:
+            return np.array([0.0, 0.6 * self.w_max])
+
+        # 进度跟踪：长期不靠近当前前沿 → 拉黑换下一个
+        tr, tc = fr._target
+        tx = fr.bounds[0] + (tc + 0.5) * fr.res
+        ty = fr.bounds[2] + (tr + 0.5) * fr.res
+        dnow = float(np.hypot(tx - p[0], ty - p[1]))
+        if fr._best_d is None or dnow < fr._best_d - 0.1:
+            fr._best_d, fr._tgt_age = dnow, 0
+        else:
+            fr._tgt_age += 1
+            if fr._tgt_age > 40:
+                fr._blacklist.add((tr, tc))
+                fr._target, fr._best_d, fr._tgt_age = None, None, 0
+                return np.array([0.0, 0.6 * self.w_max])
+
+        # 路径跟随：前沿格不可达（新增障碍挡路）→ 拉黑换目标
+        if dist[tr, tc] < 0:
+            fr._blacklist.add((tr, tc))
+            fr._target, fr._best_d, fr._tgt_age = None, None, 0
+            return np.array([0.0, 0.6 * self.w_max])
+        # 弦可见性：前瞻过远时直线斜切贴住膨胀墙角 → 顶着墙原地自旋
+        # （实测 9003：wp 距 0.47 m，弦从 (5.17,1.45) 起落进膨胀带，而真实
+        # 路线要先向北再向西；1750 步冻结在 (5.3,1.4) 零位移）。沿 dist 梯度
+        # 逐步缩短前瞻直到弦通。**用原始 blk（不放行起点 3×3）**：起点放行区
+        # 只是规划口径，物理上机器人都驶不进去（env 同口径膨胀，0.04 m 即碰撞）。
+        need = int(self.lookahead / fr.res)
+        cell = None
+        while need >= 1:
+            cell = self._walk(dist, (tr, tc), need)
+            if cell is None:
+                break
+            wp = np.array([fr.bounds[0] + (cell[1] + 0.5) * fr.res,
+                           fr.bounds[2] + (cell[0] + 0.5) * fr.res])
+            if self._seg_free(p[:2], wp, blk):
+                break
+            need -= 1
+        if cell is None:
+            return np.array([0.0, 0.6 * self.w_max])
+        return self._steer(obs, p, wp)
+
+    def act(self, obs, env):
+        if self.phase == "explore":
+            a = self._explore_act(obs, env)     # 建图 + 前沿路径跟随
+            self.cover = float((self.front.grid >= 0).mean())
+            self.explore_t += 1
+            self._glance(env, int(env.steps))
+            if (self.landmark is not None and
+                    (self.cover >= self.cover_switch or
+                     self.explore_t >= self.min_explore)):
+                self.phase = "navigate"
+                self._t = 0
+                self._wp = None
+                self._path = None
+                self._path_i = 0
+                self._stuck = 0
+                self._esc = 0
+                self._last_xy = None
+            self._sync_live(env)
+            return a
+
+        # ---- 阶段二：记忆寻物（目标只认瞥见时记下的地标，不读真值）----
+        self._t += 1
+        p = env.robot_pose()
+        # 激光继续把没见过的障碍补进记忆栅格（SLAM 式细化）：乐观路径穿过未知区
+        # 时，不补光会反复顶死（实测 9004：421 次碰撞卡到超时）；补的是“墙在哪”，
+        # 目标在哪始终来自记忆 —— 与「摄像头拍不到也凭记忆找到」不冲突。
+        self.front._integrate(p, obs["lidar"])
+        self._remember(p)              # 见过的墙持久化（贴墙走时会被自我清除抹掉）
+        if self._esc > 0:
+            self._esc -= 1
+            return np.array([0.0, self._esc_dir * self.w_max])
+        if self._last_xy is not None:
+            moved = float(np.linalg.norm(p[:2] - self._last_xy))
+            self._stuck = self._stuck + 1 if moved < 2e-3 else 0
+        self._last_xy = p[:2].copy()
+        if self._stuck > 10:
+            self._stuck = 0
+            self._esc = 12
+            lid = obs["lidar"]
+            nn = len(lid)
+            self._esc_dir = (1.0 if float(np.min(lid[:nn // 2])) >=
+                             float(np.min(lid[nn // 2:])) else -1.0)
+            return np.array([0.0, self._esc_dir * self.w_max])
+
+        # 路径级承诺：一次规划完整路径并沿路走，只有「路径被新激光证实
+        # 阻断 / 偏离太远 / 走到尽头」才重规划。原先每 6 步取单个前视航点，
+        # 两条等长路线反复换边 → 原地打转（实测 9002/9004 耗光 1750 步）。
+        fr = self.front
+        if self._path is not None:
+            # 进度 = 剩余路径中离机器人最近的格（只前进不后退）。原先要求
+            # 「走到头格 0.25m 内」，机器人一偏离就永远推进不了，前视点退化
+            # 成身后格 → 在两个反向候选间抖动（实测 9000 卡死自旋）。
+            rem = self._path[self._path_i:]
+            best_j, best_d = 0, 1e9
+            for j, (r0, c0) in enumerate(rem):
+                d = float(np.hypot(fr.bounds[0] + (c0 + 0.5) * fr.res - p[0],
+                                   fr.bounds[2] + (r0 + 0.5) * fr.res - p[1]))
+                if d < best_d:
+                    best_d, best_j = d, j
+            if best_d > 1.5:
+                self._path = None              # 偏离路径太远 → 重规划
+            else:
+                self._path_i += best_j
+                # 用**膨胀后**的（与前视弦检查同一口径）记忆占据查阻断：
+                # 只查原值会漏「路径落入膨胀带」——实测 9007：规划后西墙才
+                # 被激光记进 occ1，路径前段全在膨胀带里，原值检查 (g=0,
+                # occ1=0) 永不触发 → 贴带走到墙前反复卡死。
+                blk_chk = self._blk_opt(p)   # 与规划同一口径（含起点 3×3 放行）
+                i0 = self._path_i + 1        # 跳过脚下格（机器人所在处必然在膨胀带边缘）
+                win = self._path[i0:
+                                 i0 + max(4, int(self.lookahead / fr.res) * 2)]
+                if any(blk_chk[r0, c0] for r0, c0 in win):
+                    self._path = None          # 前段被新观测证实是障碍/膨胀带
+                elif (self._path_i >= len(self._path) - 1
+                      and best_d <= 0.30):
+                    self._path = None          # 走到路径尽头
+        if self._path is None:
+            self._path = self._waypoint(env)
+            self._path_i = 0
+        # 前视点：剩余路径上沿路径弧长 ≥ lookahead 的第一个格，但**弦必须
+        # 可见** —— `_steer` 是直线开过去，跨拐角的弦会斜切贴墙角被 env 方形
+        # 膨胀判碰撞（实测 9000：wp 直取 (1.65,4.35) 而路径先北后西，斜线
+        # 贴墙角 → 原地卡死 1000+ 步）。弧长够但弦穿记忆障碍 → 逐格回退，
+        # 取「弧长 < lookahead 且弦可见」里最远的一格。
+        self._wp = None
+        if self._path:
+            blk = self._blk_opt(p)       # 膨胀后的记忆障碍（未知按通行；口径同规划）
+            last_vis = None                # 最远的弦可见格
+            arc, prev = 0.0, None
+            for r0, c0 in self._path[self._path_i:]:
+                xy = np.array([fr.bounds[0] + (c0 + 0.5) * fr.res,
+                               fr.bounds[2] + (r0 + 0.5) * fr.res])
+                if prev is not None:
+                    arc += float(np.hypot(*(xy - prev)))
+                vis = self._seg_free(p[:2], xy, blk)
+                if vis:
+                    last_vis = xy
+                    if arc >= self.lookahead:
+                        self._wp = xy        # 弧长够且弦可见 → 用它
+                        break
+                elif arc >= self.lookahead and last_vis is not None:
+                    # 弧长已够但此格弦被挡 → 用之前最远的可见格，
+                    # **不是**首个可见格（那是脚下格，朝它开会原地卡死）
+                    self._wp = last_vis
+                    break
+                prev = xy
+            if self._wp is None:
+                self._wp = last_vis
+            if self._wp is None:
+                self._wp = np.array(
+                    [fr.bounds[0] + (self._path[-1][1] + 0.5) * fr.res,
+                     fr.bounds[2] + (self._path[-1][0] + 0.5) * fr.res])
+        self._sync_live(env)
+        d_lm = float(np.hypot(*(self.landmark - p[:2])))
+        # 最后 0.75 m 允许直取地标（目标格常落在膨胀障碍里）；其余沿记忆航点
+        if d_lm < 0.75:
+            tgt = self.landmark
+        elif self._wp is None:
+            tgt = self.landmark
+        else:
+            tgt = self._wp
+        return self._steer(obs, p, tgt)
+
+
 class RandomTargetPolicy(OraclePolicy):
     """无语义对照（推荐的主力对照）：**导航机制与 oracle 完全相同**，唯一区别是
     规划目标从空闲栅格中随机选取，而非由指令指代的物体。
