@@ -834,6 +834,14 @@ class Handler(BaseHTTPRequestHandler):
                     else:
                         SIM.target = None
                         SIM.live = None
+                        # 同步任务显示：reset 已重采 env.task，否则切场景后
+                        # 状态栏/目标点还挂着上一个场景的旧指令与旧目标
+                        tk = env.task or {}
+                        if tk.get("instruction"):
+                            SIM.instruction = tk["instruction"]
+                        SIM.level_str = str(tk.get("level", "-"))
+                        SIM.goal = ([float(x) for x in tk["goal"]]
+                                    if tk.get("goal") is not None else None)
                     self._json({"ok": True,
                                 "name": (SIM.map_meta or {}).get("name")})
                 except Exception as e:                      # noqa: BLE001

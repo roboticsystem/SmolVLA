@@ -212,6 +212,54 @@ function init3d(){
  scene3.add(new THREE.HemisphereLight(0x8899bb,0x332f28,.35));
  controls=new THREE.OrbitControls(cam3,gl);
  controls.enableDamping=true;controls.dampingFactor=.08;controls.maxPolarAngle=Math.PI/2.05;}
+// 家具造型：按类别拼出可辨识的样子（植物=花盆+植株、椅子=座+靠背+四条腿…），
+// 主体用物体真实颜色（与 2D/车载相机/指令一致），不再是一排无差别方块
+const shade=(hex,f)=>{const c=new THREE.Color(hex);c.multiplyScalar(f);return c.getHex()};
+function furn(o,col){
+ const h=Math.max(.06,o.h||.5),hw=o.half,g=new THREE.Group();
+ const M=c=>new THREE.MeshStandardMaterial({color:c,roughness:.8});
+ const leg=M(0x4a3a2a),cbody=M(col);
+ const bx=(w,hh,d,m,x,y,z)=>{const b=new THREE.Mesh(new THREE.BoxGeometry(w,hh,d),m);
+  b.position.set(x,y,z);b.castShadow=b.receiveShadow=true;return b};
+ const legs=(r,hh,m)=>{const a=[];
+  for(const sx of[-1,1])for(const sz of[-1,1])
+   a.push(bx(r,hh,r,m,sx*(hw-.05),hh/2,sz*(hw-.05)));return a};
+ if(o.cls==='plant'){                       // 花盆 + 植株（球状植冠，颜色=物体色）
+  const pot=new THREE.Mesh(new THREE.CylinderGeometry(hw*.5,hw*.78,h*.38,14),M(0x9a5f3c));
+  pot.position.y=h*.19;pot.castShadow=true;g.add(pot);
+  const f1=new THREE.Mesh(new THREE.SphereGeometry(hw*.9,14,11),cbody);
+  f1.position.y=h*.38+hw*.7;f1.castShadow=true;g.add(f1);
+  const f2=new THREE.Mesh(new THREE.SphereGeometry(hw*.55,12,9),cbody);
+  f2.position.set(hw*.45,h*.38+hw*1.25,-hw*.2);f2.castShadow=true;g.add(f2);
+ }else if(o.cls==='chair'){                 // 座面 + 靠背 + 四腿
+  g.add(bx(2*hw,h*.1,2*hw,cbody,0,h*.5,0));
+  g.add(bx(2*hw,h*.5,.05,cbody,0,h*.75,-hw+.03));
+  legs(.04,h*.5,leg).forEach(x=>g.add(x));
+ }else if(o.cls==='table'){                 // 桌面板 + 四腿
+  g.add(bx(2*hw,h*.09,2*hw,cbody,0,h*.955,0));
+  legs(.05,h*.91,leg).forEach(x=>{x.position.y=h*.455;g.add(x)});
+ }else if(o.cls==='sofa'){                  // 坐垫 + 靠背 + 两侧扶手
+  g.add(bx(2*hw,h*.4,2*hw,cbody,0,h*.2,0));
+  g.add(bx(2*hw,h*.45,.16,cbody,0,h*.625,-hw+.08));
+  g.add(bx(.16,h*.18,2*hw,cbody,-hw+.08,h*.49,0));
+  g.add(bx(.16,h*.18,2*hw,cbody,hw-.08,h*.49,0));
+ }else if(o.cls==='bed'){                   // 床架 + 床头板 + 床单 + 枕头
+  g.add(bx(2*hw,h*.35,2*hw,cbody,0,h*.175,0));
+  g.add(bx(2*hw,h*.5,.09,cbody,0,h*.55,-hw+.045));
+  g.add(bx(2*hw*.92,h*.14,2*hw*.6,M(shade(col,.6)),0,h*.39,0));
+  g.add(bx(2*hw*.55,h*.1,2*hw*.3,M(0xffffff),0,h*.46,-hw+hw*.45));
+ }else if(o.cls==='shelf'){                 // 柜体 + 两道隔板线
+  g.add(bx(2*hw,h,2*hw,cbody,0,h/2,0));
+  for(const f of[.34,.66])g.add(bx(2*hw+.05,.04,2*hw+.05,leg,0,h*f,0));
+ }else if(o.cls==='box'){                   // 箱体 + 箱盖
+  g.add(bx(2*hw,h*.76,2*hw,cbody,0,h*.38,0));
+  g.add(bx(2*hw+.05,h*.2,2*hw+.05,M(shade(col,.78)),0,h*.86,0));
+ }else if(o.cls==='tv'){                    // 边框 + 屏幕 + 底座
+  g.add(bx(2*hw,h*.66,.05,cbody,0,h*.55,0));
+  g.add(bx(2*hw*.86,h*.54,.015,M(0x141418),0,h*.55,.033));
+  g.add(bx(2*hw*.6,.05,.22,M(0x33313a),0,h*.025,0));
+ }else g.add(bx(2*hw,h,2*hw,cbody,0,h/2,0));
+ g.position.set(o.xy[0],0,o.xy[1]);return g}
 function buildStatic(m){
  if(statG){scene3.remove(statG);
   statG.traverse(o=>{if(o.geometry)o.geometry.dispose();if(o.material&&o.material.dispose)o.material.dispose()})}
@@ -227,14 +275,10 @@ function buildStatic(m){
    new THREE.MeshStandardMaterial({color:ROOM3D[rm.name]||0x777770,roughness:.9}));
   f.rotation.x=-Math.PI/2;
   f.position.set((gx0+gx1)/2,.02,(gy0+gy1)/2);f.receiveShadow=true;statG.add(f)}
- // 家具（按真实高度立起来的实体块）
+ // 家具（按类别拼造型，主体用物体真实颜色）
  for(const o of (m.objs||[])){
-  const h=Math.max(.06,o.h||.5),col=(o.color&&OBJ3D[o.color])||FURN3D[o.cls]||0x999999;
-  const geo=o.cls==='plant'?new THREE.CylinderGeometry(o.half*.7,o.half*.9,h,12)
-        :new THREE.BoxGeometry(2*o.half,h,2*o.half);
-  const mesh=new THREE.Mesh(geo,new THREE.MeshStandardMaterial({color:col,roughness:.75}));
-  mesh.position.set(o.xy[0],h/2,o.xy[1]);mesh.castShadow=true;mesh.receiveShadow=true;
-  statG.add(mesh)}
+  const col=(o.color&&OBJ3D[o.color])||FURN3D[o.cls]||0x999999;
+  statG.add(furn(o,col))}
  // 墙体（InstancedMesh：0.1m 格 × 1.8m 高）
  const W=m.wh[0],cell=m.cell,cells=[];
  for(let i=0;i<m.walls.length;i++)if(m.walls[i]==='1')cells.push(i);
