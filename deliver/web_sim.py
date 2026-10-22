@@ -792,6 +792,52 @@ class Handler(BaseHTTPRequestHandler):
                           int(req.get("dens") or 0)), daemon=True)
                 SIM.worker.start()
             self._json({"ok": True})
+        elif self.path == "/api/preview":
+            # 场景/遮挡场景/人群密度下拉框切换 → 立即重建底图并归位姿态。
+            # 2D 平面图与 3D 视图都消费同一份 snapshot 的 map/map_meta，
+            # 切下拉框即换场景，无需先点 ▶（此前要等回合启动才刷新，
+            # 表现为"下拉框切了、两块视图没跟上"）。
+            with LOCK:
+                busy = (SIM.mode in ("running", "batch")
+                        or (SIM.worker and SIM.worker.is_alive())
+                        or SIM.batch.get("running"))
+                if busy:
+                    self._json({"ok": False, "busy": True})
+                    return
+                try:
+                    pol = req.get("policy") or "geodesic"
+                    dens = int(req.get("dens") or 0)
+                    env = _pick_env(SIM, pol, req.get("scenario"),
+                                    req.get("scene"), dens=dens)
+                    SIM.active_env = env
+                    env.reset(seed=int(req.get("seed", 9000)))
+                    if pol.startswith("follow") and dens > 0:
+                        place_peds(env, dens, "side")
+                    SIM.refresh_map(env)
+                    # 清掉上个场景的残留显示（位姿/轨迹/结果），避免新旧串画
+                    SIM.mode = "idle"
+                    SIM.done = False
+                    SIM.result = None
+                    SIM.step = 0
+                    SIM.traj = []
+                    SIM.obs = None
+                    SIM.policy_name = pol
+                    SIM.seed = int(req.get("seed", 9000))
+                    SIM.pose = [float(env.pose[0]), float(env.pose[1]),
+                                float(env.pose[2])]
+                    if pol.startswith("follow"):
+                        SIM.target = [float(x) for x in env.target.xy]
+                        SIM.goal = None
+                        SIM.live = None
+                        SIM.instruction = "跟随红马甲行人"
+                        SIM.level_str = "follow"
+                    else:
+                        SIM.target = None
+                        SIM.live = None
+                    self._json({"ok": True,
+                                "name": (SIM.map_meta or {}).get("name")})
+                except Exception as e:                      # noqa: BLE001
+                    self._json({"ok": False, "error": str(e)})
         elif self.path == "/api/voice":
             # 代理到 voice_server(:8010) 的 /asr：录音 → 转写 → 归一化指令
             try:
