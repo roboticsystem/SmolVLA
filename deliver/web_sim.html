@@ -109,6 +109,13 @@ function batch(){post('/api/batch',{policy:policy.value,n:+n.value,repeats:(+rep
  ref_policy:(refpol.value||null),level:level.value||null,scenario:scen.value,scene:scn.value,
  degrade:deg.value,pose:+pose.value,dens:+dens.value})}
 function stopB(){post('/api/stop')}
+// ---- 界面显示层中文化（仅显示；喂给模型的仍是训练句式「去green的植物旁边」）----
+// 训练集句式就是中英参杂（voice_server 归一化把颜色词映射成英文，逐字对齐训练集），
+// 模型输入不改 ⇒ 无需重训；这里只把观众看到的英文颜色词显示成中文。
+const ZHC={red:'红色',green:'绿色',blue:'蓝色',yellow:'黄色',white:'白色',
+ black:'黑色',purple:'紫色',orange:'橙色'};
+function zh(s){return s?s.replace(/\b(red|green|blue|yellow|white|black|purple|orange)\b/g,
+ m=>ZHC[m]||m):s}
 // ---- 语音：浏览器录音(16k 单声道 WAV) → /api/voice → 自动用归一化指令启动 SmolVLA 回合 ----
 async function recWav(sec){
  const stream=await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:true,noiseSuppression:true}});
@@ -132,7 +139,7 @@ async function voice(){
  try{var b64=await recWav(4)}catch(e){vstate.innerHTML='<span class="bad">麦克风不可用：需 localhost 或 HTTPS（SSH 隧道 -L 8020 后访问 http://localhost:8020）。可用手动输入。</span>';return}
  vstate.textContent='识别中…';const r=await post('/api/voice',{wav_b64:b64});
  if(r.error){vstate.innerHTML='<span class="bad">'+r.error+'</span>';return}
- vstate.innerHTML='听到「'+r.text+'」→ 指令「'+r.instruction+'」 ('+r.latency_ms+'ms'+(r.note&&r.note!=='直通'?'，'+r.note:'')+')'+(r.ok?'':' <span class="bad">不可用</span>');
+ vstate.innerHTML='听到「'+r.text+'」→ 指令「'+zh(r.instruction)+'」 ('+r.latency_ms+'ms'+(r.note&&r.note!=='直通'?'，'+r.note:'')+')'+(r.ok?'':' <span class="bad">不可用</span>');
  if(r.ok){policy.value='vla';post('/api/start',{policy:'vla',seed:+seed.value,instruction:r.instruction})}}
 function sendText(){const t=saytext.value.trim();if(!t)return;
  // 文字指令是导航任务：若当前选的是跟随策略，指令会被后端忽略（仍跟着人走）
@@ -276,7 +283,7 @@ async function loop(){try{const s=await(await fetch('/api/state')).json();draw(s
   if(key!==statKey){statKey=key;buildStatic(m)}
   updateDyn(s)}
  if(s.image)cam.src='data:image/jpeg;base64,'+s.image;
- const r=s.result;let st='指令: '+(s.instruction||'—')+'<br>层级: '+s.level+' | 步数: '+s.step+
+ const r=s.result;let st='指令: '+(zh(s.instruction)||'—')+'<br>层级: '+s.level+' | 步数: '+s.step+
   ' | 策略: '+s.policy+' | seed: '+s.seed+
   (+pose.value>0?' | <span class="bad">定位噪声 σ='+pose.value+' m</span>':'');
  if(s.live)st+='<br>跟随实时: 距离 '+s.live.dist.toFixed(2)+' m | '+
@@ -326,7 +333,7 @@ async function loop(){try{const s=await(await fetch('/api/state')).json();draw(s
    '（不一致 '+bs.mcnemar.n10+' vs '+bs.mcnemar.n01+'，n='+bs.mcnemar.n+'）</div>';
   if(bs.ref)b+='<div>参考基线 '+s.batch.ref+'：SR '+bs.ref.SR+'% ['+bs.ref.SR_lo+', '+bs.ref.SR_hi+']</div>';}
  if(s.batch.rows&&s.batch.rows.length){b+='<table><tr><th>#</th><th>指令</th><th>SR</th><th>NE</th></tr>'+
- s.batch.rows.map((r,i)=>'<tr><td>'+(s.batch.done-s.batch.rows.length+i+1)+'</td><td>'+(r.instruction||'—')+
+ s.batch.rows.map((r,i)=>'<tr><td>'+(s.batch.done-s.batch.rows.length+i+1)+'</td><td>'+zh(r.instruction||'—')+
  '</td><td>'+(r.success?'✔':'✘')+'</td><td>'+(r.ne!=null?r.ne.toFixed(2):('TCR '+(r.TCR!=null?r.TCR+'%':'—')))+'</td></tr>').join('')+'</table>'}
  batch.innerHTML=b}catch(e){}setTimeout(loop,120)}
 loop();
