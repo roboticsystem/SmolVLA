@@ -3,7 +3,7 @@
 body{font-family:system-ui,'Microsoft YaHei';background:#111;color:#eee;margin:0;padding:16px}
 h1{font-size:20px;margin:0 0 12px} .row{display:flex;gap:14px;flex-wrap:wrap}
 canvas,img{background:#000;border:1px solid #444}
-#gl{width:640px;height:480px;cursor:grab}#map{width:480px;height:360px}#cam{width:320px;height:240px}
+#gl{width:640px;height:480px;cursor:grab}#map{width:480px;height:360px;background:#fbf8f1;border-color:#cfc6b5}#cam{width:320px;height:240px}
 .panel{background:#1b1b1b;border:1px solid #333;border-radius:8px;padding:10px;margin-bottom:12px}
 button,select,input{background:#2a2a2a;color:#eee;border:1px solid #555;border-radius:6px;padding:6px 10px;font-size:14px}
 button{cursor:pointer}button:hover{background:#3a3a3a}
@@ -83,7 +83,7 @@ table{border-collapse:collapse;font-size:13px}td,th{border:1px solid #444;paddin
 <div id="status" class="panel" style="margin-top:10px;min-width:320px">等待开始…</div></div></div>
 <div class="panel" style="min-width:280px"><b>批量评测结果</b><div id="batch">—</div></div>
 </div>
-<div class="panel" style="max-width:520px"><b>2D 平面图（含房间名）</b><br><canvas id="map" width="480" height="360"></canvas></div>
+<div class="panel" style="max-width:520px"><b>2D 户型图（墙/门/家具/房间名）</b><br><canvas id="map" width="960" height="720"></canvas></div>
 <script src="/static/three.min.js"></script>
 <script src="/static/OrbitControls.js"></script>
 <script>
@@ -150,58 +150,205 @@ function sendText(){const t=saytext.value.trim();if(!t)return;
   vstate.innerHTML='指令「'+t+'」（跟随策略不接收指令，已自动切换 SmolVLA）';}
  else vstate.textContent='指令「'+t+'」';
  post('/api/start',{policy:p,seed:+seed.value,instruction:t,scenario:scen.value,scene:scn.value,degrade:deg.value}).then(r=>{if(r&&r.ok)seed.value=+seed.value+1})}
-// ================= 2D 平面图（小地图，含房间名） =================
+// ================= 2D 户型图（矢量绘制，像真实房型图） =================
 const FURN={chair:['#cd6b5c','#9c463a'],table:['#b98a5a','#8a6236'],sofa:['#6e87c4','#4a5f96'],
  bed:['#8fa3d9','#63779f'],shelf:['#8b7355','#644f38'],plant:['#5fa46b','#3f7a4a'],
  box:['#c9a05a','#96703a'],tv:['#3a3a40','#1e1e26']};
-// 真实颜色优先（= sim.world.COLORS），类别色兜底——与 3D/相机一致，
-// 否则「去white的植物旁边」在平面图上画成绿块，看起来自相矛盾
+// 真实颜色优先（= sim.world.COLORS），类别色兜底——与 3D/相机一致
 const OBJC={red:['#c63e37','#8f2b26'],blue:['#3e5cc6','#2a4090'],
  green:['#469e52','#2f6e39'],yellow:['#dcba3a','#a8862a'],
  white:['#eeeeee','#b0b0b0'],black:['#34343a','#111114']};
+// 房间地板色（浅色纸面配色，厨房/卫浴瓷砖、卧室暖冷区分）
+const ROOM2D={'客厅':'#f6ecd9','餐厅':'#f6ecd9','厨房':'#e6eef1','卫生间':'#e6eef1',
+ '走廊':'#f0ebdf','主卧':'#f5e7e6','次卧':'#e9eef7','书房':'#eaf1e6'};
+const PAPER='#fbf8f1',WALLF='#45444b',FLL='#7d7163';
 function rr(c,x,y,w,h,r){c.beginPath();c.moveTo(x+r,y);c.arcTo(x+w,y,x+w,y+h,r);c.arcTo(x+w,y+h,x,y+h,r);c.arcTo(x,y+h,x,y,r);c.arcTo(x,y,x+w,y,r);c.closePath()}
+// 统一比例尺：等比例缩放 + 居中留白，避免把户型拉伸变形
+let MS=1,X=x=>0,Y=y=>0;
+function setXf(m){const P=18,bw=Math.max(1e-6,m.b[1]-m.b[0]),bh=Math.max(1e-6,m.b[3]-m.b[2]);
+ MS=Math.min((480-2*P)/bw,(360-2*P)/bh);
+ const ox=(480-bw*MS)/2,oy=(360-bh*MS)/2,b=m.b;
+ X=x=>ox+(x-b[0])*MS;Y=y=>oy+(b[3]-y)*MS;}
 // 机器人记忆栅格（explore）：离屏画「未见过」暗区，版本号变了才重画
 const memCv=document.createElement('canvas');memCv.width=480;memCv.height=360;
 const memCtx=memCv.getContext('2d');let memV=-1;
 function paintMem(m){const bin=atob(m.g),H=m.shape[0],W=m.shape[1],cell=m.res;
- const iw=m.b[1]-m.b[0],ih=m.b[3]-m.b[2];
- const cw=cell/iw*480,ch=cell/ih*360;
- memCtx.clearRect(0,0,480,360);memCtx.fillStyle='rgba(6,6,8,.76)';
- for(let r=0;r<H;r++){const py=360-((r+1)*cell/ih)*360;
+ const cw=cell*MS+0.6,ch=cell*MS+0.6;
+ memCtx.clearRect(0,0,480,360);memCtx.fillStyle='rgba(52,44,34,.46)';
+ for(let r=0;r<H;r++){const py=Y(m.b[2]+(r+1)*cell);
   for(let k=0;k<W;k++){if(bin.charCodeAt(r*W+k)!==0)continue;   // 0=未知，1=自由，2=占据
-   memCtx.fillRect(k*cell/iw*480,py,cw+0.6,ch+0.6)}}}
-function draw(s){const c=map.getContext('2d');c.fillStyle='#111';c.fillRect(0,0,480,360);
- if(!s.map_meta)return;const m=s.map_meta;
- if(mapImg.src!==s.map&&s.map){mapImg.onload=()=>{c.drawImage(mapImg,0,0,480,360)};mapImg.src=s.map}
- c.drawImage(mapImg,0,0,480,360);
- const X=x=>(x-m.b[0])/(m.b[1]-m.b[0])*480, Y=y=>360-(y-m.b[2])/(m.b[3]-m.b[2])*360;
- for(const o of (m.objs||[])){const fc=(o.color&&OBJC[o.color])||FURN[o.cls];if(!fc)continue;
-  const w=2*o.half/(m.b[1]-m.b[0])*480,h=2*o.half/(m.b[3]-m.b[2])*360;
-  const px=X(o.xy[0])-w/2,py=Y(o.xy[1])-h/2,r=Math.min(4,w/3,h/3);
-  c.fillStyle=fc[0];rr(c,px,py,w,h,r);c.fill();
-  c.strokeStyle=fc[1];c.lineWidth=1.2;c.stroke()}
- c.font='bold 11px sans-serif';c.textAlign='center';c.textBaseline='middle';
- for(const rm of (m.rooms||[])){const[gx0,gy0,gx1,gy1]=rm.rect;
-  const cx=X((gx0+gx1)/2),cy=Y((gy0+gy1)/2);
-  c.strokeStyle='rgba(0,0,0,.45)';c.lineWidth=3;c.strokeText(rm.name,cx,cy);
-  c.fillStyle='#5a5248';c.fillText(rm.name,cx,cy)}
+   memCtx.fillRect(X(m.b[0]+k*cell),py,cw,ch)}}}
+// --- 各图层 ---
+function drawRooms(c,m){
+ for(const rm of (m.rooms||[])){const[x0,y0,x1,y1]=rm.rect;
+  c.fillStyle=ROOM2D[rm.name]||'#f2ede2';
+  c.fillRect(X(x0),Y(y1),(x1-x0)*MS,(y1-y0)*MS)}
+ // 1 m 辅助网格（建筑图那种很淡的细线）
+ c.strokeStyle='rgba(120,105,85,.10)';c.lineWidth=.6;c.beginPath();
+ const b=m.b;
+ for(let x=Math.ceil(b[0]);x<=b[1];x++){c.moveTo(X(x),Y(b[3]));c.lineTo(X(x),Y(b[2]))}
+ for(let y=Math.ceil(b[2]);y<=b[3];y++){c.moveTo(X(b[0]),Y(y));c.lineTo(X(b[1]),Y(y))}
+ c.stroke();
+}
+function drawWalls(c,m){
+ const cols=m.wh[0],rows=m.wh[1],cell=m.cell,wl=m.walls,b=m.b,h=cell*MS+0.7;
+ c.fillStyle=WALLF;
+ for(let r=0;r<rows;r++){
+  let k=0;
+  while(k<cols){
+   if(wl.charCodeAt(r*cols+k)!==49){k++;continue}
+   let k2=k;while(k2+1<cols&&wl.charCodeAt(r*cols+k2+1)===49)k2++;
+   const x0=X(b[0]+k*cell),x1=X(b[0]+(k2+1)*cell),y0=Y(b[2]+(r+1)*cell);
+   c.fillRect(x0,y0,x1-x0,h);
+   k=k2+1}}
+}
+function drawDoors(c,m){
+ for(const d of (m.doors||[])){
+  const px0=X(d[0]),px1=X(d[2]),pyb=Y(d[1]),pyt=Y(d[3]);
+  // 先用纸色切出墙上的门洞，再画门扇 + 开启弧线（弧半径封顶，避免大开口糊满房间）
+  c.fillStyle=PAPER;c.fillRect(px0,pyt,px1-px0,pyb-pyt);
+  c.strokeStyle='rgba(176,138,90,.85)';c.lineWidth=1.1;c.beginPath();
+  if(d[2]-d[0]>=d[3]-d[1]){                     // 横墙上的门洞：铰链在左端
+   const r=Math.min(px1-px0,.75*MS);
+   c.moveTo(px0,pyb);c.lineTo(px0,pyb-r);
+   c.arc(px0,pyb,r,-Math.PI/2,0);
+  }else{                                        // 竖墙上的门洞：铰链在上端
+   const r=Math.min(pyb-pyt,.75*MS);
+   c.moveTo(px0,pyt);c.lineTo(px0+r,pyt);
+   c.arc(px0,pyt,r,0,Math.PI/2);
+  }
+  c.stroke()}
+}
+function box(c,x,y,w,h,r,fc){
+ c.globalAlpha=.42;c.fillStyle=fc[0];rr(c,x,y,w,h,r);c.fill();
+ c.globalAlpha=1;c.strokeStyle=FLL;c.lineWidth=1.1;rr(c,x,y,w,h,r);c.stroke();}
+function drawFurn(c,m){
+ for(const o of (m.objs||[])){
+  const fc=(o.color&&OBJC[o.color])||FURN[o.cls];if(!fc)continue;
+  const w=2*o.half*MS,h=w,x=X(o.xy[0])-w/2,y=Y(o.xy[1])-h/2;
+  c.strokeStyle=FLL;c.lineWidth=1.1;
+  if(o.cls==='plant'){                         // 花盆 + 植冠
+   const r=w*.46;
+   c.globalAlpha=.42;c.fillStyle=fc[0];c.beginPath();c.arc(x+w/2,y+h/2,r,0,Math.PI*2);c.fill();
+   c.globalAlpha=1;c.beginPath();c.arc(x+w/2,y+h/2,r,0,Math.PI*2);c.stroke();
+   c.lineWidth=.9;c.beginPath();
+   c.moveTo(x+w/2,y+h/2-r*.75);c.lineTo(x+w/2,y+h/2+r*.75);
+   c.moveTo(x+w/2-r*.75,y+h/2);c.lineTo(x+w/2+r*.75,y+h/2);c.stroke();
+  }else if(o.cls==='bed'){                     // 床架 + 被子 + 枕头
+   box(c,x,y,w,h,2,fc);
+   const pw=w*.8,ph=h*.2;
+   c.globalAlpha=.55;c.fillStyle='#fff';c.fillRect(x+w*.1,y+h*.08,pw,ph);
+   c.globalAlpha=1;c.lineWidth=.9;c.strokeRect(x+w*.1,y+h*.08,pw,ph);
+   c.beginPath();c.moveTo(x+w*.07,y+h*.38);c.lineTo(x+w*.93,y+h*.38);c.stroke();
+  }else if(o.cls==='sofa'){                    // 靠背 + 坐垫分缝 + 扶手
+   box(c,x,y,w,h,2.5,fc);
+   c.lineWidth=.9;c.strokeRect(x+w*.09,y+h*.09,w*.82,h*.24);
+   c.beginPath();c.moveTo(x+w*.5,y+h*.33);c.lineTo(x+w*.5,y+h*.9);c.stroke();
+   c.strokeRect(x+w*.04,y+h*.38,w*.09,h*.5);c.strokeRect(x+w*.87,y+h*.38,w*.09,h*.5);
+  }else if(o.cls==='table'){                   // 桌面 + 内框
+   box(c,x,y,w,h,2,fc);
+   c.lineWidth=.9;c.strokeRect(x+w*.12,y+h*.12,w*.76,h*.76);
+  }else if(o.cls==='chair'){                   // 座面 + 靠背
+   box(c,x,y,w,h,2,fc);
+   c.lineWidth=.9;c.strokeRect(x+w*.1,y+h*.08,w*.8,h*.24);
+  }else if(o.cls==='shelf'){                   // 柜体 + 隔板线
+   box(c,x,y,w,h,1,fc);
+   c.lineWidth=.8;c.beginPath();
+   for(let i=1;i<4;i++){const yy=y+h*i/4;c.moveTo(x+w*.08,yy);c.lineTo(x+w*.92,yy)}
+   c.stroke();
+  }else if(o.cls==='box'){                     // 纸箱：对角封箱带
+   box(c,x,y,w,h,1,fc);
+   c.lineWidth=.8;c.beginPath();c.moveTo(x,y);c.lineTo(x+w,y+h);
+   c.moveTo(x+w,y);c.lineTo(x,y+h);c.stroke();
+  }else if(o.cls==='tv'){                      // 屏幕 + 底座
+   box(c,x,y,w,h,1,fc);
+   c.lineWidth=.9;c.beginPath();c.moveTo(x+w*.2,y+h);c.lineTo(x+w*.8,y+h);c.stroke();
+  }else box(c,x,y,w,h,2,fc);
+ }
+}
+function drawRoomLabels(c,m){
+ c.textAlign='center';c.textBaseline='middle';
+ for(const rm of (m.rooms||[])){
+  if(!rm.name)continue;
+  const[x0,y0,x1,y1]=rm.rect,cx=X((x0+x1)/2),cy=Y((y0+y1)/2);
+  const a=Math.abs((x1-x0)*(y1-y0)).toFixed(1)+' m²';
+  // 文字底片：压在床/桌上也能读清，像真实户型图的房间标注
+  c.font='bold 12px system-ui,"Microsoft YaHei",sans-serif';
+  const w1=c.measureText(rm.name).width;
+  c.font='10px system-ui,sans-serif';
+  const w2=c.measureText(a).width;
+  const bw=Math.max(w1,w2)+13,bh=30;
+  c.fillStyle='rgba(251,248,241,.84)';rr(c,cx-bw/2,cy-bh/2,bw,bh,4);c.fill();
+  c.font='bold 12px system-ui,"Microsoft YaHei",sans-serif';
+  c.fillStyle='#4a443c';c.fillText(rm.name,cx,cy-6);
+  c.font='10px system-ui,sans-serif';
+  c.fillStyle='#8a7f70';c.fillText(a,cx,cy+8);
+ }
  c.textAlign='start';c.textBaseline='alphabetic';
+}
+function drawScale(c){
+ let L=1;for(const v of[1,2,5,10])if(v*MS<=100)L=v;
+ const px=L*MS,x=480-20-px,y=352;
+ c.strokeStyle='#6b6154';c.lineWidth=1.3;c.beginPath();
+ c.moveTo(x,y);c.lineTo(x+px,y);
+ c.moveTo(x,y-3.5);c.lineTo(x,y+3.5);c.moveTo(x+px,y-3.5);c.lineTo(x+px,y+3.5);c.stroke();
+ c.fillStyle='#6b6154';c.font='10px system-ui,sans-serif';
+ c.textAlign='right';c.textBaseline='middle';c.fillText(L+' m',x-6,y);
+ c.textAlign='start';c.textBaseline='alphabetic';
+}
+function drawNorth(c){
+ const x=430,y=44;
+ c.strokeStyle='#8a7f70';c.lineWidth=1.2;
+ c.beginPath();c.moveTo(x,y+8);c.lineTo(x,y-8);c.stroke();
+ c.fillStyle='#8a7f70';c.beginPath();c.moveTo(x,y-14);c.lineTo(x-5,y-2);c.lineTo(x+5,y-2);c.closePath();c.fill();
+ c.font='bold 10px system-ui,sans-serif';c.textAlign='center';c.fillText('N',x,y+20);c.textAlign='start';
+}
+function drawCaption(c,m){
+ c.fillStyle='#9a9083';c.font='9px system-ui,sans-serif';c.textAlign='left';
+ c.fillText('户型 '+(m.b[1]-m.b[0]).toFixed(1)+' × '+(m.b[3]-m.b[2]).toFixed(1)+' m',
+  X(m.b[0])-4,356);
+}
+function draw(s){const c=map.getContext('2d');
+ c.setTransform(2,0,0,2,0,0);
+ c.fillStyle=PAPER;c.fillRect(0,0,480,360);
+ if(!s.map_meta)return;const m=s.map_meta;
+ setXf(m);
+ // 图纸外框（带一点留白的装订线）
+ const b=m.b,fx=X(b[0])-5,fy=Y(b[3])-5,fw=(b[1]-b[0])*MS+10,fh=(b[3]-b[2])*MS+10;
+ c.strokeStyle='#ddd5c7';c.lineWidth=1;c.strokeRect(fx,fy,fw,fh);
+ drawRooms(c,m);drawWalls(c,m);drawDoors(c,m);drawFurn(c,m);drawRoomLabels(c,m);
  // ---- 机器人「记忆地图」叠加（explore 策略）：未走过的区域压暗 = 还没见过，
  // 巡屋过程中暗区逐渐点亮；瞥见地标后画黄色靶心。只在版本号变化时重画。
  if(s.mem&&s.mem.g){if(memV!==s.mem.v){memV=s.mem.v;paintMem(s.mem)}
   c.drawImage(memCv,0,0,480,360);
   if(s.mem.lm){const mx=X(s.mem.lm[0]),my=Y(s.mem.lm[1]);
-   c.strokeStyle='#ffd23a';c.lineWidth=2.4;c.beginPath();c.arc(mx,my,7,0,7);c.stroke();
-   c.fillStyle='#ffd23a';c.beginPath();c.arc(mx,my,2.5,0,7);c.fill()}}
- if(s.goal){c.fillStyle='#2f2';c.beginPath();c.arc(X(s.goal[0]),Y(s.goal[1]),6,0,7);c.fill()}
- if(s.target){c.fillStyle='#f44';c.beginPath();c.arc(X(s.target[0]),Y(s.target[1]),7,0,7);c.fill()}
- c.strokeStyle='#f9933b';c.lineWidth=1;
+   c.strokeStyle='#e0a51e';c.lineWidth=2.2;c.beginPath();c.arc(mx,my,7,0,Math.PI*2);c.stroke();
+   c.fillStyle='#e0a51e';c.beginPath();c.arc(mx,my,2.5,0,Math.PI*2);c.fill()}}
+ // 激光（浅色底上降透明度，避免糊成一片）
+ c.strokeStyle='rgba(240,140,45,.45)';c.lineWidth=.7;
  for(const p of s.lidar){c.beginPath();c.moveTo(X(s.pose[0]),Y(s.pose[1]));c.lineTo(X(p[0]),Y(p[1]));c.stroke()}
- if(s.traj.length>1){c.strokeStyle='#4af';c.lineWidth=2;c.beginPath();
-  s.traj.forEach((p,i)=>i?c.lineTo(X(p[0]),Y(p[1])):c.moveTo(X(p[0]),Y(p[1])));c.stroke()}
+ // 轨迹：白色描边 + 蓝色主线
+ if(s.traj.length>1){
+  c.lineJoin='round';c.lineCap='round';
+  c.strokeStyle='rgba(255,255,255,.9)';c.lineWidth=3.6;c.beginPath();
+  s.traj.forEach((p,i)=>i?c.lineTo(X(p[0]),Y(p[1])):c.moveTo(X(p[0]),Y(p[1])));c.stroke();
+  c.strokeStyle='#2b6fd6';c.lineWidth=2;c.beginPath();
+  s.traj.forEach((p,i)=>i?c.lineTo(X(p[0]),Y(p[1])):c.moveTo(X(p[0]),Y(p[1])));c.stroke();
+  c.lineCap='butt'}
+ // 目标点 / 被跟随者
+ if(s.goal){const gx=X(s.goal[0]),gy=Y(s.goal[1]);
+  c.strokeStyle='#1f9d4d';c.lineWidth=1.6;c.beginPath();c.arc(gx,gy,7,0,Math.PI*2);c.stroke();
+  c.fillStyle='rgba(35,185,90,.9)';c.beginPath();c.arc(gx,gy,3.2,0,Math.PI*2);c.fill()}
+ if(s.target){const tx=X(s.target[0]),ty=Y(s.target[1]);
+  c.fillStyle='#e0492f';c.strokeStyle='#fff';c.lineWidth=1.4;
+  c.beginPath();c.arc(tx,ty,6.5,0,Math.PI*2);c.fill();c.stroke()}
+ // 机器人（白描边箭头，浅底上也清楚）
  if(s.pose){c.save();c.translate(X(s.pose[0]),Y(s.pose[1]));c.rotate(-s.pose[2]);
-  c.fillStyle='#4af';c.beginPath();c.moveTo(9,0);c.lineTo(-6,-5);c.lineTo(-6,5);c.closePath();c.fill();c.restore()}}
-const mapImg=new Image();
+  c.fillStyle='#1e56b3';c.strokeStyle='#fff';c.lineWidth=1.4;
+  c.beginPath();c.moveTo(10,0);c.lineTo(-6,-6);c.lineTo(-3,0);c.lineTo(-6,6);c.closePath();
+  c.fill();c.stroke();c.restore()}
+ drawScale(c);drawCaption(c,m);drawNorth(c);
+}
 // ================= 3D 场景（three.js，可拖拽旋转） =================
 const FURN3D={chair:0xcd6b5c,table:0xb98a5a,sofa:0x6e87c4,bed:0x8fa3d9,
  shelf:0x8b7355,plant:0x5fa46b,box:0xc9a05a,tv:0x3a3a40};

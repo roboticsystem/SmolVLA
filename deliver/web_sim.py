@@ -31,6 +31,38 @@ STATIC = {"three.min.js": "application/javascript",
           "OrbitControls.js": "application/javascript"}
 
 
+def _door_rects(mask, bounds, cell=0.1):
+    """0.1 m 门洞栅格 → 米制矩形列表（4 邻域连通域外接框）。
+
+    只给前端画门弧用：开口位置/朝向由矩形长短边决定，不参与任何物理计算。
+    """
+    h, w = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    rects = []
+    for r0 in range(h):
+        for c0 in range(w):
+            if not mask[r0, c0] or seen[r0, c0]:
+                continue
+            stack = [(r0, c0)]
+            seen[r0, c0] = True
+            rmin = rmax = r0
+            cmin = cmax = c0
+            while stack:
+                r, c = stack.pop()
+                rmin, rmax = min(rmin, r), max(rmax, r)
+                cmin, cmax = min(cmin, c), max(cmax, c)
+                for rr, cc in ((r + 1, c), (r - 1, c), (r, c + 1), (r, c - 1)):
+                    if (0 <= rr < h and 0 <= cc < w and mask[rr, cc]
+                            and not seen[rr, cc]):
+                        seen[rr, cc] = True
+                        stack.append((rr, cc))
+            rects.append([float(bounds[0] + cmin * cell),
+                          float(bounds[2] + rmin * cell),
+                          float(bounds[0] + (cmax + 1) * cell),
+                          float(bounds[2] + (rmax + 1) * cell)])
+    return rects
+
+
 class Sim:
     def __init__(self):
         self.env = calibrated_env()
@@ -47,7 +79,6 @@ class Sim:
         self.goal = None
         self.instruction = ""
         self.level_str = "-"
-        self.map_png = None
         self.map_meta = None
         self.img_b64 = None
         self.lidar_pts = []
@@ -65,30 +96,31 @@ class Sim:
         self._stop = False
 
     def refresh_map(self, env=None):
-        import cv2
+        """生成 2D 户型图 / 3D 场景共用的矢量元数据（不再传栅格 PNG）。
+
+        前端用 `walls` 画墙、`doors` 画门洞弧线、`rooms` 铺地板色并标名称，
+        比传一张 640 px 位图省带宽，也更像真实户型图。
+        """
         env = env or self.env
         sc = env.scene
-        rgb = sc.rgb
-        h, w = rgb.shape[:2]
-        scale = 640.0 / max(h, w)
-        small = cv2.resize(rgb, (int(w * scale), int(h * scale)),
-                           interpolation=cv2.INTER_NEAREST)
-        ok, buf = cv2.imencode(".png", cv2.cvtColor(small, cv2.COLOR_RGB2BGR))
-        self.map_png = base64.b64encode(buf.tobytes()).decode()
         b = sc.bounds
-        # 3D 视图用：墙体栅格（2×2 最大池化到 0.1 m 格）+ 家具真实高度
+        # 2×2 最大池化到 0.1 m 格；门洞单独取连通域矩形
         sem = sc.sem
         h2, w2 = sem.shape[0] // 2, sem.shape[1] // 2
         p = sem[:h2 * 2, :w2 * 2].reshape(h2, 2, w2, 2)
         walls = (p == 1).any(axis=(1, 3))
+        doors = _door_rects((p == 2).any(axis=(1, 3)), b)
+        names = getattr(sc, "room_names", None)
+        if not names:                                   # 随机 MultiRoom 无房间名
+            names = [("", rect) for rect in sc.rooms]
         self.map_meta = {"b": [float(b[0]), float(b[1]), float(b[2]), float(b[3])],
-                         "w": int(small.shape[1]), "h": int(small.shape[0]),
                          "name": sc.name,
                          "walls": "".join("1" if v else "0"
                                           for row in walls for v in row),
                          "wh": [int(w2), int(h2)], "cell": 0.1,
+                         "doors": doors,
                          "rooms": [{"name": n, "rect": [float(v) for v in rect]}
-                                   for n, rect in getattr(sc, "room_names", [])],
+                                   for n, rect in names],
                          "objs": [{"cls": o.cls, "color": o.color,
                                    "xy": [float(o.xy[0]), float(o.xy[1])],
                                    "half": float(o.half),
@@ -129,7 +161,7 @@ class Sim:
                 "step": self.step, "instruction": self.instruction,
                 "level": self.level_str, "pose": self.pose, "traj": traj,
                 "goal": self.goal, "lidar": lidar, "image": self.img_b64,
-                "map": self.map_png, "map_meta": self.map_meta,
+                "map_meta": self.map_meta,
                 "target": self.target, "live": self.live, "mem": self.mem,
                 "done": self.done, "result": self.result, "batch": self.batch}
 
@@ -781,8 +813,8 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         elif self.path == "/api/state":
             with LOCK:
-                if SIM.map_png is None:
-                    # 首次访问即预渲染默认场景（公寓）的底图，页面打开就有户型图
+                if SIM.map_meta is None:
+                    # 首次访问即预渲染默认场景（公寓）的户型数据，页面打开就有图
                     try:
                         if SIM.aenv is None:
                             SIM.aenv = calibrated_env(layout="apartment",
