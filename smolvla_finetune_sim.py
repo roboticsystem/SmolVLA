@@ -256,7 +256,8 @@ def _sample_seed(ep_seed, step):
 def closed_loop_sr_batch(policy, data, episodes=200, seed=9000, max_steps=200,
                          level=None, n_frames=1, visible_start=False,
                          detail=None, batch=8, verbose=True,
-                         det_mode="none", mem_ttl=25, calib=True, trace_n=0):
+                         det_mode="none", mem_ttl=25, calib=True, trace_n=0,
+                         env_over=None):
     """**批量**闭环评测：同时跑 `batch` 个环境，把模型前向合并成一批。
 
     ## 为什么需要
@@ -278,10 +279,13 @@ def closed_loop_sr_batch(policy, data, episodes=200, seed=9000, max_steps=200,
         # `calib=False` → 默认多房间 + 2 行人（**域泛化评测**用）。
         # 早先这里硬编码 `calibrated_env`，导致「多房间评测」实际仍在标定场地上跑
         #（数字对不上才发现）。
+        # `env_over`：布局 / 退化矩阵的额外环境开关（layout、exposure、glare、
+        # n_peds、frame_drop …），透传给构造函数；与 `calib` 的基准配置叠加。
+        ov = env_over or {}
         if calib:
-            return calibrated_env(seed=seed, max_steps=max_steps, task_level=level)
+            return calibrated_env(seed=seed, max_steps=max_steps, task_level=level, **ov)
         return SemanticNavEnv(seed=seed, n_peds=2, max_steps=max_steps,
-                              task_level=level)
+                              task_level=level, **ov)
 
     policy.eval()
     if detail is None:
@@ -714,7 +718,11 @@ def main():
     # 仅评测：加载已训练的 checkpoint，用**统一口径**重评（便于修正指标后回溯既有结果）
     if a.eval_only:
         ck = torch.load(os.path.join(a.eval_only, "policy.pt"), map_location=DEV)
-        if "model" in ck:
+        if ck.get("zeroshot"):
+            # E5 外部锚点：**不加载任何权重**，直接用预训练 SmolVLA（models/smolvla_base）
+            # 跑同一闭环协议 —— 证明「域迁移微调 + 感知分离架构」的必要性下界。
+            print("  [zero-shot] 使用预训练 SmolVLA，不加载任何微调权重")
+        elif "model" in ck:
             miss, unexp = policy.model.load_state_dict(ck["model"], strict=False)
             if miss or unexp:
                 print(f"  [提示] 加载 state_dict：缺失 {len(miss)} 项 / 多余 {len(unexp)} 项")

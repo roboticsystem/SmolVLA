@@ -28,6 +28,7 @@ import os
 import re
 import sys
 import time
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -35,6 +36,10 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
 import numpy as np
+
+# 可选外部 ASR 后端（whisper.cpp / funasr_server 同协议：multipart file → {"text"}）。
+# 设置后不再加载 faster-whisper，直接转发；如 ASR_BACKEND=http://127.0.0.1:8086/inference
+ASR_BACKEND = os.getenv("ASR_BACKEND", "")
 
 # ---------- 指令归一化 ----------
 COLOR_MAP = {
@@ -132,6 +137,21 @@ def _get_asr():
     return _State.whisper
 
 
+def _asr_http(audio: bytes) -> str:
+    """转发到外部 ASR 服务（multipart 上传 file 字段，返回 {"text": ...}）。"""
+    boundary = "----vlavoice9271x"
+    body = (("--%s\r\n" % boundary).encode() +
+            b"Content-Disposition: form-data; name=\"file\"; "
+            b"filename=\"a.wav\"\r\n"
+            b"Content-Type: application/octet-stream\r\n\r\n" +
+            audio + ("\r\n--%s--\r\n" % boundary).encode())
+    r = urllib.request.Request(
+        ASR_BACKEND, data=body, method="POST",
+        headers={"Content-Type": "multipart/form-data; boundary=%s" % boundary})
+    out = json.loads(urllib.request.urlopen(r, timeout=120).read())
+    return str(out.get("text", ""))
+
+
 async def _edge_tts_bytes(text: str) -> bytes:
     import edge_tts
     buf = io.BytesIO()
@@ -158,8 +178,9 @@ def make_handler(project: str, validate_fn):
         def do_GET(self):
             u = urlparse(self.path)
             if u.path == "/health":
-                self._json(200, {"asr": _State.whisper is not None,
-                                 "model": ASR_MODEL})
+                self._json(200, {"asr": bool(ASR_BACKEND)
+                                 or _State.whisper is not None,
+                                 "model": ASR_BACKEND or ASR_MODEL})
             elif u.path == "/tts":
                 text = parse_qs(u.query).get("text", [""])[0]
                 if not text:
@@ -186,10 +207,14 @@ def make_handler(project: str, validate_fn):
                     return
                 req = json.loads(self.rfile.read(n))
                 audio = base64.b64decode(req["wav_b64"])
-                model = _get_asr()
-                segs, _info = model.transcribe(io.BytesIO(audio), language="zh",
-                                               beam_size=1, vad_filter=True)
-                text = "".join(s.text for s in segs).strip()
+                if ASR_BACKEND:
+                    text = _asr_http(audio)
+                else:
+                    model = _get_asr()
+                    segs, _info = model.transcribe(io.BytesIO(audio),
+                                                   language="zh",
+                                                   beam_size=1, vad_filter=True)
+                    text = "".join(s.text for s in segs).strip()
                 instr, ok, note = normalize_instruction(text, validate_fn)
                 self._json(200, {"text": text, "instruction": instr,
                                  "ok": bool(ok), "note": note,
