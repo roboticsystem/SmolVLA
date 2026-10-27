@@ -79,7 +79,7 @@ table{border-collapse:collapse;font-size:13px}td,th{border:1px solid #444;paddin
 <div class="row">
 <div class="panel"><b>3D 场景</b> <span class="hint">（拖拽旋转 / 滚轮缩放 / 右键平移）</span><br>
 <canvas id="gl" width="640" height="480"></canvas></div>
-<div><div class="panel"><b>车载相机</b><br><img id="cam"><br>
+<div><div class="panel"><b>车载相机（第一视角）</b><br><canvas id="cam" width="320" height="240"></canvas><br>
 <div id="status" class="panel" style="margin-top:10px;min-width:320px">等待开始…</div></div></div>
 <div class="panel" style="min-width:280px"><b>批量评测结果</b><div id="batch">—</div></div>
 </div>
@@ -359,7 +359,11 @@ const OBJ3D={red:0xc63e37,blue:0x3e5cc6,green:0x469e52,yellow:0xdcba3a,
  white:0xeeeeee,black:0x34343a};
 const ROOM3D={'客厅':0x9a8760,'餐厅':0x9a8760,'厨房':0x6e8290,'卫生间':0x6e8290,
  '走廊':0x84847a,'主卧':0x8f7a78,'次卧':0x78869a,'书房':0x7a8a78};
-let renderer,cam3,scene3,controls,statG,dyn={},statKey='';
+let renderer,cam3,scene3,controls,statG,dyn={},statKey='',camR,camFP;
+// 车载相机 = 同一 three.js 场景的第一视角：水平 FOV 64.5°、离地 0.35 m
+// （与 sim.sensors 里机器人相机的参数一致），这样拍到的家具造型/颜色
+// 和 3D 视图完全同源，不再是后端软件渲染画出来的方盒。
+const CAM_HFOV=64.5,CAM_H=0.35,CAM_W=320,CAM_HH=240;
 function init3d(){
  renderer=new THREE.WebGLRenderer({antialias:true,canvas:gl});
  renderer.setSize(640,480,false);renderer.setPixelRatio(window.devicePixelRatio);
@@ -376,7 +380,13 @@ function init3d(){
  scene3.add(dir);
  scene3.add(new THREE.HemisphereLight(0x8899bb,0x332f28,.35));
  controls=new THREE.OrbitControls(cam3,gl);
- controls.enableDamping=true;controls.dampingFactor=.08;controls.maxPolarAngle=Math.PI/2.05;}
+ controls.enableDamping=true;controls.dampingFactor=.08;controls.maxPolarAngle=Math.PI/2.05;
+ // 第一视角相机渲染到「车载相机」画布：竖直 FOV 由水平 64.5° 按 4:3 画幅换算
+ camFP=new THREE.PerspectiveCamera(2*Math.atan(Math.tan(CAM_HFOV*Math.PI/360)*CAM_HH/CAM_W)
+  *180/Math.PI,CAM_W/CAM_HH,.05,60);
+ camR=new THREE.WebGLRenderer({antialias:true,canvas:document.getElementById('cam')});
+ camR.setSize(CAM_W,CAM_HH,false);camR.setPixelRatio(window.devicePixelRatio);
+ camR.shadowMap.enabled=true;camR.shadowMap.type=THREE.PCFSoftShadowMap;}
 // 家具造型：按类别拼出可辨识的样子（植物=花盆+植株、椅子=座+靠背+四条腿…），
 // 主体用物体真实颜色（与 2D/车载相机/指令一致），不再是一排无差别方块
 const shade=(hex,f)=>{const c=new THREE.Color(hex);c.multiplyScalar(f);return c.getHex()};
@@ -488,20 +498,40 @@ function updateDyn(s){
  if(!dyn.robot)return;
  if(s.goal){dyn.goal.visible=true;dyn.goal.position.set(s.goal[0],.15,s.goal[1])}else dyn.goal.visible=false;
  if(s.target){dyn.person.visible=true;dyn.person.position.set(s.target[0],0,s.target[1])}else dyn.person.visible=false;
- dyn.robot.position.set(s.pose[0],0,s.pose[1]);dyn.robot.rotation.y=-s.pose[2];
+ // 机器人的位置/朝向由 anim 循环按平滑位姿每帧写（见 smoothPose），这里不设，
+ // 否则 10 Hz 的快照会把 60 Hz 的平滑结果来回打断
  if(s.traj&&s.traj.length)dyn.traj.geometry.setFromPoints(s.traj.map(p=>new THREE.Vector3(p[0],.06,p[1])));
- const lp=[];for(const p of s.lidar){lp.push(new THREE.Vector3(s.pose[0],.25,s.pose[1]),
+ const o=sp||s.pose,lp=[];for(const p of s.lidar){lp.push(new THREE.Vector3(o[0],.25,o[1]),
   new THREE.Vector3(p[0],.25,p[1]))}
  dyn.lidar.geometry.setFromPoints(lp);}
 init3d();
-(function anim(){requestAnimationFrame(anim);controls.update();renderer.render(scene3,cam3)})();
+// 快照 10 Hz、渲染 60 Hz：位姿做指数平滑，机器人/相机/激光一起顺滑移动
+let latestPose=null,sp=null;
+function smoothPose(){const p=latestPose;if(!p)return null;
+ if(!sp||Math.hypot(p[0]-sp[0],p[1]-sp[1])>2)sp=[p[0],p[1],p[2]];   // 切场景等大跳变直接归位
+ else{const k=.25,d=((p[2]-sp[2]+Math.PI)%(2*Math.PI)+2*Math.PI)%(2*Math.PI)-Math.PI;
+  sp[0]+=(p[0]-sp[0])*k;sp[1]+=(p[1]-sp[1])*k;sp[2]+=d*k}
+ return sp}
+(function anim(){requestAnimationFrame(anim);controls.update();
+ const p=smoothPose();
+ if(p&&dyn.robot){dyn.robot.position.set(p[0],0,p[1]);dyn.robot.rotation.y=-p[2];
+  camFP.position.set(p[0],CAM_H,p[1]);              // 车载相机 = 车头朝向前视
+  camFP.lookAt(p[0]+Math.cos(p[2]),CAM_H,p[1]+Math.sin(p[2]));
+  camR.render(scene3,camFP)}
+ renderer.render(scene3,cam3)})();
 // ================= 主循环 =================
-async function loop(){try{const s=await(await fetch('/api/state')).json();draw(s);
+// 户型元数据只在切换场景时下发（约 12 KB，见后端 Sim.frame），这里缓存合并进快照，
+// 下游绘图代码不用改；主通道改为服务端 SSE 推流，不再每帧付一次公网 RTT。
+let lastMM=null,lastMV=-1,es=null,esOn=false,lastMsg=0;
+function render(s){
+ if(s.map_meta){lastMM=s.map_meta;lastMV=s.map_v}
+ s.map_meta=lastMM;
+ if(s.pose)latestPose=s.pose;        // 动画循环据此驱动机器人 + 车载相机
+ draw(s);
  const m=s.map_meta;
  if(m&&m.walls){const key=m.name+'|'+m.b.join(',')+'|'+m.walls.length+'|'+(m.objs||[]).length;
   if(key!==statKey){statKey=key;buildStatic(m)}
   updateDyn(s)}
- if(s.image)cam.src='data:image/jpeg;base64,'+s.image;
  const r=s.result;let st='指令: '+(zh(s.instruction)||'—')+'<br>层级: '+s.level+' | 步数: '+s.step+
   ' | 策略: '+s.policy+' | seed: '+s.seed+
   (+pose.value>0?' | <span class="bad">定位噪声 σ='+pose.value+' m</span>':'');
@@ -564,6 +594,21 @@ async function loop(){try{const s=await(await fetch('/api/state')).json();draw(s
  if(s.batch.rows&&s.batch.rows.length){b+='<table><tr><th>#</th><th>指令</th><th>SR</th><th>NE</th></tr>'+
  s.batch.rows.map((r,i)=>'<tr><td>'+(s.batch.done-s.batch.rows.length+i+1)+'</td><td>'+zh(r.instruction||'—')+
  '</td><td>'+(r.success?'✔':'✘')+'</td><td>'+(r.ne!=null?r.ne.toFixed(2):('TCR '+(r.TCR!=null?r.TCR+'%':'—')))+'</td></tr>').join('')+'</table>'}
- batch.innerHTML=b}catch(e){}setTimeout(loop,120)}
+ batch.innerHTML=b}
+// 兜底轮询：SSE 断开（隧道抖动 / 被中间代理缓冲）时自动接管，演示不中断
+async function loop(){
+ if(esOn){setTimeout(loop,300);return}
+ try{render(await(await fetch('/api/state?mv='+lastMV)).json())}catch(e){}
+ setTimeout(loop,120)}
+function connect(){try{es&&es.close()}catch(e){}
+ es=new EventSource('/api/stream');lastMsg=Date.now();
+ es.onopen=()=>{esOn=true};                                   // 建连成功 → 停轮询
+ es.onmessage=e=>{lastMsg=Date.now();try{render(JSON.parse(e.data))}catch(err){}};
+ es.onerror=()=>{esOn=false}}                                 // 断流 → 立即退回轮询
+connect();
+// 看门狗：连上了却 3 s 收不到帧（被代理缓冲）→ 重连；完全不通 → 每 20 s 再试
+setInterval(()=>{const now=Date.now();
+ if(esOn&&now-lastMsg>3000){esOn=false;connect()}
+ else if(!esOn&&now-lastMsg>20000)connect()},1000);
 loop();
 </script></body></html>

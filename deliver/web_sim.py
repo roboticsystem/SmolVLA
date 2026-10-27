@@ -80,7 +80,7 @@ class Sim:
         self.instruction = ""
         self.level_str = "-"
         self.map_meta = None
-        self.img_b64 = None
+        self.map_v = 0             # 户型元数据版本号：前端带 ?mv=N 时只在变化才下发
         self.lidar_pts = []
         self.target = None        # 跟随模式：被跟随者（红马甲）位置
         self.live = None          # 跟随模式：实时 距离/可见/带内；explore 模式：阶段/覆盖/地标
@@ -125,9 +125,9 @@ class Sim:
                                    "xy": [float(o.xy[0]), float(o.xy[1])],
                                    "half": float(o.half),
                                    "h": float(o.height)} for o in sc.objects]}
+        self.map_v += 1
 
     def snapshot(self):
-        import cv2
         lidar = []
         if self.obs is not None:
             th = self.pose[2]
@@ -137,33 +137,46 @@ class Sim:
                 a = th + i * 2 * np.pi / n
                 r = float(scan[i])
                 if r < 11.5:
-                    lidar.append([float(self.pose[0] + r * np.cos(a)),
-                                  float(self.pose[1] + r * np.sin(a))])
-            if self.step % 2 == 0 or self.done:
-                # 显示用「清晰机位」：320×240、低雾化、无光度噪声 ——
-                # 与模型实际吃的 160×120 含噪观测分开，观感与口径互不影响
-                try:
-                    from sim.sensors import render as _render
-                    env2 = self.active_env
-                    peds = ([env2.target] if hasattr(env2, "target")
-                            else env2.peds)
-                    disp = _render(env2.scene, env2.pose, peds,
-                                   width=320, height=240, fog_strength=0.15,
-                                   cam_h=0.85)
-                except Exception:                           # noqa: BLE001
-                    disp = self.obs["image"]
-                ok, buf = cv2.imencode(".jpg", cv2.cvtColor(
-                    disp, cv2.COLOR_RGB2BGR),
-                    [cv2.IMWRITE_JPEG_QUALITY, 85])
-                self.img_b64 = base64.b64encode(buf.tobytes()).decode()
-        traj = self.traj[::max(1, len(self.traj) // 300)]
+                    lidar.append([round(float(self.pose[0] + r * np.cos(a)), 2),
+                                  round(float(self.pose[1] + r * np.sin(a)), 2)])
+        # 车载相机画面不再由服务端渲染：前端用同一个 three.js 场景、按机器人位姿取
+        # 第一视角，形状/颜色与 3D 视图天然一致（后端软件渲染只能画方盒，观感对不上），
+        # 顺带把每帧 ~7 KB 的 JPEG 与编码开销整条去掉。
+        # 轨迹/位姿只用于画图，降到 2~3 位小数即可，公网链路上能省掉一大半字节
+        traj = [[round(float(v), 2) for v in p]
+                for p in self.traj[::max(1, len(self.traj) // 300)]]
+        goal = (None if self.goal is None
+                else [round(float(v), 3) for v in self.goal])
         return {"mode": self.mode, "policy": self.policy_name, "seed": self.seed,
                 "step": self.step, "instruction": self.instruction,
-                "level": self.level_str, "pose": self.pose, "traj": traj,
-                "goal": self.goal, "lidar": lidar, "image": self.img_b64,
-                "map_meta": self.map_meta,
+                "level": self.level_str,
+                "pose": [round(float(v), 3) for v in self.pose], "traj": traj,
+                "goal": goal, "lidar": lidar,
+                "map_meta": self.map_meta, "map_v": self.map_v,
                 "target": self.target, "live": self.live, "mem": self.mem,
                 "done": self.done, "result": self.result, "batch": self.batch}
+
+    def ensure_map(self):
+        """首次访问即预渲染默认场景（公寓）的户型数据，页面打开就有图。"""
+        if self.map_meta is not None:
+            return
+        try:
+            if self.aenv is None:
+                self.aenv = calibrated_env(layout="apartment", max_steps=350)
+            self.refresh_map(self.aenv)
+        except Exception:                                   # noqa: BLE001
+            pass
+
+    def frame(self, mv=-1):
+        """取一份快照；与调用方已持有的户型版本号一致时不回传 map_meta。
+
+        公网上每一帧的字节数直接决定刷新率，map_meta 约 12 KB，只在切换场景时
+        （map_v 变化）下发，其余帧只有几 KB。
+        """
+        snap = self.snapshot()
+        if snap["map_v"] == mv:
+            snap["map_meta"] = None
+        return snap
 
 
 SIM = Sim()
@@ -783,6 +796,8 @@ def worker_batch(sim, policy_name, n, level, scene_name=None, scenario=None,
 
 
 class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"      # 保活 + 让 SSE 能用分块传输成帧
+
     def log_message(self, *a):
         pass
 
@@ -793,6 +808,53 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    @staticmethod
+    def _ver(qs, key):
+        """从查询串里取一个整数版本号（形如 ?mv=3&iv=17）。"""
+        for kv in qs.split("&"):
+            if kv.startswith(key + "="):
+                try:
+                    return int(kv[len(key) + 1:])
+                except ValueError:
+                    return -1
+        return -1
+
+    def _stream(self):
+        """SSE 推流：一条长连接持续下发快照，消除「每帧一次跨境往返」。
+
+        公网隧道上单次请求 TTFB ≈0.6 s（冷启首包 1.5~2.5 s），前端轮询把相机
+        帧率锁死在 ~1.2 fps；改成服务端主动推流后，帧率只受带宽（实测约
+        100 KB/s）与渲染耗时限制，不再每帧付一次 RTT。分块传输（chunked）成帧，
+        配合 `X-Accel-Buffering: no` 让中间 nginx 不做缓冲。
+        """
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache, no-transform")
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+        except OSError:
+            return
+        mv = -1
+        paddle = time.time() + 3600.0               # 单连接上限 1 h，防幽灵线程
+        try:
+            with LOCK:
+                SIM.ensure_map()
+            while time.time() < paddle:
+                with LOCK:
+                    snap = SIM.frame(mv)
+                    mv = snap["map_v"]
+                body = ("data: " + json.dumps(snap, ensure_ascii=False)
+                        + "\n\n").encode()
+                self.wfile.write(b"%x\r\n" % len(body) + body + b"\r\n")
+                self.wfile.flush()
+                time.sleep(0.08)                    # 状态帧 ~10 Hz，相机帧由 Sim 内部节流
+        except (BrokenPipeError, ConnectionResetError, OSError, ValueError):
+            pass
+        finally:
+            self.close_connection = True
 
     def do_GET(self):
         if self.path.startswith("/static/") and \
@@ -811,18 +873,16 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-        elif self.path == "/api/state":
+        elif self.path.split("?")[0] == "/api/stream":
+            self._stream()
+        elif self.path.split("?")[0] == "/api/state":
+            # ?mv=N：前端已持有的户型版本号；一致时不再重复下发 map_meta（约 12 KB）
+            qs = self.path.split("?", 1)[1] if "?" in self.path else ""
+            mv = self._ver(qs, "mv")
             with LOCK:
-                if SIM.map_meta is None:
-                    # 首次访问即预渲染默认场景（公寓）的户型数据，页面打开就有图
-                    try:
-                        if SIM.aenv is None:
-                            SIM.aenv = calibrated_env(layout="apartment",
-                                                      max_steps=350)
-                        SIM.refresh_map(SIM.aenv)
-                    except Exception:                       # noqa: BLE001
-                        pass
-                self._json(SIM.snapshot())
+                SIM.ensure_map()
+                snap = SIM.frame(mv)
+            self._json(snap)
         else:
             self._json({"error": "not found"})
 
