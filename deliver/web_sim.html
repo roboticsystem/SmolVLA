@@ -580,18 +580,19 @@ function render(s){
  const r=s.result;let st='指令: '+(zh(s.instruction)||'—')+'<br>层级: '+s.level+' | 步数: '+s.step+
   ' | 策略: '+s.policy+' | seed: '+s.seed+
   (+pose.value>0?' | <span class="bad">定位噪声 σ='+pose.value+' m</span>':'');
- if(s.live&&s.live.phase==='explore')st+='<br>阶段: <span class="big" style="color:#fc6">'+
+ if(s.mode==='running'&&s.live&&s.live.phase==='explore')st+='<br>阶段: <span class="big" style="color:#fc6">'+
   (s.live.phase==='explore'?'① 巡屋建图中…':'② 记忆寻物中…')+'</span> | 已点亮地图 '+
   (100*s.live.cover).toFixed(0)+'% | 地标: '+
   (s.live.seen?'<span class="ok">已记住</span>':'<span class="bad">未瞥见</span>')+
   (s.live.dist!=null?' | 距地标 '+s.live.dist.toFixed(2)+' m':'')+
   (s.live.optim?' | <span style="color:#fc6">记忆缺区·乐观补全</span>':'');
- else if(s.live)st+='<br>跟随实时: 距离 '+s.live.dist.toFixed(2)+' m | '+
+ else if(s.mode==='running'&&s.live)st+='<br>跟随实时: 距离 '+s.live.dist.toFixed(2)+' m | '+
   (s.live.visible?'<span class="ok">可见</span>':'<span class="bad">丢失(扫描中)</span>')+' | '+
   (s.live.in_band?'<span class="ok">带内 [0.9, 2.6]</span>':'<span class="bad">带外</span>')+
   (s.live.rho!=null?' | 拥挤度 ρ(2m): '+s.live.rho+' 人':'')+
   (s.live.stage?'<br>阶段机: <span class="big" style="color:#fc6">'+s.live.stage+'</span>':'');
  if(s.mode==='running')st+='<br><span class="big" style="color:#4af">▶ 运行中…</span>';
+ if(s.mode==='stopped')st+='<br><span class="big" style="color:#fc6">⏹ 已手动停止（第 '+s.step+' 步）</span>';
  if(s.mode==='done'&&r&&r.follow)st+='<br>'+(r.success?'<span class="ok big">✔ 跟随完成</span>':
  '<span class="bad big">✘ 跟随欠佳</span>')+'<br>TCR: '+r.TCR+'% | 距离误差: '+r.err_mean+
  '±'+r.err_std+' m<br>可见率: '+r.vis_rate+'% | 丢失: '+r.n_loss+' 次 | 恢复中位: '+
@@ -618,7 +619,8 @@ function render(s){
  statusEl.innerHTML=st;
  let b='—';if(s.batch.n)b='进度 '+s.batch.done+'/'+(s.batch.total||s.batch.n)+
  ' | 重复 '+(s.batch.repeats||1)+' 轮<br>SR '+s.batch.sr+'% | SPL '+
- s.batch.spl+' | NE '+s.batch.ne+' m';
+ s.batch.spl+' | NE '+s.batch.ne+' m'+
+ (s.mode==='stopped'?'<br><span style="color:#fc6">⏹ 批量评测已手动停止（部分结果仍可参考）</span>':'');
  const bs=s.batch.stats;
  if(bs){b+='<table><tr><th>场景</th><th>n</th><th>SR [95%CI]</th><th>轮均值±σ</th><th>SPL</th><th>NE</th>'+
  (bs.pooled&&bs.pooled.TCR!=null?'<th>TCR</th>':'')+'</tr>';
