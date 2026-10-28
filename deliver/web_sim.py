@@ -642,6 +642,21 @@ def run_episode(sim, policy_name, seed, level, collect_only=False,
            "steps": steps, "min_dist": float(env.min_dist),
            "instruction": env.task["instruction"],
            "level": str(env.task.get("level", "-")), **eng}
+    # W1诊断：失败原因四分类（优先级 near_miss > wander > lost > progress_timeout）
+    tl = m.get("TL")
+    out["tl"] = round(float(tl), 2) if tl == tl else None
+    if not m["SR"]:
+        md = float(env.min_dist)
+        tl_eff = tl if tl == tl else float("inf")
+        if md <= 1.6:
+            fm = "near_miss"         # 到过目标附近但未判定成功（半径/朝向边缘）
+        elif tl_eff > 4.0:
+            fm = "wander"            # 路程≥4倍最短路：绕圈/来回震荡（复合误差特征）
+        elif md > 5.0:
+            fm = "lost"              # 全程未接近目标（语义/感知失败）
+        else:
+            fm = "progress_timeout"  # 在推进但步数耗尽（效率问题）
+        out["fail_mode"] = fm
     if policy_name == "explore" and not collect_only:
         # 两阶段战报：巡屋覆盖了多少、第几步瞥见地标、记忆寻物是否用了乐观补全
         sim.mem = mem_payload(pol, steps)      # 终版记忆图定格给前端
