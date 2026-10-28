@@ -504,7 +504,7 @@ def _pick_env(sim, policy_name, scenario, scene_name=None, dens=0):
 
 def run_episode(sim, policy_name, seed, level, collect_only=False,
                 instruction=None, scenario=None, scene_name=None, degrade=None,
-                pose=0.0, dens=0):
+                pose=0.0, dens=0, max_steps=None):
     env = _pick_env(sim, policy_name, scenario, scene_name, dens=dens)
     follow = policy_name.startswith("follow")
     sim.active_env = env
@@ -533,6 +533,9 @@ def run_episode(sim, policy_name, seed, level, collect_only=False,
         env.cfg["max_steps"] = env._max_steps0 * 5
     elif hasattr(env, "_max_steps0"):
         env.cfg["max_steps"] = env._max_steps0
+    if max_steps is not None:
+        # W1 口径实验：显式覆盖步数预算（每回合写入，无跨批次残留）
+        env.cfg["max_steps"] = int(max_steps)
     if instruction and not follow:
         if not apply_instruction(env, instruction):
             raise RuntimeError("指令「%s」在当前场景中无对应目标"
@@ -762,7 +765,8 @@ def _batch_stats(rows, ref_rows=None):
 
 
 def worker_batch(sim, policy_name, n, level, scene_name=None, scenario=None,
-                 repeats=1, ref_policy=None, degrade=None, pose=0.0, dens=0):
+                 repeats=1, ref_policy=None, degrade=None, pose=0.0, dens=0,
+                 max_steps=None):
     """批量评测：**可跨场景 + 可重复多次 + 可配对参考基线**。
 
     - 跨场景：`scene_name='multi'` 时在「标定场地 + 公寓」两种场地上跑同一批种子，
@@ -791,16 +795,17 @@ def worker_batch(sim, policy_name, n, level, scene_name=None, scenario=None,
                     res = run_episode(sim, policy_name, seed, level,
                                       collect_only=True, scene_name=sc,
                                       scenario=scenario, degrade=degrade,
-                                      pose=pose, dens=dens)
+                                      pose=pose, dens=dens, max_steps=max_steps)
                     if sim._stop:
                         break        # 被停止打断的半个回合：丢弃，不入统计
-                    res.update(scene=sc, rep=rep, seed=seed)
+                    res.update(scene=sc, rep=rep, seed=seed,
+                               max_steps=int(max_steps) if max_steps else None)
                     rows.append(res)
                     if ref_policy:
                         r2 = run_episode(sim, ref_policy, seed, level,
                                          collect_only=True, scene_name=sc,
                                          scenario=scenario, degrade=degrade,
-                                         pose=pose, dens=dens)
+                                         pose=pose, dens=dens, max_steps=max_steps)
                         r2.update(scene=sc, rep=rep, seed=seed)
                         ref_rows.append(r2)
                     done += 1
@@ -955,6 +960,7 @@ class Handler(BaseHTTPRequestHandler):
                     SIM.worker.join(timeout=10)
                 SIM._stop = False        # 无条件复位（与 /api/start 同理）
                 SIM.mode = "batch"
+                _ms = int(req.get("max_steps") or 0) or None
                 SIM.batch = {"running": True, "done": 0,
                              "total": int(req.get("n", 20)) *
                              int(req.get("repeats", 1)) *
@@ -962,7 +968,8 @@ class Handler(BaseHTTPRequestHandler):
                              "n": int(req.get("n", 20)), "sr": None,
                              "spl": None, "ne": None, "rows": [],
                              "stats": None, "repeats": int(req.get("repeats", 1)),
-                             "ref": req.get("ref_policy") or None}
+                             "ref": req.get("ref_policy") or None,
+                             "max_steps": _ms}
                 SIM.worker = threading.Thread(
                     target=worker_batch,
                     args=(SIM, req.get("policy", "oracle"),
@@ -972,7 +979,8 @@ class Handler(BaseHTTPRequestHandler):
                           req.get("ref_policy") or None,
                           req.get("degrade"),
                           float(req.get("pose") or 0.0),
-                          int(req.get("dens") or 0)), daemon=True)
+                          int(req.get("dens") or 0),
+                          _ms), daemon=True)
                 SIM.worker.start()
             self._json({"ok": True})
         elif self.path == "/api/preview":
