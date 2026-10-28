@@ -233,6 +233,7 @@ class VLAPolicy:
             self.stats["cached_steps"] += 1
             return self.queue.pop(0)
         import urllib.request
+        import urllib.error
         ok, buf = cv2_jpeg(obs["image"])
         req = {"jpg_b64": base64.b64encode(buf).decode(),
                "scan": obs["lidar"].tolist(),
@@ -244,6 +245,13 @@ class VLAPolicy:
                 self.server + "/infer", json.dumps(req).encode(),
                 {"Content-Type": "application/json"}), timeout=30)
             out = json.loads(r.read())
+        except urllib.error.HTTPError as e:              # 服务器 5xx：带出错误详情
+            self.stats["fails"] += 1
+            try:
+                detail = json.loads(e.read().decode()).get("error", "")
+            except Exception:                            # noqa: BLE001
+                detail = ""
+            raise RuntimeError(f"infer HTTP {e.code}: {detail or e.reason}")
         except Exception:                                    # noqa: BLE001
             self.stats["fails"] += 1
             raise
@@ -756,7 +764,11 @@ def worker_batch(sim, policy_name, n, level, scene_name=None, scenario=None,
         total = n * len(scenes) * repeats
         done = 0
         for rep in range(repeats):
+            if sim._stop:
+                break
             for sc in scenes:
+                if sim._stop:
+                    break
                 for ep in range(n):
                     if sim._stop:
                         break
@@ -765,6 +777,8 @@ def worker_batch(sim, policy_name, n, level, scene_name=None, scenario=None,
                                       collect_only=True, scene_name=sc,
                                       scenario=scenario, degrade=degrade,
                                       pose=pose, dens=dens)
+                    if sim._stop:
+                        break        # 被停止打断的半个回合：丢弃，不入统计
                     res.update(scene=sc, rep=rep, seed=seed)
                     rows.append(res)
                     if ref_policy:
@@ -786,6 +800,8 @@ def worker_batch(sim, policy_name, n, level, scene_name=None, scenario=None,
         rows.append({"error": "%s: %s" % (type(e).__name__, e)})
     with LOCK:
         sim.batch["running"] = False
+        if sim._stop:
+            sim.mode = "stopped"        # 停止要在前端可见（此前 mode 一直卡在 batch）
         if rows and "error" not in rows[-1]:
             sim.batch["stats"] = _batch_stats(rows, ref_rows or None)
         if rows:
