@@ -1,0 +1,661 @@
+<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">
+<title>SmolVLA 室内语义导航 · 仿真演示系统</title><style>
+body{font-family:'Microsoft YaHei',system-ui,sans-serif;color:#dbe7f3;margin:0;padding:16px 16px 40px;
+background:#070b14;
+background-image:
+ radial-gradient(1100px 500px at 15% -5%,rgba(34,211,238,.10),transparent 60%),
+ radial-gradient(900px 460px at 90% 0%,rgba(59,130,246,.12),transparent 55%),
+ linear-gradient(rgba(148,190,230,.045) 1px,transparent 1px),
+ linear-gradient(90deg,rgba(148,190,230,.045) 1px,transparent 1px);
+background-size:auto,auto,34px 34px,34px 34px}
+h1{font-size:19px;margin:0 0 14px;padding:10px 14px;letter-spacing:1px;color:#eaf6ff;
+background:linear-gradient(90deg,rgba(34,211,238,.14),rgba(59,130,246,.06) 55%,transparent);
+border:1px solid rgba(34,211,238,.35);border-left:4px solid #22d3ee;border-radius:6px;
+box-shadow:0 0 18px rgba(34,211,238,.15),inset 0 0 24px rgba(34,211,238,.05);
+text-shadow:0 0 10px rgba(34,211,238,.45)}
+h1::after{content:'● SYSTEM ONLINE';float:right;font-size:11px;letter-spacing:2px;color:#34d399;
+text-shadow:0 0 8px rgba(52,211,153,.8);margin-top:4px;font-family:Consolas,monospace}
+.row{display:flex;gap:14px;flex-wrap:wrap;align-items:flex-start}
+canvas,img{background:#04070d;border:1px solid rgba(34,211,238,.35);border-radius:4px;
+box-shadow:0 0 14px rgba(34,211,238,.14),inset 0 0 30px rgba(10,20,40,.5)}
+#gl{width:640px;height:480px;cursor:grab}
+#map{width:480px;height:360px;background:#fbf8f1;border:2px solid rgba(34,211,238,.45);
+box-shadow:0 0 16px rgba(34,211,238,.18)}
+#cam{width:320px;height:240px}
+.panel{position:relative;background:rgba(13,20,36,.82);border:1px solid rgba(76,116,166,.45);
+border-radius:8px;padding:12px 14px;margin-bottom:12px;
+box-shadow:0 4px 22px rgba(0,0,0,.45),inset 0 0 26px rgba(34,100,180,.06)}
+.panel::before,.panel::after{content:'';position:absolute;width:12px;height:12px;pointer-events:none;
+border:2px solid #22d3ee;opacity:.75;filter:drop-shadow(0 0 4px rgba(34,211,238,.8))}
+.panel::before{top:-1px;left:-1px;border-right:none;border-bottom:none;border-top-left-radius:8px}
+.panel::after{bottom:-1px;right:-1px;border-left:none;border-top:none;border-bottom-right-radius:8px}
+.panel>b{color:#9fdcff;letter-spacing:.5px;text-shadow:0 0 8px rgba(34,211,238,.35)}
+button,select,input{background:rgba(16,26,46,.9);color:#d7e9fb;border:1px solid rgba(90,140,200,.5);
+border-radius:5px;padding:6px 11px;font-size:14px;outline:none;transition:all .15s}
+select:hover,input:hover{border-color:rgba(34,211,238,.7)}
+select:focus,input:focus{border-color:#22d3ee;box-shadow:0 0 8px rgba(34,211,238,.35)}
+input[type=number]{font-family:Consolas,monospace;color:#aef0ff}
+button{cursor:pointer;letter-spacing:.5px}
+button:hover{background:rgba(34,211,238,.16);border-color:#22d3ee;color:#eaffff;
+box-shadow:0 0 12px rgba(34,211,238,.45);text-shadow:0 0 6px rgba(34,211,238,.8)}
+button:active{transform:translateY(1px)}
+button[onclick="voice()"]{background:rgba(120,40,60,.55)!important;border-color:rgba(255,110,130,.6)}
+button[onclick="voice()"]:hover{background:rgba(255,110,130,.25)!important;border-color:#ff6e82;
+box-shadow:0 0 12px rgba(255,110,130,.5)}
+button[onclick="start()"]{border-color:rgba(52,211,153,.7);color:#b8ffe3}
+button[onclick="start()"]:hover{background:rgba(52,211,153,.18);border-color:#34d399;box-shadow:0 0 12px rgba(52,211,153,.45)}
+#status{font-size:14px;line-height:1.7;font-family:Consolas,'Courier New',monospace;color:#bfe9ff;
+background:rgba(4,10,20,.9);min-width:320px}
+#status::after{content:'▍';color:#22d3ee;animation:blink 1.1s steps(1) infinite;margin-left:2px}
+@keyframes blink{50%{opacity:0}}
+.ok{color:#34d399;font-weight:bold;text-shadow:0 0 8px rgba(52,211,153,.7)}
+.bad{color:#ff7a8a;font-weight:bold;text-shadow:0 0 8px rgba(255,110,130,.7)}
+table{border-collapse:collapse;font-size:13px;font-family:Consolas,monospace}
+td,th{border:1px solid rgba(90,140,200,.4);padding:4px 10px;background:rgba(10,18,34,.6)}
+th{color:#9fdcff;background:rgba(34,100,180,.18)}
+.big{font-size:18px;font-weight:bold}
+.hint{color:#6b83a3;font-size:12px}
+</style></head><body>
+<h1>SmolVLA 室内语义导航 · 仿真演示系统（三室两厅公寓演示 / E1 标定场景可切换）</h1>
+<div class="panel">
+策略 <select id="policy">
+<option value="oracle">oracle 全知规划（上界）</option>
+<option value="geodesic">geodesic 窗口测地场（新布局上界）</option>
+<option value="sweep" selected>sweep 扫描检测（论文基线）</option>
+<option value="random_target">random_target 随机游走（下界）</option>
+<option value="random">random 纯随机</option>
+<option value="explore">explore 巡屋→记忆寻物（先建图·视野外也找得到）</option>
+<option value="vla">SmolVLA 真模型（需推理服务:8000）</option>
+<option value="follow_reactive">跟随 reactive（E11 · 与真机同口径）</option>
+<option value="follow_e4">跟随 reactive + E4 增强（卡尔曼/深度融合）</option>
+<option value="follow_stage">跟随 阶段机+三级脱困（E11c）</option>
+<option value="follow_stage_s">跟随 仅阶段机（E11c 消融臂）</option>
+<option value="follow_oracle">跟随 oracle（真值上界）</option></select>
+任务层级 <select id="level"><option value="">混合 L1-L3</option>
+<option value="L1">L1 类别</option><option value="L2">L2 属性</option>
+<option value="L3">L3 空间关系</option></select>
+场景 <select id="scn"><option value="apartment" selected>三室两厅公寓（演示）</option>
+<option value="lab">标定实验场景（单间·家具稀疏）</option>
+<option value="corridor">1.5m 窄走廊（单直通道）</option>
+<option value="s_corridor">S 形窄走廊（连续急弯）</option>
+<option value="warehouse">仓库货架作业区（货架密集遮挡）</option>
+<option value="classroom">教室（课桌阵列）</option>
+<option value="office">办公室（隔断工位）</option>
+<option value="apartment_s">公寓·紧凑档 0.82×</option>
+<option value="apartment_l">公寓·放大档 1.22×</option>
+<option value="multi">多场景联合（跨场景统计）</option></select>
+<span id="scenlb" style="display:none">遮挡场景 </span><select id="scen" style="display:none"><option value="normal">normal 常规</option>
+<option value="tour">tour 全屋巡回（公寓专用）</option>
+<option value="short_occl">short_occl 短遮挡 1.6s</option>
+<option value="long_occl">long_occl 长遮挡 3.8s</option>
+<option value="light_shift">light_shift 光照突变</option>
+<option value="narrow">narrow 窄道穿行</option>
+<option value="dim">dim 弱光</option><option value="backlight">backlight 逆光</option>
+<option value="sunset">sunset 夕阳强逆光</option>
+<option value="gloss">gloss 反光地面</option>
+<option value="shadow">shadow 侧光阴影</option>
+<option value="plain_wall">plain_wall 纯白无纹理墙</option></select>
+硬件退化 <select id="deg"><option value="none">无</option>
+<option value="slip">轮滑</option><option value="odom">里程计漂移</option>
+<option value="drop">掉帧</option><option value="delay">执行器延迟</option>
+<option value="accel">加减速斜坡</option><option value="peds">行人动态障碍</option>
+<option value="combo">组合退化</option></select>
+定位噪声 <select id="pose" title="E1b 定位敏感度：策略看到的位姿加高斯噪声 σ">
+<option value="0">无（真值位姿）</option><option value="0.005">σ=0.5cm</option>
+<option value="0.01">σ=1cm（红线）</option><option value="0.02">σ=2cm（断崖）</option>
+<option value="0.05">σ=5cm</option><option value="0.1">σ=10cm</option></select>
+<span id="denslb" style="display:none">人群密度 </span><select id="dens" style="display:none" title="E11b 拥挤度分层：额外行人受控摆在机器人侧向（半径 2m 内人数 ρ）">
+<option value="0">0 人（基线）</option><option value="1">稀疏 1 人</option>
+<option value="2">中 2 人</option><option value="4">密集 4 人</option></select>
+起始种子 <input id="seed" type="number" value="9000" style="width:90px">
+<button onclick="start()">▶ 单回合演示</button>
+回合数 <input id="n" type="number" value="20" style="width:70px">
+重复次数 <input id="rep" type="number" value="1" style="width:60px" title="同一批场景重复几轮，报各轮均值的均值±组间标准差">
+对比基线 <select id="refpol"><option value="">无</option>
+<option value="sweep">sweep 扫描检测</option><option value="oracle">oracle 全知</option>
+<option value="random_target">random_target</option><option value="frontier">frontier 前沿</option></select>
+<button onclick="batch()">📊 批量评测</button>
+<button onclick="stopB()">⏹ 停止</button>
+<div style="margin-top:8px">
+<button onclick="voice()" style="background:#7a3030">🎤 语音指令（录音 4s）</button>
+<input id="saytext" placeholder="或手动输入指令：去白色的箱子旁边 / 去沙发旁边" style="width:300px">
+<button onclick="sendText()">发送</button> <span id="vstate"></span></div>
+</div>
+<div class="row">
+<div class="panel"><b>3D 场景</b> <span class="hint">（拖拽旋转 / 滚轮缩放 / 右键平移）</span><br>
+<canvas id="gl" width="640" height="480"></canvas></div>
+<div><div class="panel"><b>车载相机（第一视角）</b><br><canvas id="cam" width="320" height="240"></canvas><br>
+<div id="status" class="panel" style="margin-top:10px;min-width:320px">等待开始…</div></div></div>
+<div class="panel" style="min-width:280px"><b>批量评测结果</b><div id="batch">—</div></div>
+</div>
+<div class="panel" style="max-width:520px"><b>2D 户型图（墙/门/家具/房间名）</b><br><canvas id="map" width="960" height="720"></canvas></div>
+<script src="/static/three.min.js"></script>
+<script src="/static/OrbitControls.js"></script>
+<script>
+// 注意：不能用裸全局 `status`（撞上浏览器内置 window.status 字符串，
+// innerHTML 赋值被静默忽略 → 状态栏永远显示"等待开始"）
+const statusEl = document.getElementById('status');
+async function post(u,d){const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d||{})});return r.json()}
+// 场景/遮挡场景/人群密度/策略切换 → 让服务端立即重建底图并归位姿态，
+// 2D 平面图与 3D 视图消费同一份 snapshot ⇒ 两块视图**同步**切到新场景，
+// 不必先点 ▶（此前要等回合启动才刷新，看起来"切了没反应"）。
+async function previewScene(){
+ if(scen.value==='tour')scn.value='apartment';   // tour 航点按公寓生成，强制绑定
+ const r=await post('/api/preview',{policy:policy.value,scene:scn.value,
+  scenario:scen.value,dens:+dens.value,seed:+seed.value});
+ if(r&&r.error)vstate.textContent='场景预览: '+r.error;   // busy 时静默忽略
+}
+function syncFollowUI(){const f=policy.value.startsWith('follow');
+ scen.style.display=f?'':'none';scenlb.style.display=f?'':'none';
+ dens.style.display=f?'':'none';denslb.style.display=f?'':'none'}
+policy.onchange=()=>{syncFollowUI();previewScene()};
+scn.onchange=previewScene;scen.onchange=previewScene;dens.onchange=previewScene;
+function start(){post('/api/start',{policy:policy.value,seed:+seed.value,level:level.value||null,scenario:scen.value,scene:scn.value,degrade:deg.value,pose:+pose.value,dens:+dens.value}).then(r=>{if(r&&r.ok)seed.value=+seed.value+1})}
+function batch(){post('/api/batch',{policy:policy.value,n:+n.value,repeats:(+rep.value||1),
+ ref_policy:(refpol.value||null),level:level.value||null,scenario:scen.value,scene:scn.value,
+ degrade:deg.value,pose:+pose.value,dens:+dens.value})}
+function stopB(){post('/api/stop')}
+// ---- 界面显示层中文化（仅显示；喂给模型的仍是训练句式「去green的植物旁边」）----
+// 训练集句式就是中英参杂（voice_server 归一化把颜色词映射成英文，逐字对齐训练集），
+// 模型输入不改 ⇒ 无需重训；这里只把观众看到的英文颜色词显示成中文。
+const ZHC={red:'红色',green:'绿色',blue:'蓝色',yellow:'黄色',white:'白色',
+ black:'黑色',purple:'紫色',orange:'橙色'};
+function zh(s){return s?s.replace(/\b(red|green|blue|yellow|white|black|purple|orange)\b/g,
+ m=>ZHC[m]||m):s}
+// ---- 语音：浏览器录音(16k 单声道 WAV) → /api/voice → 自动用归一化指令启动 SmolVLA 回合 ----
+async function recWav(sec){
+ const stream=await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:true,noiseSuppression:true}});
+ const ac=new AudioContext({sampleRate:16000});await ac.resume();
+ const src=ac.createMediaStreamSource(stream),proc=ac.createScriptProcessor(4096,1,1),buf=[];
+ proc.onaudioprocess=e=>{buf.push(new Float32Array(e.inputBuffer.getChannelData(0)))};
+ src.connect(proc);proc.connect(ac.destination);
+ await new Promise(r=>setTimeout(r,sec*1000));
+ proc.disconnect();src.disconnect();stream.getTracks().forEach(t=>t.stop());ac.close();
+ let n=0;buf.forEach(b=>n+=b.length);const pcm=new Float32Array(n);let o=0;buf.forEach(b=>{pcm.set(b,o);o+=b.length});
+ const sr=ac.sampleRate,len=pcm.length,bw=new ArrayBuffer(44+len*2),v=new DataView(bw);
+ const ws=(i,s)=>{for(let j=0;j<s.length;j++)v.setUint8(i+j,s.charCodeAt(j))};
+ ws(0,'RIFF');v.setUint32(4,36+len*2,true);ws(8,'WAVE');ws(12,'fmt ');v.setUint32(16,16,true);
+ v.setUint16(20,1,true);v.setUint16(22,1,true);v.setUint32(24,sr,true);v.setUint32(28,sr*2,true);
+ v.setUint16(32,2,true);v.setUint16(34,16,true);ws(36,'data');v.setUint32(40,len*2,true);
+ for(let i=0;i<len;i++){const s=Math.max(-1,Math.min(1,pcm[i]));v.setInt16(44+i*2,s<0?s*0x8000:s*0x7FFF,true)}
+ const u8=new Uint8Array(bw);let s2='';for(let i=0;i<u8.length;i+=8192)s2+=String.fromCharCode.apply(null,u8.subarray(i,i+8192));
+ return btoa(s2);}
+async function voice(){
+ vstate.textContent='🎤 录音中(4s)，请说指令…';
+ try{var b64=await recWav(4)}catch(e){vstate.innerHTML='<span class="bad">麦克风不可用：需 localhost 或 HTTPS（SSH 隧道 -L 8020 后访问 http://localhost:8020）。可用手动输入。</span>';return}
+ vstate.textContent='识别中…';const r=await post('/api/voice',{wav_b64:b64});
+ if(r.error){vstate.innerHTML='<span class="bad">'+r.error+'</span>';return}
+ vstate.innerHTML='听到「'+r.text+'」→ 指令「'+zh(r.instruction)+'」 ('+r.latency_ms+'ms'+(r.note&&r.note!=='直通'?'，'+r.note:'')+')'+(r.ok?'':' <span class="bad">不可用</span>');
+ if(r.ok){policy.value='vla';post('/api/start',{policy:'vla',seed:+seed.value,instruction:r.instruction}).then(q=>{if(q&&q.ok)seed.value=+seed.value+1})}}
+function sendText(){const t=saytext.value.trim();if(!t)return;
+ // 文字指令是导航任务：若当前选的是跟随策略，指令会被后端忽略（仍跟着人走）
+ // —— 与语音路径一致，自动切到 SmolVLA 导航策略
+ let p=policy.value;
+ if(p.startsWith('follow')){p='vla';policy.value='vla';scen.style.display='none';
+  vstate.innerHTML='指令「'+t+'」（跟随策略不接收指令，已自动切换 SmolVLA）';}
+ else vstate.textContent='指令「'+t+'」';
+ post('/api/start',{policy:p,seed:+seed.value,instruction:t,scenario:scen.value,scene:scn.value,degrade:deg.value}).then(r=>{if(r&&r.ok)seed.value=+seed.value+1})}
+// ================= 2D 户型图（矢量绘制，像真实房型图） =================
+const FURN={chair:['#cd6b5c','#9c463a'],table:['#b98a5a','#8a6236'],sofa:['#6e87c4','#4a5f96'],
+ bed:['#8fa3d9','#63779f'],shelf:['#8b7355','#644f38'],plant:['#5fa46b','#3f7a4a'],
+ box:['#c9a05a','#96703a'],tv:['#3a3a40','#1e1e26']};
+// 真实颜色优先（= sim.world.COLORS），类别色兜底——与 3D/相机一致
+const OBJC={red:['#c63e37','#8f2b26'],blue:['#3e5cc6','#2a4090'],
+ green:['#469e52','#2f6e39'],yellow:['#dcba3a','#a8862a'],
+ white:['#eeeeee','#b0b0b0'],black:['#34343a','#111114']};
+// 房间地板色（浅色纸面配色，厨房/卫浴瓷砖、卧室暖冷区分）
+const ROOM2D={'客厅':'#f6ecd9','餐厅':'#f6ecd9','厨房':'#e6eef1','卫生间':'#e6eef1',
+ '走廊':'#f0ebdf','主卧':'#f5e7e6','次卧':'#e9eef7','书房':'#eaf1e6'};
+const PAPER='#fbf8f1',WALLF='#45444b',FLL='#7d7163';
+function rr(c,x,y,w,h,r){c.beginPath();c.moveTo(x+r,y);c.arcTo(x+w,y,x+w,y+h,r);c.arcTo(x+w,y+h,x,y+h,r);c.arcTo(x,y+h,x,y,r);c.arcTo(x,y,x+w,y,r);c.closePath()}
+// 统一比例尺：等比例缩放 + 居中留白，避免把户型拉伸变形
+let MS=1,X=x=>0,Y=y=>0;
+function setXf(m){const P=18,bw=Math.max(1e-6,m.b[1]-m.b[0]),bh=Math.max(1e-6,m.b[3]-m.b[2]);
+ MS=Math.min((480-2*P)/bw,(360-2*P)/bh);
+ const ox=(480-bw*MS)/2,oy=(360-bh*MS)/2,b=m.b;
+ X=x=>ox+(x-b[0])*MS;Y=y=>oy+(b[3]-y)*MS;}
+// 机器人记忆栅格（explore）：离屏画「未见过」暗区，版本号变了才重画
+const memCv=document.createElement('canvas');memCv.width=480;memCv.height=360;
+const memCtx=memCv.getContext('2d');let memV=-1;
+function paintMem(m){const bin=atob(m.g),H=m.shape[0],W=m.shape[1],cell=m.res;
+ const cw=cell*MS+0.6,ch=cell*MS+0.6;
+ memCtx.clearRect(0,0,480,360);memCtx.fillStyle='rgba(52,44,34,.46)';
+ for(let r=0;r<H;r++){const py=Y(m.b[2]+(r+1)*cell);
+  for(let k=0;k<W;k++){if(bin.charCodeAt(r*W+k)!==0)continue;   // 0=未知，1=自由，2=占据
+   memCtx.fillRect(X(m.b[0]+k*cell),py,cw,ch)}}}
+// --- 各图层 ---
+function drawRooms(c,m){
+ for(const rm of (m.rooms||[])){const[x0,y0,x1,y1]=rm.rect;
+  c.fillStyle=ROOM2D[rm.name]||'#f2ede2';
+  c.fillRect(X(x0),Y(y1),(x1-x0)*MS,(y1-y0)*MS)}
+ // 1 m 辅助网格（建筑图那种很淡的细线）
+ c.strokeStyle='rgba(120,105,85,.10)';c.lineWidth=.6;c.beginPath();
+ const b=m.b;
+ for(let x=Math.ceil(b[0]);x<=b[1];x++){c.moveTo(X(x),Y(b[3]));c.lineTo(X(x),Y(b[2]))}
+ for(let y=Math.ceil(b[2]);y<=b[3];y++){c.moveTo(X(b[0]),Y(y));c.lineTo(X(b[1]),Y(y))}
+ c.stroke();
+}
+function drawWalls(c,m){
+ const cols=m.wh[0],rows=m.wh[1],cell=m.cell,wl=m.walls,b=m.b,h=cell*MS+0.7;
+ c.fillStyle=WALLF;
+ for(let r=0;r<rows;r++){
+  let k=0;
+  while(k<cols){
+   if(wl.charCodeAt(r*cols+k)!==49){k++;continue}
+   let k2=k;while(k2+1<cols&&wl.charCodeAt(r*cols+k2+1)===49)k2++;
+   const x0=X(b[0]+k*cell),x1=X(b[0]+(k2+1)*cell),y0=Y(b[2]+(r+1)*cell);
+   c.fillRect(x0,y0,x1-x0,h);
+   k=k2+1}}
+}
+function drawDoors(c,m){
+ for(const d of (m.doors||[])){
+  const px0=X(d[0]),px1=X(d[2]),pyb=Y(d[1]),pyt=Y(d[3]);
+  // 先用纸色切出墙上的门洞，再画门扇 + 开启弧线（弧半径封顶，避免大开口糊满房间）
+  c.fillStyle=PAPER;c.fillRect(px0,pyt,px1-px0,pyb-pyt);
+  c.strokeStyle='rgba(176,138,90,.85)';c.lineWidth=1.1;c.beginPath();
+  if(d[2]-d[0]>=d[3]-d[1]){                     // 横墙上的门洞：铰链在左端
+   const r=Math.min(px1-px0,.75*MS);
+   c.moveTo(px0,pyb);c.lineTo(px0,pyb-r);
+   c.arc(px0,pyb,r,-Math.PI/2,0);
+  }else{                                        // 竖墙上的门洞：铰链在上端
+   const r=Math.min(pyb-pyt,.75*MS);
+   c.moveTo(px0,pyt);c.lineTo(px0+r,pyt);
+   c.arc(px0,pyt,r,0,Math.PI/2);
+  }
+  c.stroke()}
+}
+function box(c,x,y,w,h,r,fc){
+ c.globalAlpha=.42;c.fillStyle=fc[0];rr(c,x,y,w,h,r);c.fill();
+ c.globalAlpha=1;c.strokeStyle=FLL;c.lineWidth=1.1;rr(c,x,y,w,h,r);c.stroke();}
+function drawFurn(c,m){
+ for(const o of (m.objs||[])){
+  const fc=(o.color&&OBJC[o.color])||FURN[o.cls];if(!fc)continue;
+  const w=2*o.half*MS,h=w,x=X(o.xy[0])-w/2,y=Y(o.xy[1])-h/2;
+  c.strokeStyle=FLL;c.lineWidth=1.1;
+  if(o.cls==='plant'){                         // 花盆 + 植冠
+   const r=w*.46;
+   c.globalAlpha=.42;c.fillStyle=fc[0];c.beginPath();c.arc(x+w/2,y+h/2,r,0,Math.PI*2);c.fill();
+   c.globalAlpha=1;c.beginPath();c.arc(x+w/2,y+h/2,r,0,Math.PI*2);c.stroke();
+   c.lineWidth=.9;c.beginPath();
+   c.moveTo(x+w/2,y+h/2-r*.75);c.lineTo(x+w/2,y+h/2+r*.75);
+   c.moveTo(x+w/2-r*.75,y+h/2);c.lineTo(x+w/2+r*.75,y+h/2);c.stroke();
+  }else if(o.cls==='bed'){                     // 床架 + 被子 + 枕头
+   box(c,x,y,w,h,2,fc);
+   const pw=w*.8,ph=h*.2;
+   c.globalAlpha=.55;c.fillStyle='#fff';c.fillRect(x+w*.1,y+h*.08,pw,ph);
+   c.globalAlpha=1;c.lineWidth=.9;c.strokeRect(x+w*.1,y+h*.08,pw,ph);
+   c.beginPath();c.moveTo(x+w*.07,y+h*.38);c.lineTo(x+w*.93,y+h*.38);c.stroke();
+  }else if(o.cls==='sofa'){                    // 靠背 + 坐垫分缝 + 扶手
+   box(c,x,y,w,h,2.5,fc);
+   c.lineWidth=.9;c.strokeRect(x+w*.09,y+h*.09,w*.82,h*.24);
+   c.beginPath();c.moveTo(x+w*.5,y+h*.33);c.lineTo(x+w*.5,y+h*.9);c.stroke();
+   c.strokeRect(x+w*.04,y+h*.38,w*.09,h*.5);c.strokeRect(x+w*.87,y+h*.38,w*.09,h*.5);
+  }else if(o.cls==='table'){                   // 桌面 + 内框
+   box(c,x,y,w,h,2,fc);
+   c.lineWidth=.9;c.strokeRect(x+w*.12,y+h*.12,w*.76,h*.76);
+  }else if(o.cls==='chair'){                   // 座面 + 靠背
+   box(c,x,y,w,h,2,fc);
+   c.lineWidth=.9;c.strokeRect(x+w*.1,y+h*.08,w*.8,h*.24);
+  }else if(o.cls==='shelf'){                   // 柜体 + 隔板线
+   box(c,x,y,w,h,1,fc);
+   c.lineWidth=.8;c.beginPath();
+   for(let i=1;i<4;i++){const yy=y+h*i/4;c.moveTo(x+w*.08,yy);c.lineTo(x+w*.92,yy)}
+   c.stroke();
+  }else if(o.cls==='box'){                     // 纸箱：对角封箱带
+   box(c,x,y,w,h,1,fc);
+   c.lineWidth=.8;c.beginPath();c.moveTo(x,y);c.lineTo(x+w,y+h);
+   c.moveTo(x+w,y);c.lineTo(x,y+h);c.stroke();
+  }else if(o.cls==='tv'){                      // 屏幕 + 底座
+   box(c,x,y,w,h,1,fc);
+   c.lineWidth=.9;c.beginPath();c.moveTo(x+w*.2,y+h);c.lineTo(x+w*.8,y+h);c.stroke();
+  }else box(c,x,y,w,h,2,fc);
+ }
+}
+function drawRoomLabels(c,m){
+ c.textAlign='center';c.textBaseline='middle';
+ for(const rm of (m.rooms||[])){
+  if(!rm.name)continue;
+  const[x0,y0,x1,y1]=rm.rect,cx=X((x0+x1)/2),cy=Y((y0+y1)/2);
+  const a=Math.abs((x1-x0)*(y1-y0)).toFixed(1)+' m²';
+  // 文字底片：压在床/桌上也能读清，像真实户型图的房间标注
+  c.font='bold 12px system-ui,"Microsoft YaHei",sans-serif';
+  const w1=c.measureText(rm.name).width;
+  c.font='10px system-ui,sans-serif';
+  const w2=c.measureText(a).width;
+  const bw=Math.max(w1,w2)+13,bh=30;
+  c.fillStyle='rgba(251,248,241,.84)';rr(c,cx-bw/2,cy-bh/2,bw,bh,4);c.fill();
+  c.font='bold 12px system-ui,"Microsoft YaHei",sans-serif';
+  c.fillStyle='#4a443c';c.fillText(rm.name,cx,cy-6);
+  c.font='10px system-ui,sans-serif';
+  c.fillStyle='#8a7f70';c.fillText(a,cx,cy+8);
+ }
+ c.textAlign='start';c.textBaseline='alphabetic';
+}
+function drawScale(c){
+ let L=1;for(const v of[1,2,5,10])if(v*MS<=100)L=v;
+ const px=L*MS,x=480-20-px,y=352;
+ c.strokeStyle='#6b6154';c.lineWidth=1.3;c.beginPath();
+ c.moveTo(x,y);c.lineTo(x+px,y);
+ c.moveTo(x,y-3.5);c.lineTo(x,y+3.5);c.moveTo(x+px,y-3.5);c.lineTo(x+px,y+3.5);c.stroke();
+ c.fillStyle='#6b6154';c.font='10px system-ui,sans-serif';
+ c.textAlign='right';c.textBaseline='middle';c.fillText(L+' m',x-6,y);
+ c.textAlign='start';c.textBaseline='alphabetic';
+}
+function drawNorth(c){
+ const x=430,y=44;
+ c.strokeStyle='#8a7f70';c.lineWidth=1.2;
+ c.beginPath();c.moveTo(x,y+8);c.lineTo(x,y-8);c.stroke();
+ c.fillStyle='#8a7f70';c.beginPath();c.moveTo(x,y-14);c.lineTo(x-5,y-2);c.lineTo(x+5,y-2);c.closePath();c.fill();
+ c.font='bold 10px system-ui,sans-serif';c.textAlign='center';c.fillText('N',x,y+20);c.textAlign='start';
+}
+function drawCaption(c,m){
+ c.fillStyle='#9a9083';c.font='9px system-ui,sans-serif';c.textAlign='left';
+ c.fillText('户型 '+(m.b[1]-m.b[0]).toFixed(1)+' × '+(m.b[3]-m.b[2]).toFixed(1)+' m',
+  X(m.b[0])-4,356);
+}
+function draw(s){const c=map.getContext('2d');
+ c.setTransform(2,0,0,2,0,0);
+ c.fillStyle=PAPER;c.fillRect(0,0,480,360);
+ if(!s.map_meta)return;const m=s.map_meta;
+ setXf(m);
+ // 图纸外框（带一点留白的装订线）
+ const b=m.b,fx=X(b[0])-5,fy=Y(b[3])-5,fw=(b[1]-b[0])*MS+10,fh=(b[3]-b[2])*MS+10;
+ c.strokeStyle='#ddd5c7';c.lineWidth=1;c.strokeRect(fx,fy,fw,fh);
+ drawRooms(c,m);drawWalls(c,m);drawDoors(c,m);drawFurn(c,m);drawRoomLabels(c,m);
+ // ---- 机器人「记忆地图」叠加（explore 策略）：未走过的区域压暗 = 还没见过，
+ // 巡屋过程中暗区逐渐点亮；瞥见地标后画黄色靶心。只在版本号变化时重画。
+ if(s.mem&&s.mem.g){if(memV!==s.mem.v){memV=s.mem.v;paintMem(s.mem)}
+  c.drawImage(memCv,0,0,480,360);
+  if(s.mem.lm){const mx=X(s.mem.lm[0]),my=Y(s.mem.lm[1]);
+   c.strokeStyle='#e0a51e';c.lineWidth=2.2;c.beginPath();c.arc(mx,my,7,0,Math.PI*2);c.stroke();
+   c.fillStyle='#e0a51e';c.beginPath();c.arc(mx,my,2.5,0,Math.PI*2);c.fill()}}
+ // 激光（浅色底上降透明度，避免糊成一片）
+ c.strokeStyle='rgba(240,140,45,.45)';c.lineWidth=.7;
+ for(const p of s.lidar){c.beginPath();c.moveTo(X(s.pose[0]),Y(s.pose[1]));c.lineTo(X(p[0]),Y(p[1]));c.stroke()}
+ // 轨迹：白色描边 + 蓝色主线
+ if(s.traj.length>1){
+  c.lineJoin='round';c.lineCap='round';
+  c.strokeStyle='rgba(255,255,255,.9)';c.lineWidth=3.6;c.beginPath();
+  s.traj.forEach((p,i)=>i?c.lineTo(X(p[0]),Y(p[1])):c.moveTo(X(p[0]),Y(p[1])));c.stroke();
+  c.strokeStyle='#2b6fd6';c.lineWidth=2;c.beginPath();
+  s.traj.forEach((p,i)=>i?c.lineTo(X(p[0]),Y(p[1])):c.moveTo(X(p[0]),Y(p[1])));c.stroke();
+  c.lineCap='butt'}
+ // 目标点 / 被跟随者
+ if(s.goal){const gx=X(s.goal[0]),gy=Y(s.goal[1]);
+  c.strokeStyle='#1f9d4d';c.lineWidth=1.6;c.beginPath();c.arc(gx,gy,7,0,Math.PI*2);c.stroke();
+  c.fillStyle='rgba(35,185,90,.9)';c.beginPath();c.arc(gx,gy,3.2,0,Math.PI*2);c.fill()}
+ if(s.target){const tx=X(s.target[0]),ty=Y(s.target[1]);
+  c.fillStyle='#e0492f';c.strokeStyle='#fff';c.lineWidth=1.4;
+  c.beginPath();c.arc(tx,ty,6.5,0,Math.PI*2);c.fill();c.stroke()}
+ // 机器人（白描边箭头，浅底上也清楚）
+ if(s.pose){c.save();c.translate(X(s.pose[0]),Y(s.pose[1]));c.rotate(-s.pose[2]);
+  c.fillStyle='#1e56b3';c.strokeStyle='#fff';c.lineWidth=1.4;
+  c.beginPath();c.moveTo(10,0);c.lineTo(-6,-6);c.lineTo(-3,0);c.lineTo(-6,6);c.closePath();
+  c.fill();c.stroke();c.restore()}
+ drawScale(c);drawCaption(c,m);drawNorth(c);
+}
+// ================= 3D 场景（three.js，可拖拽旋转） =================
+const FURN3D={chair:0xcd6b5c,table:0xb98a5a,sofa:0x6e87c4,bed:0x8fa3d9,
+ shelf:0x8b7355,plant:0x5fa46b,box:0xc9a05a,tv:0x3a3a40};
+// 物体真实颜色（= sim.world.COLORS，2D 平面图与车载相机用同一套）。
+// 3D 此前按类别上色（FURN3D）→ 白植物被画成绿的，与指令「去white的植物旁边」
+// 看起来矛盾；现改为颜色优先、类别兜底，三处视图一致。
+const OBJ3D={red:0xc63e37,blue:0x3e5cc6,green:0x469e52,yellow:0xdcba3a,
+ white:0xeeeeee,black:0x34343a};
+const ROOM3D={'客厅':0x9a8760,'餐厅':0x9a8760,'厨房':0x6e8290,'卫生间':0x6e8290,
+ '走廊':0x84847a,'主卧':0x8f7a78,'次卧':0x78869a,'书房':0x7a8a78};
+let renderer,cam3,scene3,controls,statG,dyn={},statKey='',camR,camFP;
+// 车载相机 = 同一 three.js 场景的第一视角：水平 FOV 64.5°、离地 0.35 m
+// （与 sim.sensors 里机器人相机的参数一致），这样拍到的家具造型/颜色
+// 和 3D 视图完全同源，不再是后端软件渲染画出来的方盒。
+const CAM_HFOV=64.5,CAM_H=0.35,CAM_W=320,CAM_HH=240;
+function init3d(){
+ renderer=new THREE.WebGLRenderer({antialias:true,canvas:gl});
+ renderer.setSize(640,480,false);renderer.setPixelRatio(window.devicePixelRatio);
+ renderer.shadowMap.enabled=true;renderer.shadowMap.type=THREE.PCFSoftShadowMap;
+ scene3=new THREE.Scene();scene3.background=new THREE.Color(0x14171c);
+ scene3.fog=new THREE.Fog(0x14171c,25,60);
+ cam3=new THREE.PerspectiveCamera(50,640/480,0.05,120);
+ scene3.add(new THREE.AmbientLight(0xffffff,.55));
+ const dir=new THREE.DirectionalLight(0xfff1dd,.95);
+ dir.position.set(6,14,5);dir.castShadow=true;
+ dir.shadow.camera.left=-9;dir.shadow.camera.right=9;
+ dir.shadow.camera.top=9;dir.shadow.camera.bottom=-9;
+ dir.shadow.camera.far=45;dir.shadow.mapSize.set(2048,2048);
+ scene3.add(dir);
+ scene3.add(new THREE.HemisphereLight(0x8899bb,0x332f28,.35));
+ controls=new THREE.OrbitControls(cam3,gl);
+ controls.enableDamping=true;controls.dampingFactor=.08;controls.maxPolarAngle=Math.PI/2.05;
+ // 第一视角相机渲染到「车载相机」画布：竖直 FOV 由水平 64.5° 按 4:3 画幅换算
+ camFP=new THREE.PerspectiveCamera(2*Math.atan(Math.tan(CAM_HFOV*Math.PI/360)*CAM_HH/CAM_W)
+  *180/Math.PI,CAM_W/CAM_HH,.05,60);
+ camR=new THREE.WebGLRenderer({antialias:true,canvas:document.getElementById('cam')});
+ camR.setSize(CAM_W,CAM_HH,false);camR.setPixelRatio(window.devicePixelRatio);
+ camR.shadowMap.enabled=true;camR.shadowMap.type=THREE.PCFSoftShadowMap;}
+// 家具造型：按类别拼出可辨识的样子（植物=花盆+植株、椅子=座+靠背+四条腿…），
+// 主体用物体真实颜色（与 2D/车载相机/指令一致），不再是一排无差别方块
+const shade=(hex,f)=>{const c=new THREE.Color(hex);c.multiplyScalar(f);return c.getHex()};
+function furn(o,col){
+ const h=Math.max(.06,o.h||.5),hw=o.half,g=new THREE.Group();
+ const M=c=>new THREE.MeshStandardMaterial({color:c,roughness:.8});
+ const leg=M(0x4a3a2a),cbody=M(col);
+ const bx=(w,hh,d,m,x,y,z)=>{const b=new THREE.Mesh(new THREE.BoxGeometry(w,hh,d),m);
+  b.position.set(x,y,z);b.castShadow=b.receiveShadow=true;return b};
+ const legs=(r,hh,m)=>{const a=[];
+  for(const sx of[-1,1])for(const sz of[-1,1])
+   a.push(bx(r,hh,r,m,sx*(hw-.05),hh/2,sz*(hw-.05)));return a};
+ if(o.cls==='plant'){                       // 花盆 + 植株（球状植冠，颜色=物体色）
+  const pot=new THREE.Mesh(new THREE.CylinderGeometry(hw*.5,hw*.78,h*.38,14),M(0x9a5f3c));
+  pot.position.y=h*.19;pot.castShadow=true;g.add(pot);
+  const f1=new THREE.Mesh(new THREE.SphereGeometry(hw*.9,14,11),cbody);
+  f1.position.y=h*.38+hw*.7;f1.castShadow=true;g.add(f1);
+  const f2=new THREE.Mesh(new THREE.SphereGeometry(hw*.55,12,9),cbody);
+  f2.position.set(hw*.45,h*.38+hw*1.25,-hw*.2);f2.castShadow=true;g.add(f2);
+ }else if(o.cls==='chair'){                 // 座面 + 靠背 + 四腿
+  g.add(bx(2*hw,h*.1,2*hw,cbody,0,h*.5,0));
+  g.add(bx(2*hw,h*.5,.05,cbody,0,h*.75,-hw+.03));
+  legs(.04,h*.5,leg).forEach(x=>g.add(x));
+ }else if(o.cls==='table'){                 // 桌面板 + 四腿
+  g.add(bx(2*hw,h*.09,2*hw,cbody,0,h*.955,0));
+  legs(.05,h*.91,leg).forEach(x=>{x.position.y=h*.455;g.add(x)});
+ }else if(o.cls==='sofa'){                  // 坐垫 + 靠背 + 两侧扶手
+  g.add(bx(2*hw,h*.4,2*hw,cbody,0,h*.2,0));
+  g.add(bx(2*hw,h*.45,.16,cbody,0,h*.625,-hw+.08));
+  g.add(bx(.16,h*.18,2*hw,cbody,-hw+.08,h*.49,0));
+  g.add(bx(.16,h*.18,2*hw,cbody,hw-.08,h*.49,0));
+ }else if(o.cls==='bed'){                   // 床架 + 床头板 + 床单 + 枕头
+  g.add(bx(2*hw,h*.35,2*hw,cbody,0,h*.175,0));
+  g.add(bx(2*hw,h*.5,.09,cbody,0,h*.55,-hw+.045));
+  g.add(bx(2*hw*.92,h*.14,2*hw*.6,M(shade(col,.6)),0,h*.39,0));
+  g.add(bx(2*hw*.55,h*.1,2*hw*.3,M(0xffffff),0,h*.46,-hw+hw*.45));
+ }else if(o.cls==='shelf'){                 // 柜体 + 两道隔板线
+  g.add(bx(2*hw,h,2*hw,cbody,0,h/2,0));
+  for(const f of[.34,.66])g.add(bx(2*hw+.05,.04,2*hw+.05,leg,0,h*f,0));
+ }else if(o.cls==='box'){                   // 箱体 + 箱盖
+  g.add(bx(2*hw,h*.76,2*hw,cbody,0,h*.38,0));
+  g.add(bx(2*hw+.05,h*.2,2*hw+.05,M(shade(col,.78)),0,h*.86,0));
+ }else if(o.cls==='tv'){                    // 边框 + 屏幕 + 底座
+  g.add(bx(2*hw,h*.66,.05,cbody,0,h*.55,0));
+  g.add(bx(2*hw*.86,h*.54,.015,M(0x141418),0,h*.55,.033));
+  g.add(bx(2*hw*.6,.05,.22,M(0x33313a),0,h*.025,0));
+ }else g.add(bx(2*hw,h,2*hw,cbody,0,h/2,0));
+ g.position.set(o.xy[0],0,o.xy[1]);return g}
+function buildStatic(m){
+ if(statG){scene3.remove(statG);
+  statG.traverse(o=>{if(o.geometry)o.geometry.dispose();if(o.material&&o.material.dispose)o.material.dispose()})}
+ statG=new THREE.Group();
+ const cx=(m.b[0]+m.b[1])/2,cz=(m.b[2]+m.b[3])/2;
+ controls.target.set(cx,0,cz);cam3.position.set(cx+7,13,cz+13);
+ // 地面（基底 + 各房间地板色）
+ const base=new THREE.Mesh(new THREE.PlaneGeometry(m.b[1]-m.b[0]+2,m.b[3]-m.b[2]+2),
+  new THREE.MeshStandardMaterial({color:0x3a3630,roughness:.95}));
+ base.rotation.x=-Math.PI/2;base.position.set(cx,0,cz);base.receiveShadow=true;statG.add(base);
+ for(const rm of (m.rooms||[])){const[gx0,gy0,gx1,gy1]=rm.rect;
+  const f=new THREE.Mesh(new THREE.PlaneGeometry(gx1-gx0,gy1-gy0),
+   new THREE.MeshStandardMaterial({color:ROOM3D[rm.name]||0x777770,roughness:.9}));
+  f.rotation.x=-Math.PI/2;
+  f.position.set((gx0+gx1)/2,.02,(gy0+gy1)/2);f.receiveShadow=true;statG.add(f)}
+ // 家具（按类别拼造型，主体用物体真实颜色）
+ for(const o of (m.objs||[])){
+  const col=(o.color&&OBJ3D[o.color])||FURN3D[o.cls]||0x999999;
+  statG.add(furn(o,col))}
+ // 墙体（InstancedMesh：0.1m 格 × 1.8m 高）
+ const W=m.wh[0],cell=m.cell,cells=[];
+ for(let i=0;i<m.walls.length;i++)if(m.walls[i]==='1')cells.push(i);
+ const wg=new THREE.BoxGeometry(cell,1.8,cell);
+ const wm=new THREE.MeshStandardMaterial({color:0x8d949e,roughness:.85});
+ const inst=new THREE.InstancedMesh(wg,wm,cells.length);
+ const m4=new THREE.Matrix4();
+ cells.forEach((idx,i)=>{const r=(idx/W)|0,c=idx%W;
+  m4.setPosition(m.b[0]+(c+.5)*cell,.9,m.b[2]+(r+.5)*cell);inst.setMatrixAt(i,m4)});
+ inst.castShadow=true;inst.receiveShadow=true;statG.add(inst);
+ // 目标（绿球）与被跟随者（红衣人形）
+ dyn.goal=new THREE.Mesh(new THREE.SphereGeometry(.13,16,12),
+  new THREE.MeshStandardMaterial({color:0x22cc44,emissive:0x116622}));
+ dyn.goal.visible=false;statG.add(dyn.goal);
+ dyn.person=new THREE.Group();
+ const body=new THREE.Mesh(new THREE.CylinderGeometry(.16,.2,1.1,12),
+  new THREE.MeshStandardMaterial({color:0xcc3327,roughness:.7}));
+ body.position.y=.62;body.castShadow=true;dyn.person.add(body);
+ const head=new THREE.Mesh(new THREE.SphereGeometry(.12,12,10),
+  new THREE.MeshStandardMaterial({color:0xe8c39a}));
+ head.position.y=1.32;dyn.person.add(head);
+ dyn.person.visible=false;statG.add(dyn.person);
+ // 轨迹线 / 激光线
+ dyn.traj=new THREE.Line(new THREE.BufferGeometry(),
+  new THREE.LineBasicMaterial({color:0x44aaff}));
+ dyn.traj.frustumCulled=false;statG.add(dyn.traj);
+ dyn.lidar=new THREE.LineSegments(new THREE.BufferGeometry(),
+  new THREE.LineBasicMaterial({color:0xf9933b,transparent:true,opacity:.35}));
+ dyn.lidar.frustumCulled=false;statG.add(dyn.lidar);
+ // 机器人（车体 + 朝向箭头）
+ dyn.robot=new THREE.Group();
+ const rb=new THREE.Mesh(new THREE.BoxGeometry(.30,.12,.26),
+  new THREE.MeshStandardMaterial({color:0x2f6fb0,roughness:.6}));
+ rb.position.y=.10;rb.castShadow=true;dyn.robot.add(rb);
+ const arrow=new THREE.Mesh(new THREE.ConeGeometry(.07,.18,10),
+  new THREE.MeshStandardMaterial({color:0x66ccff}));
+ arrow.rotation.x=Math.PI/2;arrow.rotation.z=Math.PI/2;
+ arrow.position.set(.18,.16,0);dyn.robot.add(arrow);
+ statG.add(dyn.robot);
+ scene3.add(statG);}
+function updateDyn(s){
+ if(!dyn.robot)return;
+ if(s.goal){dyn.goal.visible=true;dyn.goal.position.set(s.goal[0],.15,s.goal[1])}else dyn.goal.visible=false;
+ if(s.target){dyn.person.visible=true;dyn.person.position.set(s.target[0],0,s.target[1])}else dyn.person.visible=false;
+ // 机器人的位置/朝向由 anim 循环按平滑位姿每帧写（见 smoothPose），这里不设，
+ // 否则 10 Hz 的快照会把 60 Hz 的平滑结果来回打断
+ if(s.traj&&s.traj.length)dyn.traj.geometry.setFromPoints(s.traj.map(p=>new THREE.Vector3(p[0],.06,p[1])));
+ const o=sp||s.pose,lp=[];for(const p of s.lidar){lp.push(new THREE.Vector3(o[0],.25,o[1]),
+  new THREE.Vector3(p[0],.25,p[1]))}
+ dyn.lidar.geometry.setFromPoints(lp);}
+init3d();
+// 快照 10 Hz、渲染 60 Hz：位姿做指数平滑，机器人/相机/激光一起顺滑移动
+let latestPose=null,sp=null;
+function smoothPose(){const p=latestPose;if(!p)return null;
+ if(!sp||Math.hypot(p[0]-sp[0],p[1]-sp[1])>2)sp=[p[0],p[1],p[2]];   // 切场景等大跳变直接归位
+ else{const k=.25,d=((p[2]-sp[2]+Math.PI)%(2*Math.PI)+2*Math.PI)%(2*Math.PI)-Math.PI;
+  sp[0]+=(p[0]-sp[0])*k;sp[1]+=(p[1]-sp[1])*k;sp[2]+=d*k}
+ return sp}
+(function anim(){requestAnimationFrame(anim);controls.update();
+ const p=smoothPose();
+ if(p&&dyn.robot){dyn.robot.position.set(p[0],0,p[1]);dyn.robot.rotation.y=-p[2];
+  camFP.position.set(p[0],CAM_H,p[1]);              // 车载相机 = 车头朝向前视
+  camFP.lookAt(p[0]+Math.cos(p[2]),CAM_H,p[1]+Math.sin(p[2]));
+  camR.render(scene3,camFP)}
+ renderer.render(scene3,cam3)})();
+// ================= 主循环 =================
+// 户型元数据只在切换场景时下发（约 12 KB，见后端 Sim.frame），这里缓存合并进快照，
+// 下游绘图代码不用改；主通道改为服务端 SSE 推流，不再每帧付一次公网 RTT。
+let lastMM=null,lastMV=-1,es=null,esOn=false,lastMsg=0;
+function render(s){
+ if(s.map_meta){lastMM=s.map_meta;lastMV=s.map_v}
+ s.map_meta=lastMM;
+ if(s.pose)latestPose=s.pose;        // 动画循环据此驱动机器人 + 车载相机
+ draw(s);
+ const m=s.map_meta;
+ if(m&&m.walls){const key=m.name+'|'+m.b.join(',')+'|'+m.walls.length+'|'+(m.objs||[]).length;
+  if(key!==statKey){statKey=key;buildStatic(m)}
+  updateDyn(s)}
+ const r=s.result;let st='指令: '+(zh(s.instruction)||'—')+'<br>层级: '+s.level+' | 步数: '+s.step+
+  ' | 策略: '+s.policy+' | seed: '+s.seed+
+  (+pose.value>0?' | <span class="bad">定位噪声 σ='+pose.value+' m</span>':'');
+ if(s.mode==='running'&&s.live&&s.live.phase==='explore')st+='<br>阶段: <span class="big" style="color:#fc6">'+
+  (s.live.phase==='explore'?'① 巡屋建图中…':'② 记忆寻物中…')+'</span> | 已点亮地图 '+
+  (100*s.live.cover).toFixed(0)+'% | 地标: '+
+  (s.live.seen?'<span class="ok">已记住</span>':'<span class="bad">未瞥见</span>')+
+  (s.live.dist!=null?' | 距地标 '+s.live.dist.toFixed(2)+' m':'')+
+  (s.live.optim?' | <span style="color:#fc6">记忆缺区·乐观补全</span>':'');
+ else if(s.mode==='running'&&s.live)st+='<br>跟随实时: 距离 '+s.live.dist.toFixed(2)+' m | '+
+  (s.live.visible?'<span class="ok">可见</span>':'<span class="bad">丢失(扫描中)</span>')+' | '+
+  (s.live.in_band?'<span class="ok">带内 [0.9, 2.6]</span>':'<span class="bad">带外</span>')+
+  (s.live.rho!=null?' | 拥挤度 ρ(2m): '+s.live.rho+' 人':'')+
+  (s.live.stage?'<br>阶段机: <span class="big" style="color:#fc6">'+s.live.stage+'</span>':'');
+ if(s.mode==='running')st+='<br><span class="big" style="color:#4af">▶ 运行中…</span>';
+ if(s.mode==='stopped')st+='<br><span class="big" style="color:#fc6">⏹ 已手动停止（第 '+s.step+' 步）</span>';
+ if(s.mode==='done'&&r&&r.follow)st+='<br>'+(r.success?'<span class="ok big">✔ 跟随完成</span>':
+ '<span class="bad big">✘ 跟随欠佳</span>')+'<br>TCR: '+r.TCR+'% | 距离误差: '+r.err_mean+
+ '±'+r.err_std+' m<br>可见率: '+r.vis_rate+'% | 丢失: '+r.n_loss+' 次 | 恢复中位: '+
+ r.rec_ms_median+' ms | 碰撞: '+r.n_collide+
+ (r.rho!=null?' | 拥挤度 ρ: '+r.rho+' 人':'');
+ if(s.mode==='done'&&r&&r.stage_time)st+='<br>阶段停留: '+
+  Object.entries(r.stage_time).map(([k,v])=>k+' '+v+'s').join(' | ')+
+  '<br>三级脱困: L1 '+r.unstick.L1+' 次 | L2 '+r.unstick.L2+' 次 | L3 '+
+  r.unstick.L3+' 次 (重规划中位 '+r.replan_ms+' ms)';
+ if(s.mode==='done'&&r&&!r.follow)st+='<br>'+(r.success?'<span class="ok big">✔ 成功到达</span>':
+ '<span class="bad big">✘ 未成功</span>')+'<br>剩余距离 NE: '+r.ne.toFixed(2)+
+ ' m | SPL: '+r.spl.toFixed(3)+' | 全程最小距离: '+r.min_dist.toFixed(2)+' m';
+ if(s.mode==='done'&&r&&r.phase)st+='<br>巡屋: 覆盖 '+(100*r.cover).toFixed(0)+'%（'+
+  r.explore_steps+' 步）| '+
+  (r.seen?('第 <span class="ok">'+r.seen_step+'</span> 步瞥见并记住地标'):'<span class="bad">始终未瞥见目标</span>')+
+  (r.optim?' | <span style="color:#fc6">记忆缺区·乐观补全</span>':'');
+ if(s.mode==='done'&&r&&r.ctrl_ms_mean!=null)st+='<br>控制耗时: '+r.ctrl_ms_mean+
+ ' ms/步 (p95 '+(r.ctrl_ms_p95!=null?r.ctrl_ms_p95:'—')+' ms)'+
+ (r.infer_ms_mean!=null?' | VLA 推理: '+r.infer_ms_mean+' ms (p95 '+
+ (r.infer_p95!=null?r.infer_p95:'—')+' ms, 请求 '+r.infer_reqs+
+ ' 次, 失败 '+r.infer_fails+' 次, chunk 复用 '+(100*r.chunk_reuse).toFixed(0)+'%, '+
+ r.hz+' Hz)':'');
+ if(s.mode==='error')st+='<br><span class="bad">错误: '+(r&&r.error||'')+'</span>';
+ statusEl.innerHTML=st;
+ let b='—';if(s.batch.n)b='进度 '+s.batch.done+'/'+(s.batch.total||s.batch.n)+
+ ' | 重复 '+(s.batch.repeats||1)+' 轮<br>SR '+s.batch.sr+'% | SPL '+
+ s.batch.spl+' | NE '+s.batch.ne+' m'+
+ (s.mode==='stopped'?'<br><span style="color:#fc6">⏹ 批量评测已手动停止（部分结果仍可参考）</span>':'');
+ const bs=s.batch.stats;
+ if(bs){b+='<table><tr><th>场景</th><th>n</th><th>SR [95%CI]</th><th>轮均值±σ</th><th>SPL</th><th>NE</th>'+
+ (bs.pooled&&bs.pooled.TCR!=null?'<th>TCR</th>':'')+'</tr>';
+  const rowsHtml=[];
+  for(const sc in bs.per_scene){const p=bs.per_scene[sc];
+   rowsHtml.push('<tr><td>'+sc+'</td><td>'+p.n+'</td><td>'+p.SR+'% ['+p.SR_lo+', '+p.SR_hi+']</td><td>'+
+   (p.rep_SR_mean!=null?(p.rep_SR_mean+'% ± '+p.rep_SR_std):'—')+'</td><td>'+
+   (p.SPL!=null?p.SPL:'—')+'</td><td>'+(p.NE!=null?p.NE:'—')+'</td>'+
+   (p.TCR!=null?'<td>'+p.TCR+'%</td>':'')+'</tr>');}
+  if(bs.pooled&&bs.pooled.n){const p=bs.pooled;
+   rowsHtml.push('<tr><td><b>合并</b></td><td>'+p.n+'</td><td>'+p.SR+'% ['+p.SR_lo+', '+p.SR_hi+']</td><td>—</td><td>'+
+   (p.SPL!=null?p.SPL:'—')+'</td><td>'+(p.NE!=null?p.NE:'—')+'</td>'+
+   (p.TCR!=null?'<td>'+p.TCR+'%</td>':'')+'</tr>');}
+  b+=rowsHtml.join('')+'</table>';
+  if(bs.mcnemar)b+='<div>配对 McNemar（vs '+s.batch.ref+'）: p='+bs.mcnemar.p+
+   '（不一致 '+bs.mcnemar.n10+' vs '+bs.mcnemar.n01+'，n='+bs.mcnemar.n+'）</div>';
+  if(bs.ref)b+='<div>参考基线 '+s.batch.ref+'：SR '+bs.ref.SR+'% ['+bs.ref.SR_lo+', '+bs.ref.SR_hi+']</div>';}
+ if(s.batch.rows&&s.batch.rows.length){b+='<table><tr><th>#</th><th>指令</th><th>SR</th><th>NE</th></tr>'+
+ s.batch.rows.map((r,i)=>'<tr><td>'+(s.batch.done-s.batch.rows.length+i+1)+'</td><td>'+zh(r.instruction||'—')+
+ '</td><td>'+(r.success?'✔':'✘')+'</td><td>'+(r.ne!=null?r.ne.toFixed(2):('TCR '+(r.TCR!=null?r.TCR+'%':'—')))+'</td></tr>').join('')+'</table>'}
+ batch.innerHTML=b}
+// 兜底轮询：SSE 断开（隧道抖动 / 被中间代理缓冲）时自动接管，演示不中断
+async function loop(){
+ if(esOn){setTimeout(loop,300);return}
+ try{render(await(await fetch('/api/state?mv='+lastMV)).json())}catch(e){}
+ setTimeout(loop,120)}
+function connect(){try{es&&es.close()}catch(e){}
+ es=new EventSource('/api/stream');lastMsg=Date.now();
+ es.onopen=()=>{esOn=true};                                   // 建连成功 → 停轮询
+ es.onmessage=e=>{lastMsg=Date.now();try{render(JSON.parse(e.data))}catch(err){}};
+ es.onerror=()=>{esOn=false}}                                 // 断流 → 立即退回轮询
+connect();
+// 看门狗：连上了却 3 s 收不到帧（被代理缓冲）→ 重连；完全不通 → 每 20 s 再试
+setInterval(()=>{const now=Date.now();
+ if(esOn&&now-lastMsg>3000){esOn=false;connect()}
+ else if(!esOn&&now-lastMsg>20000)connect()},1000);
+loop();
+</script></body></html>

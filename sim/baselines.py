@@ -956,6 +956,292 @@ class ExploreMemoryPolicy:
         return self._steer(obs, p, tgt)
 
 
+class HierRulePolicy(ExploreMemoryPolicy):
+    """规则版「分层 VLA」对照基线：指令解析 → 语义记忆定位 → 记忆测地执行。
+
+    与 `explore`（ExploreMemoryPolicy）共用全部建图/执行组件（前沿探索、
+    进屋环视、记忆栅格 BFS 路径跟随、卡死脱困），唯一差别是**换段条件**：
+    explore 用「瞥见真值目标」（`_glance` 读 `env.task["goal"]`，特权演示用），
+    本策略完全零特权，对应分层 VLA 的三段结构：
+
+    1. **子目标解码**：`parse_instruction` 只读指令文本 → (颜色, 类别, 参考物, 方位)；
+    2. **定位**：探索途中周期性跑感知检测，把实例（颜色/类别/世界坐标）
+       永久累积进 `SemanticMap`（里程计 + 相机方位/单目测距，无真值）；
+       记忆中查询到符合指令描述的实例 → 记为地标、转入记忆导航
+       （= 「子目标层」的规则版；VLM 版只是把这一步换成多模态模型判定，
+       执行层不变）；
+    3. **执行**：父类阶段二（记忆栅格 BFS 测地路径 + 前视跟随），
+       末段（≤`refine_dist`）用当前帧检测持续修正地标 —— 单目测距近场才准，
+       记忆位置可能差 0.3~0.5 m，直冲修正才能稳定过 0.30 m 成功判据。
+
+    指令在场景内指代无歧义（L1 类别唯一 / L2 颜色+类别唯一 / L3 参考物唯一），
+    故任何符合描述的检测/记忆实例即为目标本身，无需实例级消歧。
+    覆盖率近满仍未命中时放宽颜色约束（`relax_cover`，颜色混淆兜底）。
+    """
+
+    name = "hier"
+
+    def __init__(self, det_every=2, rel_tol_deg=50.0, refine_dist=1.5,
+                 relax_cover=0.9, dock_win=0.9, dock_stop=0.25,
+                 align_tol_deg=6.0, align_v=0.08, align_max_steps=12,
+                 dock_k=2.0, **kw):
+        # 换段只认「记忆里查到目标实例」，不按覆盖率/步数强切（父类的
+        # cover_switch/min_explore 关死；探索到超时是搜索失败的正常形态）。
+        # 注意：父类 __init__ 末尾会调用 self.reset()，子类状态须先建好。
+        from .semantic_map import SemanticMap
+        self._map = SemanticMap()
+        self._frame = 0
+        self._fresh = None       # 本帧检测命中的世界坐标（末段修正用）
+        self._fresh_det = None   # 本帧命中的检测对象（末段停靠用 surf/hit_bearing）
+        self._relaxed = False    # 覆盖近满仍未命中 → 放宽颜色
+        self._planned_lm = None  # 当前承诺路径对应的地标（修正幅度大才重规划）
+        self._spin = 0           # 原地环视剩余步数（进度监督触发）
+        self._prog_best = None   # 换段后距地标的最好成绩（进度监督基准）
+        self._prog_step = 0      # 距上次明显接近以来的步数
+        super().__init__(cover_switch=1.01, min_explore=10 ** 9, **kw)
+        self.det_every = int(max(1, det_every))   # 检测较贵（~10 ms/帧），隔帧做
+        self.rel_tol_deg = float(rel_tol_deg)
+        self.refine_dist = float(refine_dist)
+        self.relax_cover = float(relax_cover)
+        # 末段停靠（沿用 SweepDetDock 的两段式：先对准再冲刺，激光表面距判停）。
+        # 动机：20 回合实测 SR 对步数预算不敏感（350/700 均 10%）而 near_miss+超时
+        # 占 14/20 —— 记忆地标位置有单目测距误差，走到点旁≠过 0.30 m 成功判据；
+        # 激光 surf 在近距是唯一不失手的量，直接按它停靠。
+        self.dock_win = float(dock_win)
+        self.dock_stop = float(dock_stop)
+        self.align_tol = float(np.deg2rad(align_tol_deg))
+        self.align_v = float(align_v)
+        self.align_max_steps = int(align_max_steps)
+        self.dock_k = float(dock_k)
+        self._align_n = 0
+
+    def reset(self, env=None):
+        super().reset(env)
+        self._map.reset()
+        self._frame = 0
+        self._fresh = None
+        self._fresh_det = None
+        self._relaxed = False
+        self._planned_lm = None
+        self._align_n = 0
+        self._spin = 0
+        self._prog_best = None
+        self._prog_step = 0
+
+    # ------------------------------------------------------------ 子目标层
+    def _match_dets(self, dets, env, want_color, want_cls, ref_cls, rel):
+        """当前帧检测里按指令描述挑目标（L3 按「参考物+方位」的世界几何解算）。"""
+        from .perception import match
+
+        def wpos(d):
+            a = env.robot_pose()[2] + d.bearing
+            return env.robot_pose()[:2] + d.dist * np.array([np.cos(a), np.sin(a)])
+
+        if rel is not None and ref_cls is not None:
+            refs = [d for d in dets if match([d], cls=ref_cls) is not None]
+            tgts = [d for d in dets
+                    if match([d], color=want_color, cls=want_cls) is not None]
+            tgt_ang = _REL_ANG[rel]
+            tol = np.deg2rad(self.rel_tol_deg)
+            best = None
+            for t in tgts:
+                for r in refs:
+                    v = wpos(t) - wpos(r)
+                    if np.hypot(*v) < 0.4:
+                        continue
+                    a = float(np.arctan2(v[1], v[0]))
+                    if abs((a - tgt_ang + np.pi) % (2 * np.pi) - np.pi) < tol:
+                        if best is None or t.dist < best.dist:
+                            best = t
+                        break
+            if best is not None:
+                self._fresh_det = best
+            return wpos(best) if best is not None else None
+        d = match(dets, color=want_color, cls=want_cls)
+        if d is not None:
+            self._fresh_det = d          # 供末段停靠用（surf / hit_bearing）
+        return wpos(d) if d is not None else None
+
+    def _query_map(self, env, want_color, want_cls, ref_cls, rel):
+        """语义记忆里按指令描述查实例（L1/L2 最近优先；L3 按世界几何过滤）。"""
+        pose = env.robot_pose()
+        if rel is not None and ref_cls is not None:
+            refs = self._map.query(cls=ref_cls, pose=pose)
+            tgts = self._map.query(color=want_color, cls=want_cls, pose=pose)
+            tgt_ang = _REL_ANG[rel]
+            tol = np.deg2rad(self.rel_tol_deg)
+            for t in tgts:
+                for r in refs:
+                    v = t[0] - r[0]
+                    if np.hypot(*v) < 0.4:
+                        continue
+                    a = float(np.arctan2(v[1], v[0]))
+                    if abs((a - tgt_ang + np.pi) % (2 * np.pi) - np.pi) < tol:
+                        return np.asarray(t[0], dtype=np.float64).copy()
+            return None
+        cand = self._map.query(color=want_color, cls=want_cls, pose=pose)
+        if not cand and self._relaxed and want_color is not None:
+            cand = self._map.query(cls=want_cls, pose=pose)   # 颜色混淆兜底
+        return (np.asarray(cand[0][0], dtype=np.float64).copy()) if cand else None
+
+    def _subgoal(self, obs, env):
+        """每帧：检测 → 语义地图累积 → 按指令查询；返回目标世界坐标或 None。"""
+        from .perception import detect
+
+        want_color, want_cls, ref_cls, rel = parse_instruction(env.task["instruction"])
+        if want_cls is None:
+            return None
+        self._frame += 1
+        dets = []
+        if self._frame % self.det_every == 1:
+            dets = list(detect(obs["image"], lidar=obs.get("lidar"),
+                               want_hit=True))
+        # 地图只维护实例表（导航栅格由父类 front.grid 负责，激光不必重复积分）
+        self._map.update(env.robot_pose(), None, dets, self._frame)
+        self._fresh = None
+        self._fresh_det = None
+        if dets:
+            self._fresh = self._match_dets(dets, env, want_color, want_cls,
+                                           ref_cls, rel)
+        hit = self._fresh
+        if hit is None:
+            hit = self._query_map(env, want_color, want_cls, ref_cls, rel)
+        return hit
+
+    def _accept(self, hit, env):
+        """把查询结果落成地标。首次命中即换段；此后只接受末段修正。"""
+        if self.phase == "explore":
+            self.landmark = np.asarray(hit, dtype=float).copy()
+            self.seen_step = int(env.steps)
+            self.phase = "navigate"
+            self._t = 0
+            self._path = None
+            self._path_i = 0
+            self._stuck = 0
+            self._esc = 0
+            self._last_xy = None
+            self._scan = 0
+            self._planned_lm = self.landmark.copy()
+            return
+        # navigate：只在末段（单目测距较准的范围内）用当前帧检测修正地标；
+        # 自旋找目标时放宽 —— 卡在半路往往就是记忆地标不可达，此刻重新看见
+        # 目标是唯一出路（视线可达 ≈ 至少能朝它推进一段；实测 timeout 回合
+        # 全部卡在 2.0~4.9 m 处原地耗光步数）。
+        if self._fresh is None:
+            return
+        d_new = float(np.hypot(*(np.asarray(hit) - env.robot_pose()[:2])))
+        if self._spin <= 0 and d_new > self.refine_dist:
+            return
+        if self._planned_lm is None or \
+                float(np.hypot(*(np.asarray(hit) - self._planned_lm))) > 0.3:
+            self.landmark = np.asarray(hit, dtype=float).copy()
+            self._planned_lm = self.landmark.copy()
+            self._path = None          # 地标修正幅度大 → 承诺路径作废重规划
+            if self._spin > 0:         # 自旋中重新锁定 → 立即结束自旋
+                self._spin = 0
+                self._prog_best = None
+
+    # ------------------------------------------------------------ 主循环
+    def _dock_act(self, obs, env):
+        """末段两段式停靠（SweepDetDock 同款）：对准 → 冲刺 → surf 判停。
+
+        返回 None 表示不在停靠窗口（surf 无效或 > dock_win），回落记忆导航。
+        """
+        d = self._fresh_det
+        if d is None:
+            return None
+        surf = float(getattr(d, "surf", float("nan")))
+        hb = float(getattr(d, "hit_bearing", float("nan")))
+        if not np.isfinite(surf) or surf > self.dock_win:
+            self._align_n = 0
+            return None
+        if surf <= self.dock_stop:
+            return np.array([0.0, 0.0], dtype=np.float32)   # 已在判据内，停住
+        if np.isfinite(hb) and abs(hb) > self.align_tol and \
+                self._align_n < self.align_max_steps:
+            self._align_n += 1                               # 未对准：低速转向
+            return np.array([self.align_v,
+                             float(np.clip(self.dock_k * hb, -self.w_max,
+                                           self.w_max))], dtype=np.float32)
+        return np.array([self.v_max,
+                         float(np.clip(self.dock_k * hb if np.isfinite(hb) else 0.0,
+                                       -self.w_max, self.w_max))],
+                        dtype=np.float32)                    # 对准：全速冲刺
+
+    def _spin_act(self, env):
+        """navigate 进度监督：60 步内距地标未缩短 0.2 m → 原地自旋 40 步。
+
+        记忆地标位置有单目测距误差、且可能被新激光证实不可达 —— 实测
+        timeout 回合全部卡在 2.0~4.9 m 半路上。原地转一圈换个朝向往往就能
+        重新看见目标，自旋期间的 fresh 检测不受 `refine_dist` 限制（见
+        `_accept`）。返回 None 表示未触发/已结束，回落记忆导航。
+        """
+        d_lm = float(np.hypot(*(self.landmark - env.robot_pose()[:2])))
+        if self._spin > 0:
+            self._spin -= 1
+            self._stuck = 0
+            self._last_xy = env.robot_pose()[:2].copy()  # 原地转不算卡死
+            return np.array([0.0, self.w_max], dtype=np.float32)
+        if self._prog_best is None or d_lm < self._prog_best - 0.2:
+            self._prog_best, self._prog_step = d_lm, 0   # 有进展：重新计时
+        else:
+            self._prog_step += 1
+            if self._prog_step > 60:
+                self._spin = 40
+                self._prog_step = 0
+                self._prog_best = None   # 自旋结束（无论成败）重新定基准
+                return np.array([0.0, self.w_max], dtype=np.float32)
+        return None
+
+    def act(self, obs, env):
+        hit = self._subgoal(obs, env)
+        if hit is not None:
+            self._accept(hit, env)
+        if self.phase == "explore":     # 仍未定位 → 继续前沿探索建图
+            if not self._relaxed and self.front.grid is not None and \
+                    float((self.front.grid >= 0).mean()) >= self.relax_cover:
+                self._relaxed = True
+            a = self._explore_act(obs, env)
+            self.cover = float((self.front.grid >= 0).mean())
+            self._sync_live(env)
+            self.live["objs"] = len(self._map.objs)
+            self.live["fresh"] = self._fresh is not None
+            return a
+        # navigate：末段优先停靠（surf 可用时），否则记忆测地导航。
+        # `_ensure` 必查：目标开局就在相机里时，本帧 `_accept` 直接换段、
+        # explore 分支一步都没跑过，`front.grid` 还是 None —— 父类导航分支
+        # 里 `front._integrate` 会对 None 下标（实测 seed 9407 TypeError）。
+        self.front._ensure(env)
+        a = self._dock_act(obs, env)
+        if a is not None:
+            self._sync_live(env)
+            self.live["objs"] = len(self._map.objs)
+            return a
+        a = self._spin_act(env)        # 进度监督：半路卡死 → 自旋找目标
+        if a is not None:
+            self._sync_live(env)
+            self.live["objs"] = len(self._map.objs)
+            return a
+        self._sync_live(env)
+        self.live["objs"] = len(self._map.objs)
+        return super().act(obs, env)
+
+
+class HierRuleDockWide(HierRulePolicy):
+    """hier 变体：加宽停靠触发窗口（dock_win 0.9 → 1.5 m）。
+
+    实测 near_miss 回合停在中心距 1.0~1.5 m —— 目标已在相机里，但 surf
+    超 0.9 m 窗口，两段式停靠永不接管；记忆导航被膨胀带挡在此处进退不得。
+    加宽窗口让停靠更早接管，末段全靠激光 surf 判停。
+    """
+
+    name = "hier_dw"
+
+    def __init__(self, **kw):
+        kw.setdefault("dock_win", 1.5)
+        super().__init__(**kw)
+
+
 class RandomTargetPolicy(OraclePolicy):
     """无语义对照（推荐的主力对照）：**导航机制与 oracle 完全相同**，唯一区别是
     规划目标从空闲栅格中随机选取，而非由指令指代的物体。
@@ -1853,7 +2139,9 @@ POLICIES = {"random": RandomPolicy, "frontier": FrontierPolicy,
             # 经典 A* 传统规划对照（见 planner.AStarPolicy；E1c 路径几何对比 /
             # 第 3 章算法选型论证用），astar_random 为同口径无语义对照
             "astar": AStarPolicy,
-            "astar_random": AStarRandomTargetPolicy}
+            "astar_random": AStarRandomTargetPolicy,
+            # 规则版分层基线（W2-3：指令→语义记忆定位→记忆测地执行，零特权）
+            "hier": HierRulePolicy}
 
 
 def make_policy(name, **kw):

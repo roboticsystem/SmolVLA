@@ -18,7 +18,8 @@ import numpy as np
 
 from sim.env import calibrated_env, navigate_metrics, grid_value
 from sim.baselines import (RandomPolicy, OraclePolicy, RandomTargetPolicy,
-                           SweepDetectorPolicy, ExploreMemoryPolicy)
+                           SweepDetectorPolicy, ExploreMemoryPolicy,
+                           HierRulePolicy, HierRuleDockWide)
 from sim.follow import (FollowEnv, OracleFollow, ReactiveFollow, FollowPolicyE4,
                         FollowPolicyStage, place_peds, crowding)
 from sim.planner import GeodesicWindowPolicy
@@ -411,6 +412,17 @@ def make_policy(name, env=None):
     if name == "explore":
         # 巡屋建图 → 瞥见记地标 → 记忆寻物（两阶段「视野外寻物」演示）
         return ExploreMemoryPolicy()
+    if name == "hier":
+        # 规则版分层基线：指令解析 → 语义记忆定位 → 记忆测地执行（零特权，
+        # 与 explore 共用执行层，仅换段条件不同）
+        return HierRulePolicy()
+    if name == "hier_dw":
+        # hier 变体：停靠触发窗口加宽（dock_win 0.9→1.5 m），救 near_miss
+        return HierRuleDockWide()
+    if name == "hier_vlm":
+        # VLM 版分层基线：Qwen3-VL-4B zero-shot 子目标判定 + 同一套记忆测地执行层
+        from sim.hier_vlm import HierVLMPolicy
+        return HierVLMPolicy()
     if name == "oracle" and env is not None and \
             getattr(env.scene, "name", "") in LAYOUT_STEPS:
         # **固定户型**（公寓/窄走廊/S 形走廊/仓库）统一换测地场上界：
@@ -534,7 +546,11 @@ def run_episode(sim, policy_name, seed, level, collect_only=False,
     elif hasattr(env, "_max_steps0"):
         env.cfg["max_steps"] = env._max_steps0
     if max_steps is not None:
-        # W1 口径实验：显式覆盖步数预算（每回合写入，无跨批次残留）
+        # W1 口径实验：显式覆盖步数预算。**覆盖也要记原值**：否则上一批的
+        # 覆盖值泄漏进下一批默认口径（实测 hier@700 显式 700 后，紧随的
+        # hier_vlm 默认批继承 700 —— 协议污染）。
+        if not hasattr(env, "_max_steps0"):
+            env._max_steps0 = int(env.cfg["max_steps"])
         env.cfg["max_steps"] = int(max_steps)
     if instruction and not follow:
         if not apply_instruction(env, instruction):
@@ -546,7 +562,7 @@ def run_episode(sim, policy_name, seed, level, collect_only=False,
         sim.refresh_map(env)
         # explore：预建记忆栅格，第一帧就有「暗区底图」；其他策略清掉残留
         sim.mem = None
-        if policy_name == "explore":
+        if policy_name in ("explore", "hier", "hier_dw", "hier_vlm"):
             pol.front._ensure(env)
             sim.mem = mem_payload(pol, 0)
     info = None
@@ -578,7 +594,7 @@ def run_episode(sim, policy_name, seed, level, collect_only=False,
                     sim.instruction = "跟随红马甲行人"
                     sim.level_str = "follow"
                 else:
-                    if policy_name == "explore":
+                    if policy_name in ("explore", "hier", "hier_dw", "hier_vlm"):
                         # 阶段一（巡屋）藏起目标点 —— 机器人自己还没瞥见，
                         # 观众看到的与机器人同信息量；瞥见换段后亮出地标。
                         if pol.phase == "navigate" and pol.landmark is not None:
