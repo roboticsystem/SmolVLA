@@ -31,6 +31,9 @@
 SmolVLA/
 ├── smolvla_finetune_sim.py    # 训练/评测主干（推理服务依赖此文件在根目录）
 ├── smolvla_sim_data.py        # 数据管线与归一化口径
+├── smolvla_lora.py            # E2 LoRA 微调（注入/训练）
+├── smolvla_idas.py            # E5 IDAS 辅助监督
+├── web_sim.py / web_sim.html  # 网页版仿真演示（在线演示后端 :8020，static/ 为前端依赖）
 ├── sim/                       # 语义导航仿真测试床（E1，纯 Python：numpy+h5py）
 ├── exp_plan.yaml              # 实验事前登记（E1–E12 状态/阻塞/unblock 条件）
 ├── scripts/
@@ -41,6 +44,7 @@ SmolVLA/
 │   └── stats/                 # Holm 多重比较校正
 ├── ros2_ws/                   # ROS2 五节点（camera/lidar/odom/vla_bridge/control）
 ├── deliver/                   # 真机交付包（README/server/tools/config/ros2_ws/docs；模型不入库）
+├── deliver_v1/                # 真机交付包 v1（server/tools/ros2_ws/models/ft_detf 统计量；权重不入库）
 ├── docker/
 │   ├── ros2_sim/              # ROS2 Humble + Gazebo + TurtleBot3 + Nav2 容器
 │   │   └── README_Spark.md    # DGX Spark (ARM64) 适配说明
@@ -72,9 +76,10 @@ python -m sim.run_eval --policy oracle --episodes 15
 ### 真机推理服务（D2 路线：板端采数据 → 服务端 GPU 推理）
 
 ```bash
-python deliver/server/infer_server.py --project <本仓库根目录> \
-    --ckpt <ft_detf 权重目录> --port 8000
+python deliver_v1/server/infer_server.py --project <本仓库根目录> \
+    --ckpt deliver_v1/models/ft_detf --config deliver/config/robot.yaml --port 8000
 # 契约：POST {image_bgr(hex), h, w, scan[], state[5], instruction} → {action:[v,ω]}
+# 注意：--config 必须显式指定（HSV 标定文件在 deliver/config/，服务默认路径不存在）
 ```
 
 ### ROS2 仿真容器（含 DGX Spark ARM64 适配）
