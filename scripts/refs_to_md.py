@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""refs_to_md.py —— 把「参考论文」目录里的 PDF / DOCX 批量转成 Markdown。
+"""refs_to_md.py —— 把「参考论文」目录里的 PDF / DOCX / PPTX / DOC 批量转成 Markdown。
 
 为什么要这一步：参考论文是 PDF/DOCX 二进制，每次让模型"读一遍再转写"既慢又
 不可复用（表格/公式在纯文本抽取里会整段丢失）。本脚本把每篇论文转成一份
@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import struct
 import sys
 import zipfile
 from collections import Counter
@@ -218,16 +219,199 @@ def docx_to_md(docx_path: str, out_md: str, media_dir: str) -> dict:
                 md.append("\n![](%s)\n" % im)
         elif child.tag == qn("w:tbl"):
             t = Table(child, d)
-            rows = [[c.text.replace("\n", " ").strip() for c in r.cells]
-                    for r in t.rows]
+            raw = [[c.text.strip() for c in r.cells] for r in t.rows]
+            rows = [[c.replace("\n", " ") for c in r] for r in raw]
             tbl_seq += 1
             md.append("\n**表 %d**\n" % tbl_seq)
             md.append(_rows_to_md(rows) + "\n")
+            # 中期检查表这类「一格装整段正文」的表：把长单元格原文按段落补出来，
+            # 否则整段被压成一行，后续检索/引用都不好用
+            for r in raw:
+                for c in r:
+                    if len(c) > 200:
+                        md.append("\n**表 %d 长单元格原文**\n\n" % tbl_seq)
+                        md.append(c + "\n")
     head = ("# %s\n\n> 由 `scripts/refs_to_md.py` 自动转换（DOCX：%d 段 / %d 图 / %d 表）。"
             "\n\n" % (os.path.splitext(os.path.basename(docx_path))[0],
                      len(d.paragraphs), img_seq, tbl_seq))
     _write(out_md, head + "\n".join(md))
     return {"images": img_seq, "tables": tbl_seq}
+
+
+# ---------------------------------------------------------------- PPTX → MD
+def _save_img(blob: bytes, ext: str, media_dir: str, name: str) -> bool:
+    """图片落盘；宽 >1400px 的等比缩到 1400，避免 md 媒体目录过大。"""
+    from io import BytesIO
+    ext = (ext or "png").lower().replace("emf", "png").replace("wmf", "png")
+    if ext not in ("png", "jpg", "jpeg", "gif", "bmp", "webp"):
+        ext = "png"
+    try:
+        from PIL import Image
+        im = Image.open(BytesIO(blob))
+        if im.width > 1400:
+            h = max(1, int(im.height * 1400 / im.width))
+            im = im.convert("RGB").resize((1400, h))
+        if ext == "jpg":
+            ext = "jpeg"
+        im.convert("RGB").save(os.path.join(media_dir, name), ext.upper()
+                               if ext != "jpeg" else "JPEG", quality=90)
+        return True
+    except Exception:                                    # noqa: BLE001
+        pass
+    try:
+        with open(os.path.join(media_dir, name), "wb") as f:
+            f.write(blob)
+        return True
+    except Exception:                                    # noqa: BLE001
+        return False
+
+
+def pptx_to_md(pptx_path: str, out_md: str, media_dir: str) -> dict:
+    """按「第 N 页」切分，页内按 上→下/左→右 顺序输出文本、表格、图片。"""
+    from pptx import Presentation
+    from pptx.enum.shapes import MSO_SHAPE_TYPE
+
+    prs = Presentation(pptx_path)
+    md = []
+    img_seq = 0
+    tbl_seq = 0
+
+    def walk(shapes):
+        for sh in shapes:
+            try:
+                if sh.shape_type == MSO_SHAPE_TYPE.GROUP:
+                    yield from walk(sh.shapes)
+                    continue
+            except Exception:                            # noqa: BLE001
+                pass
+            yield sh
+
+    for sno, slide in enumerate(prs.slides, 1):
+        md.append("\n## 第 %d 页\n" % sno)
+        shapes = list(walk(slide.shapes))
+        shapes.sort(key=lambda s: (int(getattr(s, "top", 0) or 0),
+                                   int(getattr(s, "left", 0) or 0)))
+        for sh in shapes:
+            # ---- 表格
+            if getattr(sh, "has_table", False):
+                rows = [[c.text.replace("\n", " ").strip() for c in r.cells]
+                        for r in sh.table.rows]
+                tbl_seq += 1
+                md.append("\n**表 %d（第 %d 页）**\n" % (tbl_seq, sno))
+                md.append(_rows_to_md(rows) + "\n")
+                continue
+            # ---- 文本
+            if getattr(sh, "has_text_frame", False):
+                t = "\n".join(p.text for p in sh.text_frame.paragraphs).strip()
+                if t:
+                    md.append(t + "\n")
+                continue
+            # ---- 图片
+            try:
+                img = sh.image
+            except Exception:                            # noqa: BLE001
+                continue
+            img_seq += 1
+            name = "p%03d_img%02d.%s" % (sno, img_seq,
+                                         (img.ext or "png").lower())
+            name = re.sub(r"\.(emf|wmf)$", ".png", name)
+            if _save_img(img.blob, img.ext, media_dir, name):
+                md.append("\n![](%s)\n" % name)
+        # ---- 备注页（中期汇报常把细节写在备注里）
+        try:
+            if slide.has_notes_slide:
+                nt = slide.notes_slide.notes_text_frame.text.strip()
+                if nt:
+                    md.append("\n> 备注：%s\n" % nt.replace("\n", " / "))
+        except Exception:                                # noqa: BLE001
+            pass
+    head = ("# %s\n\n> 由 `scripts/refs_to_md.py` 自动转换（PPTX：%d 页 / %d 图 / "
+            "%d 表；表格按页顺序编号）。\n\n"
+            % (os.path.splitext(os.path.basename(pptx_path))[0],
+               len(prs.slides._sldIdLst), img_seq, tbl_seq))
+    _write(out_md, head + "\n".join(md))
+    return {"slides": len(prs.slides._sldIdLst), "images": img_seq,
+            "tables": tbl_seq}
+
+
+# ---------------------------------------------------------------- DOC(97-2003) → MD
+def _doc_pieces(clx: bytes):
+    """解析 Clx：跳过 Prc(0x01)，取 Pcdt(0x02) 里的片段表 [(cp0, cp1, fc)]。"""
+    i = 0
+    while i < len(clx):
+        t = clx[i]
+        if t == 1:                                       # Prc: 0x01+cbGrpprl(2)+grpprl
+            i += 3 + struct.unpack_from("<h", clx, i + 1)[0]
+        elif t == 2:                                     # Pcdt: 0x02+lcb(4)+PlcPcd
+            lcb = struct.unpack_from("<I", clx, i + 1)[0]
+            plc = clx[i + 5:i + 5 + lcb]
+            n = (lcb - 4) // 12
+            cps = struct.unpack_from("<%dI" % (n + 1), plc, 0)
+            off = (n + 1) * 4
+            return [(cps[k], cps[k + 1],
+                     struct.unpack_from("<I", plc, off + k * 8 + 2)[0])
+                    for k in range(n)]
+        else:
+            break
+    return []
+
+
+def doc_text(doc_path: str) -> str:
+    """Word 97-2003 正文抽取：FIB → Clx 片段表 → 逐段解码（UTF-16 或 8 bit）。"""
+    import olefile
+    ole = olefile.OleFileIO(doc_path)
+    try:
+        word = ole.openstream("WordDocument").read()
+        flags = struct.unpack_from("<H", word, 10)[0]
+        tname = "1Table" if (flags >> 9) & 1 else "0Table"
+        if not ole.exists(tname):
+            tname = "0Table" if tname == "1Table" else "1Table"
+        table = ole.openstream(tname).read()
+        # FIB 基址 32B → csw → rgw97 → cslw → rglw97 → cbRgFcLcb → rgFcLcb97
+        base = 32
+        csw = struct.unpack_from("<H", word, base)[0]
+        off = base + 2 + csw * 2
+        cslw = struct.unpack_from("<H", word, off)[0]
+        off += 2 + cslw * 4 + 2
+        fc_clx, lcb_clx = struct.unpack_from("<II", word, off + 33 * 8)
+        chunks = []
+        for cp0, cp1, fc in _doc_pieces(table[fc_clx:fc_clx + lcb_clx]):
+            n = cp1 - cp0
+            if fc & 0x40000000:                          # 压缩片段：8 bit 本地码页
+                s = (fc & 0x3FFFFFFF) // 2
+                chunks.append(word[s:s + n].decode("cp1252", "replace"))
+            else:
+                s = fc & 0x3FFFFFFF
+                chunks.append(word[s:s + n * 2].decode("utf-16-le", "replace"))
+    finally:
+        ole.close()
+    txt = "".join(chunks)
+    # Word 控制符：\r 段落、\x07 单元格结束、\x0b 软换行、\x0c 分页
+    txt = (txt.replace("\x07", "\n").replace("\r", "\n")
+              .replace("\x0b", "\n").replace("\x0c", "\n"))
+    txt = "".join(ch for ch in txt
+                  if ch in "\n\t" or (ord(ch) >= 32 and ord(ch) != 0xFFFD))
+    return "\n".join(ln.rstrip() for ln in txt.split("\n"))
+
+
+def doc_to_md(doc_path: str, out_md: str, media_dir: str) -> dict:
+    text = doc_text(doc_path)
+    md = []
+    for ln in text.split("\n"):
+        s = ln.strip()
+        if not s:
+            continue
+        if re.match(r"^[一二三四五六七八九十]+、", s):        # 一、研究工作…
+            md.append("\n## " + s + "\n")
+        elif re.match(r"^（?[0-9]+）", s) and len(s) < 40:
+            md.append("\n### " + s + "\n")                # 小节序号
+        else:
+            md.append(s + "\n")
+    head = ("# %s\n\n> 由 `scripts/refs_to_md.py` 自动转换（DOC 97-2003，"
+            "表格已拍平为段落；共 %d 字符）。\n\n"
+            % (os.path.splitext(os.path.basename(doc_path))[0], len(text)))
+    _write(out_md, head + "\n".join(md))
+    return {"chars": len(text)}
 
 
 # ---------------------------------------------------------------- main
@@ -239,7 +423,7 @@ def main():
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     files = [f for f in sorted(os.listdir(a.src))
-             if f.lower().endswith((".pdf", ".docx"))
+             if f.lower().endswith((".pdf", ".docx", ".doc", ".pptx"))
              and not f.startswith("~$")]
     if a.only:
         files = [f for f in files if a.only in f]
@@ -248,11 +432,16 @@ def main():
         md_path = os.path.join(a.out, stem + ".md")
         media = os.path.join(a.out, stem + "_media")
         os.makedirs(media, exist_ok=True)
+        low = f.lower()
         try:
-            if f.lower().endswith(".pdf"):
+            if low.endswith(".pdf"):
                 info = pdf_to_md(os.path.join(a.src, f), md_path, media)
-            else:
+            elif low.endswith(".docx"):
                 info = docx_to_md(os.path.join(a.src, f), md_path, media)
+            elif low.endswith(".pptx"):
+                info = pptx_to_md(os.path.join(a.src, f), md_path, media)
+            else:                                           # .doc（Word 97-2003）
+                info = doc_to_md(os.path.join(a.src, f), md_path, media)
             print("[ok] %-60s -> %s  %s" % (f[:58], stem + ".md", info),
                   flush=True)
         except Exception as e:                              # noqa: BLE001

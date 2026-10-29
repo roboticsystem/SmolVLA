@@ -35,10 +35,14 @@ SmolVLA/
 ├── exp_plan.yaml              # 实验事前登记（E1–E12 状态/阻塞/unblock 条件）
 ├── scripts/
 │   ├── train/                 # LoRA / IDAS / 蒸馏 / chunk / DAgger
-│   ├── deploy/                # ONNX 导出 / INT8 量化 / 基准 / 算子普查
+│   ├── deploy/                # ONNX 导出 / INT8 量化 / 基准 / 算子普查 / 公网隧道守护
 │   ├── experiments/           # E2/E5 扫描与多种子驱动
 │   ├── real/                  # E10 sim→real：真机数据回填 / 共训合并 / 受控评测 / 统计量导出
-│   └── stats/                 # Holm 多重比较校正
+│   ├── stats/                 # Holm 多重比较校正 / E5 200 回合配对汇总
+│   ├── eval_matrix.py         # E5b 模型级泛化矩阵 + 退化×遮挡鲁棒矩阵
+│   ├── probe_id_head.py       # ID 头探针（E5 阴性结果归因）
+│   ├── id_overhead_table.py   # IDAS 训练开销表（零 GPU，解析日志）
+│   └── queue_e5b_local.sh     # E5b 三卡三路实验队列
 ├── ros2_ws/                   # ROS2 五节点（camera/lidar/odom/vla_bridge/control）
 ├── deliver/                   # 真机交付包（README/server/tools/config/ros2_ws/docs；模型不入库）
 ├── docker/

@@ -263,17 +263,11 @@ def main():
     ap.add_argument("--detector", default="real", choices=["real", "sim"],
                     help="感知口径：real=robot.yaml HSV 检测（真机部署必须）；"
                          "sim=仿真调色板检测（仅离线评测）")
-    ap.add_argument("--chunk-out", type=int, default=10,
-                    help="每次推理返回并开环执行的动作步数 K（1=逐步重推理，"
-                         "50=全chunk开环；用于复合误差 vs 请求压力的扫描实验）")
     ap.add_argument("--config", default=None,
                     help="robot.yaml 路径（detector=real 时必读；默认 <project>/deliver_v1/config/robot.yaml）")
     a = ap.parse_args()
     if a.config is None:
         a.config = os.path.join(a.project, "deliver_v1", "config", "robot.yaml")
-    global CHUNK_OUT
-    CHUNK_OUT = max(1, min(int(a.chunk_out), 50))
-    print(f"[配置] chunk_out={CHUNK_OUT}（每次推理开环执行 {CHUNK_OUT} 步）")
 
     here = os.path.dirname(os.path.abspath(__file__))
     a.ckpt = a.ckpt if os.path.isabs(a.ckpt) else os.path.normpath(os.path.join(here, a.ckpt))

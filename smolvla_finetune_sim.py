@@ -737,6 +737,9 @@ def main():
         # 评测结果无效（实测踩过：ω 标准差 0.556 vs 0.870 差 1.57 倍，
         # 同一模型评出 8.3% 与 25.0% 两个数）。
         ck_data = ck.get("data")
+        if ck.get("zeroshot"):
+            # zero-shot 锚点：dummy ckpt 不携带数据路径，统计量强制取本次评测数据（同一口径）
+            ck_data = a.data
         # 若训练时冻结了统计量（stats_from），传入该 h5 即视为口径一致，
         # 不触发下面的「自动改用训练数据」——那会把 sim 冻结统计量换回混合统计量。
         _sf = ck.get("stats_from")
