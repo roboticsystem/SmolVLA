@@ -47,7 +47,7 @@ import numpy as np
 
 from .baselines import make_policy
 from .env import SemanticNavEnv, calibrated_env, navigate_metrics
-from .perception import (TargetMemory, detect, features_from_dets,
+from .perception import (PolarBEV, TargetMemory, detect, features_from_dets,
                          target_features)
 
 ARRAYS = ("images", "actions", "states", "lidar", "instr_ids", "ep_offset",
@@ -136,13 +136,19 @@ def collect(episodes, seed=0, obs_size=(160, 120), peds=2, max_steps=700, level=
         else:
             chosen = [phr[int(j)] for j in rng.integers(0, len(phr), k)]
         # 检测与指令无关，**每帧只跑一遍**，再按各种表述做匹配（省 2/3 开销）
+        # `gt` 模式不需要检测（真值方位与图像无关），跳过以省采集时间
         det_cache = None
         if det_features:
-            det_cache = [detect(ob["image"]) for ob, _ in rows]
+            det_cache = ([None] * len(rows) if det_mode == "gt"
+                         else [detect(ob["image"]) for ob, _ in rows])
+        goal_xy = (np.asarray(env.task["goal"], dtype=float)
+                   if det_features and det_mode == "gt" else None)
         for ins in chosen:
             # **记忆必须逐表述独立重放**：记忆是「指令所指目标」的跨帧累积，
             # 而同一段轨迹要配多种表述，目标不同 → 记忆内容不同。
-            mem = TargetMemory(ttl=mem_ttl) if (det_features and det_mode == "mem") else None
+            mem = ((TargetMemory(ttl=mem_ttl) if det_mode == "mem"
+                    else PolarBEV()) if (det_features and det_mode in ("mem", "bev"))
+                   else None)
             for j, (ob, av) in enumerate(rows):
                 img_buf.append(ob["image"])
                 act_buf.append(av)
@@ -153,7 +159,8 @@ def collect(episodes, seed=0, obs_size=(160, 120), peds=2, max_steps=700, level=
                     # `ob["state"][:3]` 就是 (x, y, θ)，来自里程计，不是特权信息
                     pose = np.asarray(ob["state"][:3], dtype=float)
                     det_buf.append(features_from_dets(det_cache[j], ins, pose=pose,
-                                                      mode=det_mode, memory=mem, t=j))
+                                                      mode=det_mode, memory=mem, t=j,
+                                                      target_xy=goal_xy))
             off_buf.append(len(img_buf))   # 每个表述副本各自成段，便于按段切 chunk
             # 段级元信息必须与 off_buf **同粒度**（每个表述副本一条）。
             # 若只在回合末尾记一次，len(ep_meta) != len(ep_offset)-1，
@@ -480,10 +487,12 @@ def main():
     ap.add_argument("--repair-det", action="store_true",
                     help="重算已有数据集的 det_feat（图像已在库里，无需重跑仿真）")
     ap.add_argument("--det-features-mode", default=None,
-                    choices=["none", "mem"],
-                    help="感知特征档位：`none`（4 维，单帧）/ `mem`（8 维，含跨帧记忆）。"
+                    choices=["none", "mem", "gt", "bev"],
+                    help="感知特征档位：`none`（4 维，单帧）/ `mem`（8 维，含跨帧记忆）/ "
+                         "`gt`（4 维真值方位，E13 特权探针，exp_plan.yaml）。"
                          "`mem` 用于补齐「示范依赖记忆、模型却只看单帧」这一不对称"
-                         "（关记忆使示范 33.0% → 16.0%，见报告 §4.23）")
+                         "（关记忆使示范 33.0% → 16.0%，见报告 §4.23）；"
+                         "`bev`（52 维，自我中心极坐标证据图，E15，exp_plan.yaml）")
     ap.add_argument("--mem-ttl", type=int, default=25,
                     help="记忆存活帧数，须与示范策略一致（其默认 mem_ttl=25）")
     ap.add_argument("--det-features", action="store_true",

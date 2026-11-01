@@ -57,7 +57,8 @@ def load_policy(policy_dir):
     cfg.chunk_size = chunk
     cfg.n_action_steps = chunk
     reconfigure_for_diff_drive(policy, action_dim=2,
-                               n_cam=int(ck.get("n_frames", 1)), state_dim=None)
+                               n_cam=int(ck.get("n_frames", 1)),
+                               state_dim=ck.get("max_state_dim"))
     policy.model.load_state_dict(ck["model"], strict=False)
     policy.eval()
     return policy, cfg, ck
@@ -86,7 +87,11 @@ def main():
         # 不能只信 `meta["det_features_mode"]`：早期训练的模型根本没记这个字段
         #（读到 None），照用会把「记忆档模型」按「单帧档」评，
         # 结果是归一化维度不匹配（9 vs 13）或指标被系统性低估。
+        # 第 4 段可显式指定档位（如 `resolve`）：resolve 与 none 同为 4 维，
+        # 宽度推断不出来，必须按训练口径覆盖，否则关系解算被静默跳过。
         dmode = detect_mode(data_h5)
+        if len(parts) > 3 and parts[3]:
+            dmode = parts[3]
         print(f"\n=== {tag} ({mdir}) | data={data_h5} | 档位={dmode} ===", flush=True)
 
         policy, cfg, ck = load_policy(mdir)

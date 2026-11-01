@@ -31,7 +31,7 @@ import torch.nn as nn
 
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
-from sim.perception import DET_DIM, TargetMemory, target_features
+from sim.perception import DET_DIM, PolarBEV, TargetMemory, target_features
 from smolvla_sim_data import (ACTION_KEY, IMG_KEY, IMG_KEYS, LANG_MASK_KEY,
                               LANG_TOKENS_KEY, STATE_KEY, SimDemoData)
 
@@ -316,7 +316,8 @@ def closed_loop_sr_batch(policy, data, episodes=200, seed=9000, max_steps=200,
                 "seed": ep_seed, "ep": ep,
                 "trace": [],          # 末段逐步轨迹（失败模式诊断用）
                 "ever_found": False, "min_dsurf": float("inf"),
-                "mem": (TargetMemory(ttl=mem_ttl) if det_mode == "mem" else None)}
+                "mem": (TargetMemory(ttl=mem_ttl) if det_mode == "mem"
+                        else (PolarBEV() if det_mode == "bev" else None))}
 
     slots, next_ep = [], 0
 
@@ -341,7 +342,8 @@ def closed_loop_sr_batch(policy, data, episodes=200, seed=9000, max_steps=200,
             dfeat = target_features(
                 s["obs"]["image"], s["obs"]["instruction"],
                 pose=np.concatenate([s["env"].pose[:2], [s["env"].pose[2]]]),
-                mode=det_mode, memory=s["mem"], t=s["steps"]) \
+                mode=det_mode, memory=s["mem"], t=s["steps"],
+                target_xy=np.asarray(s["env"].task["goal"], dtype=float)) \
                 if getattr(data, "with_det", False) else None
             # 该帧的感知槽是否命中目标（第 0 维 = 「是否检出」）
             if dfeat is not None and float(dfeat[0]) > 0.5:
@@ -473,7 +475,8 @@ def closed_loop_sr(policy, data, episodes=12, seed=9000, max_steps=400, level=No
         if env.task is None:
             continue
         hist = []                                   # 帧历史（帧堆叠用）
-        _mem = TargetMemory(ttl=mem_ttl) if det_mode == "mem" else None
+        _mem = (TargetMemory(ttl=mem_ttl) if det_mode == "mem"
+                else (PolarBEV() if det_mode == "bev" else None))
         # 循环变量必须是 `step`：下面 `_slot_noise(..., ep_seed, step, ...)` 要用它
         # 按步定种。早先写成 `for _ in range(...)`，导致**最终评测一跑就 NameError**，
         # 而 checkpoint 保存在评测**之后** → 整轮训练白跑（已实测损失两轮）。
@@ -484,7 +487,8 @@ def closed_loop_sr(policy, data, episodes=12, seed=9000, max_steps=400, level=No
             dfeat = target_features(
                 obs["image"], obs["instruction"],
                 pose=np.concatenate([env.pose[:2], [env.pose[2]]]),
-                mode=det_mode, memory=_mem, t=step) \
+                mode=det_mode, memory=_mem, t=step,
+                target_xy=np.asarray(env.task["goal"], dtype=float)) \
                 if getattr(data, "with_det", False) else None
             st = build_state(obs, data, DEV, dfeat)
             lang_t, lang_m = data.tokenize([obs["instruction"]])
@@ -576,11 +580,11 @@ def main():
                          "探针显示「有无激光」值 22 pp 的闭环成功率（§4.7），"
                          "而 VLA 原本只吃 RGB、拿不到这个几何模态。"
                          "实现上只需重建 state_proj 的输入维，不动视觉塔")
-    ap.add_argument("--det-features-mode", default=None, choices=["none", "mem"],
+    ap.add_argument("--det-features-mode", default=None, choices=["none", "mem", "gt", "bev"],
                     help="感知特征档位（须与采集时一致）：`none`=4 维单帧；"
-                         "`mem`=8 维（并列给出跨帧记忆的目标位置）。"
-                         "`mem` 用于补齐模型相对示范缺失的时序记忆 —— "
-                         "实测关掉示范的记忆会使它 33.0% → 16.0%")
+                         "`mem`=8 维（并列给出跨帧记忆的目标位置）；"
+                         "`gt`=4 维真值方位（E13 特权探针）；"
+                         "`bev`=52 维自我中心极坐标证据图（E15）")
     ap.add_argument("--mem-ttl", type=int, default=25,
                     help="记忆存活帧数，须与示范策略一致（默认 25）")
     ap.add_argument("--det-features", action="store_true",
@@ -616,7 +620,7 @@ def main():
         if _dm and str(_dm) != str(a.det_features_mode or "none"):
             print(f"  [提示] checkpoint 的感知档位={_dm}，已采用（必须与训练一致）")
             a.det_features_mode = str(_dm)
-            if a.det_features_mode == "mem":
+            if a.det_features_mode in ("mem", "bev"):
                 a.det_features = True
         if _ck.get("mem_ttl") and int(_ck["mem_ttl"]) != a.mem_ttl:
             print(f"  [提示] checkpoint 的 mem_ttl={_ck['mem_ttl']}，已采用")

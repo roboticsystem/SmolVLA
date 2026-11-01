@@ -386,7 +386,7 @@ def _shape_cost(h, half, clip_l=False, clip_r=False, clip_top=False, clip_bot=Fa
 
 
 def target_features(img, instruction, det_kw=None, max_range=MAX_RANGE, lidar=None,
-                    pose=None, mode="none", memory=None, t=0):
+                    pose=None, mode="none", memory=None, t=0, target_xy=None):
     """把「**指令所指目标**在当前图像里的位置」编码成定长向量。
 
     这是「**感知 + 决策分离**」架构的接口：感知模块输出结构化结果，
@@ -407,9 +407,11 @@ def target_features(img, instruction, det_kw=None, max_range=MAX_RANGE, lidar=No
     Returns:
         4 维（`mode="none"` / `"resolve"`）或 8 维（`mode="ref"`）float32。
     """
+    if mode == "gt":
+        return gt_slot(target_xy, pose, max_range)   # 真值探针无需跑检测
     return features_from_dets(detect(img, lidar=lidar, **(det_kw or {})),
                               instruction, max_range, pose=pose, mode=mode,
-                              memory=memory, t=t)
+                              memory=memory, t=t, target_xy=target_xy)
 
 
 def _obj_slot(d, max_range):
@@ -552,8 +554,93 @@ class TargetMemory:
         return a, float(np.hypot(*v))
 
 
+class PolarBEV:
+    """**自我中心极坐标 BEV 证据图**（E15）：12 方位 × 4 距离 = 48 维分布。
+
+    与 `TargetMemory` 的关键差异（exp_plan.yaml E15-bev-polar 预登记）：
+    E12 mem 把记忆压成单一 argmax 槽（无分布、无不确定性），模型学不会
+    「何时信记忆」；本类输出**证据的完整分布**——
+
+    - 世界坐标存储（里程计 + 相机测距投影，非特权），merge 同 TargetMemory
+    - 强度**累积**（多次观测 `min(1, s+0.3)`）而非只平滑位置
+    - 无 TTL 硬截断，改**指数衰减** `decay ** age`（陈旧证据渐弱）
+    - 查询时按当前位姿重投影回自我中心网格；距离 >2 m 的证据在距离向
+      **涂抹相邻 bin**（测距不确定性建模）
+    """
+
+    N_A, N_R = 12, 4                    # 方位 bins × 距离 bins → 48 维
+
+    def __init__(self, max_range=MAX_RANGE, decay=0.97, merge=0.7):
+        self.max_range = float(max_range)
+        self.decay = float(decay)
+        self.merge = float(merge)
+        self.items = []                  # [world_xy(2,), color, cls, strength, t]
+
+    def reset(self):
+        self.items = []
+
+    def update(self, dets, pose, t):
+        if dets is None or pose is None:
+            return
+        p0 = np.asarray(pose[:2], float)
+        for d in dets:
+            a = float(pose[2]) + d.bearing
+            p = p0 + d.dist * np.array([np.cos(a), np.sin(a)])
+            for m in self.items:
+                if m[1] == d.color and float(np.hypot(*(p - m[0]))) < self.merge:
+                    m[0] = 0.5 * (m[0] + p)              # 位置指数平滑（抑制抖动）
+                    m[3] = min(1.0, m[3] + 0.3)          # 强度累积
+                    m[2], m[4] = d.cls, t
+                    break
+            else:
+                self.items.append([p, d.color, d.cls, 0.7, t])
+
+    def grid(self, want_color, want_cls, pose, t):
+        """→ 48 维展平证据图（值 ∈ [0,1]，N_R × N_A 行优先）。"""
+        g = np.zeros((self.N_R, self.N_A), np.float32)
+        if pose is None or not self.items:
+            return g.flatten()
+        p0, h = np.asarray(pose[:2], float), float(pose[2])
+        for m in self.items:
+            if (want_color is not None and m[1] != want_color) or \
+               (want_cls is not None and m[2] != want_cls):
+                continue
+            s = m[3] * self.decay ** max(0, t - m[4])
+            if s < 0.05:
+                continue
+            v = m[0] - p0
+            d = float(np.hypot(*v))
+            a = float(np.arctan2(v[1], v[0]) - h)
+            a = (a + np.pi) % (2 * np.pi) - np.pi
+            r_f = d / self.max_range * self.N_R          # 浮点 bin 下标
+            a_f = (a + np.pi) / (2 * np.pi) * self.N_A
+            spread = 1 if d > 2.0 else 0                 # 距离不确定性膨胀
+            for dr in range(-spread, spread + 1):
+                w = 1.0 if dr == 0 else 0.5
+                ri = int(round(r_f)) + dr
+                if 0 <= ri < self.N_R:
+                    g[ri, int(round(a_f)) % self.N_A] = max(
+                        g[ri, int(round(a_f)) % self.N_A], min(1.0, s * w))
+        return g.flatten()
+
+
+def gt_slot(goal_xy, pose, max_range=MAX_RANGE):
+    """**真值方位槽**（E13 特权探针）：`[1, sin a, cos a, dist/max_range]`。
+
+    与 `_obj_slot` / `det_to_map_features` 同构，但来源是 `env.task["goal"]`
+    **真值**而非当前帧检测 —— 把「看见才有方位」升级为「全程知道方位」，
+    用于隔离「方位信息通道」的上界（exp_plan.yaml E13-gt-gcond）。
+    """
+    v = np.asarray(goal_xy, float) - np.asarray(pose[:2], float)
+    dist = float(np.hypot(*v))
+    a = float(np.arctan2(v[1], v[0]) - float(pose[2]))
+    a = (a + np.pi) % (2 * np.pi) - np.pi
+    return np.array([1.0, float(np.sin(a)), float(np.cos(a)),
+                     float(min(1.0, dist / max_range))], dtype=np.float32)
+
+
 def features_from_dets(dets, instruction, max_range=MAX_RANGE, pose=None, mode="none",
-                       memory=None, t=0):
+                       memory=None, t=0, target_xy=None):
     """`target_features` 的**复用版**：`dets` 由调用方预先算好。
 
     采集时同一帧要配多种指令表述，`detect` 与指令无关、只需跑一遍，
@@ -577,6 +664,12 @@ def features_from_dets(dets, instruction, max_range=MAX_RANGE, pose=None, mode="
     """
     from .baselines import parse_instruction          # 延迟导入，避免环状依赖
 
+    if mode == "gt":
+        # **真值方位探针**：不需要检测，`dets` 可为 None（采集侧跳过 detect 省时）
+        assert target_xy is not None, "mode='gt' 需要 target_xy（env.task['goal']）"
+        assert pose is not None, "mode='gt' 需要 pose"
+        return gt_slot(target_xy, pose, max_range)
+
     want_color, want_cls, ref_cls, rel = parse_instruction(str(instruction))
     if mode == "resolve" and rel is not None and ref_cls is not None:
         d = resolve_relation(dets, ref_cls, rel, pose)
@@ -599,6 +692,16 @@ def features_from_dets(dets, instruction, max_range=MAX_RANGE, pose=None, mode="
             mem = _obj_slot(q, max_range)
         return np.concatenate([tgt, mem])
 
+    if mode == "bev":
+        # **BEV 证据图档**（E15）：当前帧槽 4 维 + 48 维证据分布 = 52 维。
+        # 证据来自 PolarBEV（里程计+检测，非特权）；目标不在视野时
+        # tgt=[0,0,0,0]，bev 分布是主要信号。
+        if memory is None:
+            memory = PolarBEV()
+        memory.update(dets, pose, t)
+        g = memory.grid(want_color, want_cls, pose, t)
+        return np.concatenate([tgt, g])
+
     if mode != "ref":
         return tgt
     # `ref` 档：并列给出参考物，使 L3 所需信息完整
@@ -607,7 +710,7 @@ def features_from_dets(dets, instruction, max_range=MAX_RANGE, pose=None, mode="
 
 
 # 各 mode 的感知特征维度（写数据集 / 建模型时都要用）
-DET_DIM = {"none": 4, "ref": 8, "resolve": 4, "mem": 8}
+DET_DIM = {"none": 4, "ref": 8, "resolve": 4, "mem": 8, "gt": 4, "bev": 52}
 
 
 def match(dets, color=None, cls=None, prefer_near=True, tol_deg=12.0):

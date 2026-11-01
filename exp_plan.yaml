@@ -315,3 +315,345 @@ experiments:
       > 误差 −0.11 ± 0.40 m）。论文中应如实说明这一修正。
     outcome: "未开始 —— 阻塞于硬件：无 RDK-X3、无容器运行时、地平线工具链源不可达"
     blocked_by: [no_rdkx3_hardware, no_container_runtime, horizon_toolchain_unreachable]
+
+  - id: E12-mem-detf
+    name: 记忆档×detf数据配方（架构×数据的未试组合格）
+    status: running
+    hypothesis: >
+      mem 8 维特征在同数据上已验证 +7.75pp（§4.23，n=400 配对），但从未与最优
+      数据配方（nav_detf.h5=96k oracle 示范）组合：mem31k 22.25%、mem96k 20.0%
+      均在非最优配方上。预期 ft_detfM10k（mem×detf 配方×10k 步）SR 高于
+      ft_detf（主种子 24.5% / 五种子均值 ~21.8%）。
+    variables:
+      features: [mem 8 维]      # 对照臂 = ft_detf（none 4 维，明细已在库）
+      data: nav_detfM.h5（1080 回合 oracle+calib 重生成，8 维 det_feat，
+            seed 2026；与 nav_detf.h5 同分布不同 rollout——非逐帧配对）
+      fixed: {steps: 10000, batch: 8, lr: 1e-4, chunk: 50, lora_r: 8, mem_ttl: 25}
+    seeds: {train: 2026, eval: 9000}   # 单种子试点，达标再扩 5 种子
+    endpoints:
+      primary: SR（200 回合，seed 9000+37·ep，max_steps 200，calib）
+      secondary: [SPL, NE]
+    decision: >
+      试点配对精确 McNemar vs ft_detf 明细（n=200），Holm 校正后显著更优
+      → 扩 5 种子；无差异或更差 → 记负结果，mem 方向在 96k 配方上关闭。
+    analysis: 配对精确 McNemar（回合级二值）+ Holm 校正；双参照
+      （存储锚点 24.5% 与同码新评 21.5%）。
+    status: done
+    outcome: |
+      负结果（2026-10-30）。ft_detfM10k SR 15.50% [11.1, 21.2]，SPL 0.146，
+      NE 2.78（n=200，seed 9000）。配对精确 McNemar + Holm（m=2）：
+      vs ft_detf 同码新评 21.5%：+18/-30，p_holm=0.111 不显著；
+      vs ft_detf 存储锚点 24.5%：+15/-33，p_holm=0.027 显著更差。
+      两参照均未显著更优 → 按登记记负结果，mem 方向在 96k 配方上关闭。
+      mem 增益（+7.75pp）依赖旧数据配方，无法迁移到 96k oracle 配方。
+
+  - id: E13-gt-gcond
+    name: 真值目标方位注入上界探针（信息通道特权上界）
+    status: proposed
+    hypothesis: >
+      失败分层（2026-10-30，ft_detf_std n=200）：151 个失败回合 ever_found=100%
+      （全部曾检出目标），但 min_dsurf>1.5m 占 62% —— 失败模式是「看见了却到不了」，
+      而非「从未看见」。策略对目标方位仅有当前帧 det_feat（视野内才有效），
+      看见后丢失即盲行。若给策略全程真值方位（特权）后 SR 大幅提升，
+      则瓶颈确认为方位信息通道本身（而非控制/规划能力），mem 端到端失败（E12）
+      的解释是「学不到利用方式 / 特征噪声」，后续主攻显式无真值方位表征；
+      若提升有限，则信息通道无潜力，主攻控制侧（DAgger/RL/接近段）。
+    variables:
+      features: [gt 4 维]      # det_feat 同构替换：[1, sin a, cos a, dist/12]，
+                               # a/ dist 来自目标真值位置（示范与闭环同源特权）；
+                               # 对照臂 = ft_detf（当前帧检测 4 维）
+      data: nav_detfG.h5（1080 回合 oracle+calib 重生成，gt 4 维特征，
+            seed 2026；与 nav_detf.h5 同分布不同 rollout）
+      fixed: {steps: 10000, batch: 8, lr: 1e-4, chunk: 50, lora_r: 8}
+    seeds: {train: 2026, eval: 9000}   # 探针单种子；效应量大则补 5 种子
+    endpoints:
+      primary: SR（200 回合，seed 9000+37·ep，max_steps 200，calib）
+      secondary: [SPL, NE, 失败回合 min_dsurf 分层]
+    decision: >
+      配对精确 McNemar vs ft_detf 明细（n=200），Holm 校正（族 m=2）后
+      双参照均显著更优 → 信息瓶颈确认，主攻「无真值显式方位通道」
+      （BEV 语义地图 / 路标记忆表示改进），E13 本身视效应量扩 5 种子；
+      无差异或更差 → 方位信息通道（含 mem 类端到端记忆）无潜力，
+      关闭表征侧，主攻控制侧。
+    analysis: 配对精确 McNemar（回合级二值）+ Holm 校正；双参照
+      （存储锚点 24.5% 与同码新评 21.5%）。
+    outcome: done（2026-10-31）。SR 47.50% [40.7,54.4]，SPL 0.467，NE 1.68，
+      n=200。配对 McNemar+Holm(m=2) 双参照均极显著（vs 新评 +58/-6
+      p_holm=1.8e-11；vs 锚点 +54/-8 p_holm=1.7e-9），ΔSR +26/+23pp。
+      信息瓶颈确认：主攻「无真值显式方位通道」；E12 mem 负结果归因闭环
+      （信息有价、扁平表示学不到）；剩余 105 失败中 67% 仍 >1.5m，
+      控制/规划侧留有空间（与 E14 互补）。产物 export/ft_gcond10k_eval.json。
+    followup:
+      - id: E13b-gcond-5seeds
+        name: E13 五种子扩展（效应量稳健性）
+        status: done
+        started: 2026-10-31（排 E14 后自动接力）
+        finished: 2026-11-01
+        design: 训练种子 {42,123,456,789,1024}（对齐 ft_detf 五种子协议），
+          数据 nav_detfG.h5 不变，每种子 10k 步训练 + 200 回合标准评测
+        analysis: 逐种子配对精确 McNemar vs 同种子 ft_detf 明细 +
+          Holm（族 m=5）；报告五种子均值±SD 与池化 discordant
+        outcome: done 正结果（2026-11-01）。五种子 SR 44.5/51.0/47.5/47.5/46.5，
+          均值 47.40±2.36%（vs ft_detf 21.80±1.40%，ΔSR +25.6pp）；
+          5/5 种子 p_holm≤1.18e-9 全部显著（discordant +55~64/-6~9）；
+          池化 +295/-39 p=8.55e-50；SPL 均值 0.469。效应量跨种子稳健，
+          E13 结论固化。产物 export/eval_detail/seed*_ft_gcond_std.json、
+          /tmp/analyze_gcond5_out.txt
+
+  - id: E14-dagger-detf
+    name: HG-DAgger 复活（detf 设定，修正历史四混杂）
+    status: proposed
+    hypothesis: >
+      旧 DAgger 负结果（§4.2，reactive 设定）含四个混杂：标签器与示范不同源
+      （reactive 13.3% vs 误配 oracle）、训练步数未随数据量同比（0.42 epoch）、
+      纠正数据占比 80%、旧协议 24 回合。在 ft_detf 设定（oracle 示范 96k、
+      oracle 标签器同源、标准 200 回合协议、固定 10k 步预算）下重验：
+      DAgger 纠正数据能否提升闭环 SR。
+    variables:
+      arm: ft_dagger_r1（nav_detf.h5 + DAgger round-1 纠正数据合并后重训）
+      dagger_collect: {student: ft_detf, labeler: oracle(与示范同源), beta: 0.2,
+                       exec_actions: 8, episodes: 200, seed: 7777,
+                       不筛成败, calib}
+      data: 合并集（≈96k + ~100-130k 样本）
+      fixed: {steps: 10000, batch: 8, lr: 1e-4, chunk: 50, lora_r: 8}
+      # 训练预算口径：固定 10k 步（与 ft_detf 同预算）。同 epoch 口径
+      # （~22k 步）仅作负结果时的补充分析，不作为主检验。
+    seeds: {train: 2026, eval: 9000}   # DAgger 采集 seed 7777，与评测回合不重叠
+    endpoints:
+      primary: SR（200 回合，seed 9000+37·ep，max_steps 200，calib）
+      secondary: [SPL, NE]
+    decision: >
+      配对精确 McNemar vs ft_detf 明细（n=200），Holm 校正（族 m=1）显著更优
+      → DAgger 有效，启动 round-2；无差异或更差 → 「固定预算下 DAgger 无效」
+      结论升级到 detf 设定，关闭算法侧数据聚合路线。
+    analysis: 配对精确 McNemar + Holm；参照 = ft_detf 同码新评 21.5%
+      （单一参照，采集/训练/评测全链同码）。
+    outcome: done 负结果（2026-10-31）。SR 10.50% [7.0,15.5]，SPL 0.096，
+      NE 2.44，n=200。vs ft_detf 新评 +7/-29 p=0.0003 显著更差（ΔSR
+      −11.0pp）。按登记关闭算法侧数据聚合路线。归因：与 resolve 负结果
+      同模式——固定 10k 步预算下混入 ~25% 学生纠正数据（实际 121k 样本）
+      稀释 oracle 曝光（<1 epoch），两次混数据实验均 −9~−11pp；修正了
+      标签器/执行/占比/协议四混杂后仍负，指向预算口径混杂是主因。
+      产物 export/ft_dagger_r1_eval.json、export/nav_dagger_r1.h5。
+
+  - id: E15-bev-polar
+    name: BEV 极坐标证据图（无真值显式方位通道，主攻线第一发）
+    status: registered
+    registered: 2026-11-01
+    motivation: >
+      E13/E13b 已证方位信息通道价值（特权真值 47.4±2.4%，+25.6pp
+      5/5 种子显著）；E12 已证扁平 mem 8 维学不到（−9pp 显著更差）。
+      差异假设：E12 把记忆压成单一 argmax 槽（无分布、无不确定性），
+      模型无法学会「何时信记忆」。E15 输出证据的完整分布。
+    hypothesis: >
+      自我中心极坐标 BEV 证据图（12 方位 × 4 距离 = 48 维，世界坐标
+      证据按当前位姿重投影 + 强度累积 + 指数衰减 + 距离膨胀涂抹）能把
+      SR 从 21.5% 提升到 ≥30%（兑现 E13 上界 47.4% 的约 1/3~1/2）。
+    variables:
+      arm: ft_bev10k（同轨迹重提 nav_bev.h5 + 10k 步训练，协议同 E12/E13）
+      feature: [tgt 4 维当前帧槽] ++ [bev 48 维证据网格] = 52 维
+        （DET_DIM["bev"]=52；bev 网格编码**指令相关目标**证据，
+        指令不指目标时 tgt=[0,0,0,0]，bev 为主要信号）
+      memory: PolarBEV 类（与 TargetMemory 同接口 reset/update/query；
+        差异：①strength 累积非指数平滑 ②无 TTL 硬截断改指数衰减
+        ③输出 48 维分布非单点 ④距离>2m 条目在 r 向涂抹相邻 bin）
+      fixed: {steps: 10000, batch: 8, lr: 1e-4, chunk: 50, seed: 2026,
+              eval: 9000 标准协议, 数据轨迹与 E12/E13 完全相同}
+    info_boundary: >
+      非特权：证据全部来自「自车位姿（里程计）+ 相机检测方位/距离」，
+      与真机可用信息一致；不含真值目标位置。位姿增量用仿真精确位姿
+      差分（无漂移假设，真机部署留待后续）。
+    endpoints:
+      primary: SR（200 回合，seed 9000+37·ep，max_steps 200，calib）
+      secondary: [SPL, NE, 失败分层 min_dsurf]
+    decision: >
+      配对精确 McNemar + Holm（族 m=2，双参照 = ft_detf 同码新评 21.5%
+      与存储锚点 24.5%，与 E12/E13 同协议）。显著更优 → 扩 5 种子
+      （E13b 同协议）+ 预登记消融 E15a（空证据图对照，应≈21.5%，
+      验证 52 维本身无增益）/ E15b（argmax 单点 4 维替代 48 维分布，
+      预期低于 E15，验证「分布 vs 单点」）；不显著或更差 → 记负结果
+      关闭「自维护显式方位通道」路线，失败分层定位（证据质量 vs
+      特征消费）。
+    implementation:
+      - sim/perception.py: PolarBEV 类（~50 行，复用 TargetMemory 世界
+        投影/merge 骨架）+ target_features mode="bev" 分支（~10 行）+
+        DET_DIM["bev"]=52
+      - sim/gen_dataset.py: --det-features-mode bev（mem 同款三处，
+        ~10 行）
+      - smolvla_finetune_sim.py: closed_loop_sr_batch/closed_loop_sr 的
+        memory 构造扩 bev（~8 行）；StateNorm 适配 52 维自动
+      - scripts/eval_ft_models.py: 闭环 memory 构造扩 bev（~6 行）
+      - 冒烟：2 回合采集 + 3 步训练 + 2 回合评测（含 step-0 quick eval
+        防 NaN 回归）
+    schedule: 代码+冒烟 ~1h；数据重生成 ~15min；训练 ~2h；评测 ~1.3h；
+      全链约 5h（GPU 串行，当前空闲）
+    outcome: done（2026-11-01，负结果）
+      SR 8.50% [5.4,13.2]（n=200）SPL 0.078 NE 2.72 m。
+      配对精确 McNemar+Holm（m=2）：vs 同码新评 21.5% +6/-32
+      p_holm=2.43e-05（-13.0pp 显著更差）；vs 存储锚点 24.5%
+      p_holm=3.71e-07（-16.0pp 显著更差）。
+      失败分层（失败=183）：min_dsurf 12/21/44/106（<0.45/0.45-0.7/
+      0.7-1.5/>1.5），从未检出占失败 0%（ft_detf 锚点为 49/200=24.5%）。
+      归因：证据质量已不是瓶颈（时间积分后目标几乎总能进记忆），
+      败在特征消费——48 维稀疏网格（非零率 ~5%）在 1232 回合/10k 步
+      下学不出「何时信记忆」，且训练期记忆由教师轨迹重放构造、
+      评测期由学生自身复合误差构造，分布漂移进一步破坏策略。
+      按预登记决策：记负结果，关闭「自维护显式方位通道」路线；
+      E15a/E15b 消融不再执行。
+
+  - id: AUDIT-2026-11-01
+    name: 数据配方审计（E12-E15 登记口径修正，不改动原登记正文）
+    status: done
+    finding: |
+      逐库核对 h5 attrs 发现三处登记与实际不符：
+      ① nav_detf.h5（ft_detf 基线 21.5%/24.5% 的训练数据）attrs
+         policy=sweep_det（1080 回合 seed 0 var 3 ms 200），而 E12/E13/E14
+         登记均写作「oracle 示范 96k」；
+      ② E12/E13 登记称重生成「1080 回合」，实际 nav_detfM/G.h5 为 1232 回合
+         （oracle, seed 2026, var 2, ms 700）——与 nav_detf.h5 **不同示范策略
+         不同配方**，「同分布不同 rollout」表述不成立；
+      ③ E14 采集脚本标签器用了默认 expert=sweep（登记写 oracle），且 sweep 与
+         sweep_det 亦非同源。
+    implication: |
+      E12/E13/E15 各臂（oracle 数据）对 ft_detf 基线（sweep_det 数据）的
+      配对差值 = 特征效应 δ_data（示范策略/配方效应）之混叠。E13 的 +26pp
+      不能全部归因 gt 特征；E12 的 −9pp 中 mem 特征效应可能被配方差掩盖
+      （旁证：§4.23 旧配方上 mem +7.75pp n=400）。oracle 自身 ω 饱和噪声
+      （79.6% 步饱和，oracle_smooth 的立项动机）提示 δ_data 方向不明。
+    action: 登记 E17-recipe-delta 直接测量 δ_data；此后跨配方比较一律
+      报告 δ 分解。E12/E13/E14/E15 原登记正文保留不改（预登记完整性）。
+
+  - id: E17-recipe-delta
+    name: 配方对照臂（det 4 维 × oracle 配方，直接测量 δ_data）
+    status: done
+    registered: 2026-11-01
+    motivation: AUDIT-2026-11-01。同轨迹同配方只换特征档位，才能把 E13 的
+      +26pp 分解为「gt 特征效应 + δ_data」。
+    hypothesis: δ_data ≠ 0（方向未知）。若 δ_data < 0（oracle 配方更差），
+      E12 mem 负结果部分为配方效应所致，gt 真实效应大于 +26pp。
+    variables:
+      features: [det 4 维]     # 与 ft_detf 基线同档位
+      data: nav_detfO.h5（= nav_detfG.h5 同轨迹副本，det_feat 以
+            --repair-det 从图像重提 4 维单帧特征；oracle, 1232 回合,
+            seed 2026, var 2, ms 700）
+      fixed: {steps: 10000, batch: 8, lr: 1e-4, chunk: 50, lora_r: 8,
+              train_seed: 2026}
+    endpoints:
+      primary: SR（200 回合，seed 9000+37·ep，max_steps 200，calib）
+    analysis: 配对精确 McNemar + Holm（族 m=2，双参照 21.5%/24.5%），
+      差值即 δ_data（特征档位相同，唯一差异是示范策略/配方）。
+    decision: 无论方向如何均记录 δ_data 并用于全链分解；不设成败阈值
+      （这是测量实验，不是干预实验）。
+    outcome: >
+      已完成（2026-11-01 18:44，export/ft_detfO10k_eval.md）：
+      SR 14.00% [9.9,19.5] SPL 0.133 NE 2.79（n=200）。双参照配对精确
+      McNemar + Holm（m=2）：vs ft_detf 同码新评 21.5% ΔSR=−7.50pp
+      （+14/−29）p_holm=0.0315 显著；vs 存储锚点 24.5% ΔSR=−10.50pp
+      （+12/−33）p_holm=0.00492 显著。**δ_data 方向证实为负：oracle 配方
+      显著劣于 sweep_det 配方**（ω 饱和噪声是真实拖累）。效应分解
+      （vs 新评口径）：gt 真实效应 ≈ +33.5pp；mem 真实效应 ≈ +1.5pp
+      （近中性 —— E12 的 mem「负结果」大部分系配方效应，非特征本身）；
+      bev 真实效应 ≈ −5.5pp。sweep_det 配方为当前更优基线，跨配方
+      比较此后一律附 δ 分解。
+
+  - id: E16-feat-homology
+    name: 特征同源 DAgger（mem 8 维 × 学生状态分布，H1 分布漂移检验）
+    status: registered
+    registered: 2026-11-01
+    motivation: |
+      E12/E15 归因主假设 H1：mem/bev 特征是**学生行为历史的函数**，
+      训练期（教师轨迹重放）与评测期（学生自身复合误差）分布漂移，
+      而 E13 gt 特征是「当前位姿+目标」的确定函数（行为无关）所以能学。
+      旁证：E12 8 维稠密 argmax 也失败 → 稀疏性/表示复杂度非主因；
+      §4.23 旧配方 mem +7.75pp → mem 特征并非天然不可用。
+      E16 把训练特征改到学生状态分布上计算（DAgger 同源），直接检验 H1。
+    hypothesis: >
+      特征同源后 mem 8 维通道可用：SR 显著高于 E12（15.5%）且不显著低于
+      双参照，达到 ≥25%（若 H1 是全部原因应接近 §4.23 水平 ~29%+）。
+    variables:
+      arm: ft_memdag10k（纯 DAgger 数据，不与教师数据合并——E14 教训：
+        固定预算下混入第二数据源必稀释；纯替换保持单一来源 ~0.8 epoch）
+      dagger_collect: {student: ft_detf(deliver_v1), labeler: oracle(显式,
+        修正 E14 的 sweep 误用), beta: 0.2, exec_actions: 8,
+        episodes: 300, seed: 7777, 不筛成败, calib, max_steps: 200,
+        instr_variants: 2}
+      feature: mem 8 维，**沿学生轨迹逐表述重放** TargetMemory(ttl=25)
+        （与 gen_dataset 同一重放逻辑；p0 表述的特征与学生实际消费的
+        完全同源）
+      fixed: {steps: 10000, batch: 8, lr: 1e-4, chunk: 50, lora_r: 8,
+              train_seed: 2026}
+    info_boundary: >
+      特征仍非特权：mem 来自学生自己的检测流+里程计（β=0.2 步由 oracle
+      动作推进环境，但检测/记忆仍全部来自非特权观测流）。标签动作来自
+      特权 oracle（DAgger 标准做法，标签不进入推理期）。
+    known_limitation: >
+      轮次一近似：评测期记忆由**新模型自身**行为构造，与训练期
+      （ft_detf 行为 + 20% oracle 介入）仍非完全同源；若方向证实，
+      后续轮次用本轮产物做 student 逼近完全同源。
+    endpoints:
+      primary: SR（200 回合，seed 9000+37·ep，max_steps 200，calib）
+      secondary: [SPL, NE, 失败分层 min_dsurf, ever_found]
+    analysis: 配对精确 McNemar + Holm（族 m=3：vs E12 明细 15.5%——
+      主比较，同特征档位；vs 新评 21.5% 与锚点 24.5%——路线复活线）。
+    decision: >
+      E16 显著优于 E12 且不显著劣于双参照 → H1 证实，mem 路线复活
+      （登记 round-2 完全同源 + 评估 bev 同源版必要性）；
+      显著优于 E12 但仍显著劣于参照 → 部分恢复，报告分解后决定是否
+      round-2；不优于 E12 → H1 不成立或非主因，「历史依赖特征」路线
+      （含 bev 同源）整体关闭，主攻侧转向 δ_data 分解后的数据配方线。
+    outcome: >
+      已完成（2026-11-01 21:36，export/ft_memdag10k_eval.md）：
+      SR 8.50% [5.4,13.2] SPL 0.083 NE 2.43（n=200）。采集 stats
+      （nav_memdag_r1.h5.stats.json）：91036 样本 / 592 段，采集期
+      student SR 42.9%（β=0.2 混合口径），expert 介入率 20.1%。
+      配对精确 McNemar + Holm（m=3）：主比较 vs E12 15.5%
+      ΔSR=−7.00pp（+9/−23）p_holm=0.0201 **显著更差**；vs 新评 21.5%
+      −13.0pp p_holm=2.58e-05；vs 锚点 24.5% −16.0pp p_holm=2.83e-06。
+      **按预登记决策：H1 不成立或非主因 —— 「历史依赖特征」路线
+      （含 bev 同源）整体关闭，主攻转向数据配方线。**
+      注：特征同源非但未复活 mem 反而更差，与 E14（固定预算混学生数据
+      稀释）同模式 —— DAgger 侧修复分布漂移的两次尝试均负，归因建议
+      以「预算/配方结构」为主因，H1（分布漂移）降级为次要因素。
+
+  - id: E18-gt-sweepdet
+    name: gt 特征 × sweep_det 配方（配方修正后的真实上界重测）
+    status: registered
+    registered: 2026-11-01
+    motivation: |
+      E17 证实 δ_data<0（oracle 配方显著劣于 sweep_det，−7.5~−10.5pp），
+      而 E13 的 gt 上界 47.5% 恰是在更差的 oracle 配方上测的 —— 真实上界
+      可能被低估。E16/E17 关闭「历史依赖特征」路线后，数据配方线的第一项
+      是把标尺修正：sweep_det 配方（当前更优基线配方）× gt 特征。
+      附带得到同配方下的纯特征效应（E18 vs ft_detf 双参照），补齐
+      E13 因配方混杂而缺失的干净对照。
+    design_note: >
+      同轨迹重算不可行：探针复刻 shard 0（seed 7919 × 68 回合）与
+      nav_detf.h5 逐位不一致（生成后代码路径已漂移：68 回合仅保留 56，
+      采样数不同），且 nav_detf.h5 未存每回合 goal，事后重算无依据。
+      故采用与 E13 完全同构的设计：同配方同种子重生成 = 不同 rollout
+      （nav_detfG 之于 nav_detf 亦如此）；配对检验在评测回合上做，
+      不受训练侧 rollout 差异影响。
+    hypothesis: >
+      gt 特征效应被 oracle 配方低估：E18（sweep_det 配方 × gt）显著高于
+      E13（oracle 配方 × gt）47.5%，真实上界 >50%。
+      若不高于 E13（等价或更低）→ gt 上界 ~47.5% 对配方稳健，
+      δ_data 主要作用于可学特征臂而非特权上界。
+    variables:
+      features: [gt 4 维]      # det_feat 同构替换 [1, sin a, cos a, dist/12]，特权真值
+      data: nav_gtSW.h5（sweep_det 配方重生成：policy=sweep_det, seed 0,
+            1080 回合, instr_variants 3, max_steps 200, calib,
+            det_mode=gt，成功回合过滤与退化过滤同现行代码）
+      fixed: {steps: 10000, batch: 8, lr: 1e-4, chunk: 50, lora_r: 8,
+              train_seed: 2026}
+    endpoints:
+      primary: SR（200 回合，seed 9000+37·ep，max_steps 200，calib）
+      secondary: [SPL, NE, 失败分层 min_dsurf]
+    analysis: 配对精确 McNemar + Holm（族 m=3：主比较 vs E13
+      ft_gcond10k 47.5%——同特征跨配方；vs ft_detf 新评 21.5% 与
+      存储锚点 24.5%——同配方跨特征）。跨配方比较附 δ 分解口径。
+    decision: >
+      显著高于 E13 → 配方效应在上界臂同样成立，真实上界按 E18 修正，
+      「无真值方位通道」路线天花板抬高，后续增益按新标尺度量；
+      不高于 E13 → gt 上界 ~47.5% 稳健，配方效应仅作用于可学特征臂，
+      报告为「特权上界配方稳健」。
+    outcome: 未开始
