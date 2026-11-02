@@ -17,6 +17,12 @@ camera:
   hfov_deg: 69.4             # 2026-10-13 实测：纸盒标定 f≈926px@1280×720（宽/高两法互证 <1%）
   cam_h: 0.08                # 2026-10-13 实测：镜头上沿 9cm / 下沿 7cm，光轴取 8cm
   color_order: bgr           # OpenCV 默认；infer_server 会转 RGB 喂模型
+  # ⚠ bearing 约定（P18 hier 必读，上板第一步按手册 §3 核验）：
+  #   backfill 的 bearing_deg 以「画面右半为正」。mirror=true 表示采集链路
+  #   水平镜像（MV.py 同款 flip）→ bearing_deg 直接当逆时针角用（现行为）；
+  #   mirror=false 表示相机未镜像 → 取相反数。核验法：目标放画面右半，
+  #   看 hier 日志里 plan 模式的 w 方向是否朝目标转（转反了就翻转此开关）。
+  mirror: true               # ⚠ 待现场核验（2026-11-02 占位，与既有 lidar_at 行为一致）
   # ⚠ 仿真相机地面测距的饱和下限 = f*cam_h/(H - H/2)；真机内参不同，
   #   饱和点不同，用 calibrate_camera.py 算出后填到下面备查：
   mono_range_floor_m: 0.15   # 2026-10-13 实测 @640×480（f=463, cam_h=0.08）：低于此距离以激光为准
@@ -50,6 +56,10 @@ navigation:
   max_steps: 200
 
 detection:
+  # ★ 参与检测的色表（显式声明；未列出的色一律不检测）。
+  #   red/blue/yellow 2026-10-13 实测；green/purple/orange 仍是仿真占位值，
+  #   现场用 perception_smoke.py --measure 标定后再加入此列表。
+  use_colors: [red, blue, yellow]
   # HSV 参考色（H:0-179, S:0-255, V:0-255）。
   # ⚠⚠ 下面是占位值！真机光照/白平衡与仿真渲染完全不同，
   #    务必先用 tools/perception_smoke.py --measure 对着真实目标测一轮再填。
@@ -73,6 +83,27 @@ inference:
   # chunk 执行方式：模型一次预测 50 步，每步推理则执行第 0 步；
   # k>1 = 一次推理连发 k 步（E8：k=10 省 90% 推理、SR 无显著代价）。
   chunk_execute_k: 1
+
+hier:
+  # P18 分层混合「可见即规划，不可见即模型」（infer_server --policy hier 读取）。
+  # 缺省值 = 仿真 E20 最优配置（SweepDetDock(use_plan=True)），改动需在
+  # exp_plan.yaml P18 登记后按试次结果调整。
+  v_cruise: 0.16             # 扫描巡航速度
+  w_scan: 1.15               # 扫描角速度
+  k_ang: 2.2                 # 航向比例增益
+  stop_eps: 0.14             # 距离 ≤ 此值停住（表面距）
+  dock_dist: 0.8             # 速度斜坡区间
+  max_dw: 0.55               # 角速度速率限制（防抖）
+  emergency: 0.26            # 前向急停距离（±28° 内激光最小值）
+  scan_arc: 4.71             # 转够此弧度(rad)未检出 → 前进换观测点（1.5π）
+  relocate_steps: 25         # 换观测点持续步数
+  mem_ttl: 25                # 短期记忆步数（世界坐标检测记忆）
+  dock_win: 0.9              # 表面距进入此范围 → 末段停靠逻辑
+  dock_target: 0.25          # 停靠目标表面距（判据 0.30 内留余量）
+  dock_k: 0.8                # 末段速度比例
+  align_tol_deg: 6.0         # 末段对准容差
+  align_v: 0.08              # 末段对准速度
+  align_max_steps: 12        # 对准限步（不无限原地转）
 
 recording:
   out_dir: data_recorded

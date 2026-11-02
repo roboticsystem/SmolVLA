@@ -749,3 +749,120 @@ experiments:
       依赖（E17/E18 的镜像证据链补全）；②通道确实补上记忆信息缺口
       （从未检出归零）。后续候选（未登记，待定）：mem8 切片消融
       （同轨迹免重检测，分离「argmax 槽 vs 分布」）；扩种子需另行批准。
+
+  - id: E20-hybrid
+    name: 分层混合「可见即规划，不可见即模型」（sweep_det 执行层 × ft_detf 搜索层）
+    status: done
+    registered: 2026-11-02
+    completed: 2026-11-02
+    motivation: |
+      E19 失败分层：失败回合「从未检出」0%（记忆槽已消除），65%
+      min_dsurf>1.5 m ——「看得见但走不到」是剩余主要瓶颈，属**执行层**
+      而非感知层，继续调特征通道预期收益有限。文献路线（VLN on the Fly
+      arXiv 2609.20191 机载分层栈 / WayFinder 2609.37922 分层 VLA）表明
+      「模型提议 + 经典规划器执行」的运行时解耦是当前主流改进方向。
+      本实验把两个**都已部署**的可部署臂做运行时仲裁组合：检出（或
+      mem_ttl=25 记忆命中）→ sweep_det 逼近执行层（局部绕障规划 + 激光
+      末段停靠）；单帧与记忆均未检出 → ft_detf chunk 搜索把目标带进视野。
+      零重训练、零特权、不触碰训练数据 —— 规划器为运行时组件，
+      与 E18「示范-学生信息一致性」原则不冲突（该原则约束的是
+      训练期示范配方 × 学生特征，非推理期系统组合）。
+    variables:
+      arm: hier_vla（web_sim.HierVLAPolicy：SweepDetDock(use_plan=True) 执行层
+           + VLAPolicy 搜索层，det_every=2，公共尾部急停/限幅与父类一致）
+      fixed: {eval 与 ft_detf 同码新评完全一致：n=200, seed 9000+37·ep,
+              max_steps 200, calib（web_sim batch，collect_only，scene=lab）}
+    info_boundary: >
+      非特权：检测/记忆/激光/里程计均为可部署传感口径；搜索层仅用
+      ft_detf 同款 4 维特征；执行层目标来自「检测 + 单目/激光测距 +
+      里程计」的世界坐标估计（同 sweep_det 的 _pick 口径），无真值目标位置。
+    endpoints:
+      primary: SR（200 回合，同种子配对）
+      secondary: [SPL, NE, 模式占比（plan/search 步数比）, 推理延迟,
+                  失败分层 min_dsurf（对照 E19 的 10/9/32/93）]
+    analysis: 配对精确 McNemar + Holm（族 m=2：主比较 vs ft_detf 同码
+      同种子新评（batch 内 ref=vla 逐种子配对）；次比较 vs sweep_det
+      同种子新评（独立 batch，按 seed 对齐））。逐回合结果经
+      /tmp/web_batch_*.json 离线复算。
+    decision: >
+      显著高于 ft_detf 新评且点估计 ≥ 锚点 24.5% → 分层仲裁兑现，
+      登记为可部署系统主线（P18 真机基线），补退化族鲁棒性（slip/odom/
+      drop/delay 四档）；显著高于 ft_detf 但 < 24.5% → 部分兑现，
+      按 plan/search 模式占比与失败分层归因；不高于 ft_detf → 运行时
+      仲裁路线关闭，转向 GRPO 后训练（E21 预研）。
+    outcome: |
+      已完成（/tmp/analyze_e20_out.txt，批量A hier_vla n=200 ref=vla +
+      批量B sweep n=200，均 calib 同码同种子）。**主分支命中——分层仲裁兑现，
+      登记为 P18 真机基线**：
+      - hier_vla SR 26.0% [20.4, 32.5] SPL 0.234；ft_detf 新评 SR 13.5%
+        SPL 0.129；sweep_det SR 29.5% SPL 0.278。
+      - 主比较 hier_vla vs ft_detf：ΔSR +12.5 pp，配对 McNemar
+        p=2.47e-4，Holm(m=2) 后 p=4.9e-4 —— 显著。
+      - 判定条件「显著高于 ft_detf 且 ≥ 锚点 24.5%」两项均满足（26.0%）。
+      - 次比较 hier_vla vs sweep_det：ΔSR −3.5 pp，p=0.371 —— 与纯规则
+        基线无显著差异（诚实报告：混合未超过 sweep_det 点估计；混合的
+        增量在「未检出回合」——hier_vla never_found=0，靠 ft_detf 搜索层
+        兜底，而 sweep_det 依赖自转扫描命中）。
+      - 失败分层 (n_fail=148)：<0.5/0.5-1.0/1.0-1.5/>1.5 m = 0/10/25/113
+        （对照 E19 ft_homo 10/9/32/93）：「从未检出」保持 0，主失败质量
+        仍在 >1.5 m「接近但未停靠」，与决策分支的退化族鲁棒性补充一致。
+      - 工程：391 ms/req，chunk 复用 84%，闭环 47.8 Hz。
+      决策：按预登记第一分支 → hier_vla 登记 P18 真机主线；E21 GRPO 按用户
+      2026-11-02 指示取消（无第二篇小论文需求）。
+
+  # ─────────────────────────────────────────────────────────────
+  - id: P18-real
+    name: P18 真机上板：hier_vla 分层混合部署（RDK X3 + 笔电 infer_server 云边分层 D2）
+    status: registered
+    registered: 2026-11-02
+    completed: null
+    motivation: |
+      E20 仿真主分支命中（hier_vla SR 26.0% vs ft_detf 13.5%，p_holm=4.9e-4，
+      ≥ 锚点 24.5%）后按预登记决策登记真机主线。真机前置已具备：
+      相机/底盘/HSV(red/blue/yellow) 2026-10-13 标定；2026-10-29 采数回流
+      训出 ft_real_v1/v2（纯模型闭环 SR=0.0，NE 2.26 —— 域差下纯模型失效，
+      正是 hier 执行层要救的场景）。本实验验证「可见即规划，不可见即模型」
+      在真机域差下的可迁移性，并与纯模型闭环（ft_real_v2）同场对照。
+    variables:
+      arm: hier_vla 真机版（deliver_v1/server/hier_policy.HierRealPolicy，
+           infer_server --policy hier --detector real 启用；
+           检出/记忆 → LocalPlanner+SweepDetDock 两段式执行层，
+           未检出 → ft_detf 同款搜索层 VLA chunk）
+      fixed:
+        model: deliver_v1/models/ft_real_v2（搜索层权重，与服务端 --ckpt 一致）
+        params: robot.yaml hier 段 = 仿真 E20 最优（16 参数，零现场调参起跑）
+        protocol: 每色目标 N=5 试次（red/blue/yellow 各 5，共 15 回合/轮），
+                  起点朝向按场地固定标记摆放，指令句式与训练词表一致
+                  （「去{色}的箱子旁边」，L1 口径）
+        success: 激光表面距 ≤ 0.5 m 保持 2 s（**观察口径**；正式口径 0.30 m
+                 对齐 robot.yaml navigation.success_standoff_m，见告警② ——
+                 真机底盘编码器/激光外参误差初期先放宽观察）
+      info_boundary: >
+        非特权，与 E20 完全同口径：HSV blob + mem_ttl 世界坐标记忆 + 激光
+        表面距 + 里程计。无真值目标位置，无仿真特权传感。
+    endpoints:
+      primary: SR_real（观察口径 0.5 m，15 试次；正式口径 0.30 m 并行记录）
+      secondary: [模式占比（plan/search 步数比）, 末段停靠质量（停驻表面距分布）,
+                  搜索层检出率（目标进入视野后检出步数）, 端到端延迟（bridge
+                  rtt / 服务端 srv）, 降级/急停触发次数]
+      safety: [急停阈值 emergency=0.26 m（±28° 前向扇区）, 底盘 max 0.203 m/s
+               （< 训练分布 0.35，保守降速）, CK 协议 mode 型串口（无弧线指令）]
+    analysis: >
+      与同场对照臂 ft_real_v2 纯模型闭环（闭环 SR=0.0 的域差基线）做
+      配对比较（同色同起点试次配对，n=15 精确 McNemar，n 小仅作描述性
+      推断）；主结论按观察口径 SR_real 与「plan 模式接管率」报告——
+      本实验定位为**可行性验证**（真机上 hier 执行层能否把 SR 从 0 抬起），
+      非统计显著性主线。
+    decision: >
+      ① SR_real(0.5m) ≥ 40%（6/15）且 plan 模式接管率 ≥ 60% → hier 执行层
+      真机有效，登记 P18 done，中期演示以真机录屏为准；② SR_real > 0 但
+      < 40% → 部分有效，按失败分层（未检出/走不到/末段偏差）归因后调
+      perception（补色标定）或 align/dock 参数，再试一轮（限一次，≤15 试次）；
+      ③ SR_real = 0 且失败主因「未检出」→ 感知域差问题优先（HSV 重标定 +
+      perception_smoke 补测），执行层结论悬置。
+    pre_flight_checklist:
+      - camera.mirror 现场核验（手册 §3：目标放画面右半，plan 模式看 w 方向）
+      - perception_smoke 三色确认（red/blue/yellow 检出率 ≥ 阈值）
+      - scan 方向核验（手册 §3：手挡激光前方，索引应在 n/2 附近）
+      - 急停联测（手挡 ±28° 扇区，车须立即停）
+      - infer_server 启动命令核对（--policy hier --detector real，python -u）

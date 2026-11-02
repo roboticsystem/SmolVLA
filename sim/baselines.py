@@ -1993,37 +1993,9 @@ class SweepDetectorPolicy:
 
         hit = self._last
         if hit is not None:
-            bearing, dist = float(hit[0]), float(hit[1])
-            # **停靠判据用的距离**：默认单目中心距；开启后改用激光表面距
-            # （近距离唯一有效，且正是成功判据所用的量）。
-            if self.use_lidar_dist and np.isfinite(self._last_surf):
-                dist = float(self._last_surf)
-            if dist <= self.stop_eps:
-                self._pw = 0.0
-                return np.array([0.0, 0.0], dtype=np.float32)
-            # 先用**局部绕障规划**给出航向；规划失败（地图未建好/目标不可达）
-            # 再回退到直冲，保证行为不会因规划器失效而完全停摆。
-            if self._planner is not None and len(hit) > 2:
-                # **变量名不能叫 `ang`**：上面 `ang` 是激光束的角度数组，
-                # 覆盖它会让后面的 `np.abs(ang)` 拿到 None（规划失败时）而崩溃。
-                hd = self._planner.step(pose, lid, hit[2])
-                if hd is not None:
-                    bearing = hd
-            w = float(np.clip(self.k_ang * bearing, -self.w_max, self.w_max))
-            v = self.v_max * min(1.0, max(0.0, (dist - self.stop_eps) / self.dock_dist))
+            v, w = self._act_hit(pose, lid, hit)
         else:
-            # 扫描：转够 scan_arc 仍未检出 → 前进换观测点（避免原地空转占满多数类）
-            if self._relocate <= 0 and self._scan_acc >= self.scan_arc:
-                self._relocate = self.relocate_steps
-                self._scan_acc = 0.0
-            if self._relocate > 0:
-                self._relocate -= 1
-                w = 0.35 * self.scan_dir
-                v = self.v_cruise * 1.6
-            else:
-                w = self.scan_dir * self.w_scan
-                v = self.v_cruise
-                self._scan_acc += abs(w) * 0.1
+            v, w = self._act_scan()
 
         front = np.abs(ang) <= np.deg2rad(28.0)
         d_front = float(lid[front].min()) if front.any() else LIDAR_MAX_RANGE
@@ -2035,6 +2007,47 @@ class SweepDetectorPolicy:
         w = float(np.clip(w, -self.w_max, self.w_max))
         self._pw = w
         return np.array([float(np.clip(v, 0.0, self.v_max)), w], dtype=np.float32)
+
+    def _act_hit(self, pose, lid, hit):
+        """检出（含 mem/地图记忆命中）分支：逼近执行层。
+
+        从 act 抽出成方法（行为与原 hit 分支逐行一致），供分层混合臂
+        （web_sim.HierVLAPolicy，E20「可见即规划，不可见即模型」）在
+        「未检出 → VLA 搜索」之间仲裁复用。
+        """
+        bearing, dist = float(hit[0]), float(hit[1])
+        # **停靠判据用的距离**：默认单目中心距；开启后改用激光表面距
+        # （近距离唯一有效，且正是成功判据所用的量）。
+        if self.use_lidar_dist and np.isfinite(self._last_surf):
+            dist = float(self._last_surf)
+        if dist <= self.stop_eps:
+            self._pw = 0.0
+            return 0.0, 0.0
+        # 先用**局部绕障规划**给出航向；规划失败（地图未建好/目标不可达）
+        # 再回退到直冲，保证行为不会因规划器失效而完全停摆。
+        if self._planner is not None and len(hit) > 2:
+            hd = self._planner.step(pose, lid, hit[2])
+            if hd is not None:
+                bearing = hd
+        w = float(np.clip(self.k_ang * bearing, -self.w_max, self.w_max))
+        v = self.v_max * min(1.0, max(0.0, (dist - self.stop_eps) / self.dock_dist))
+        return v, w
+
+    def _act_scan(self):
+        """未检出分支：扫描 / 换观测点（同上抽出复用）。"""
+        # 扫描：转够 scan_arc 仍未检出 → 前进换观测点（避免原地空转占满多数类）
+        if self._relocate <= 0 and self._scan_acc >= self.scan_arc:
+            self._relocate = self.relocate_steps
+            self._scan_acc = 0.0
+        if self._relocate > 0:
+            self._relocate -= 1
+            w = 0.35 * self.scan_dir
+            v = self.v_cruise * 1.6
+        else:
+            w = self.scan_dir * self.w_scan
+            v = self.v_cruise
+            self._scan_acc += abs(w) * 0.1
+        return v, w
 
 
 class SweepDetDock(SweepDetectorPolicy):

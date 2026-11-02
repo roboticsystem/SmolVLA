@@ -33,14 +33,18 @@ def load_cfg(path):
     cfg = yaml.safe_load(open(path)) or {}
     det = cfg.get("detection", {})
     refs = {k: tuple(v) for k, v in det.get("refs", {}).items()}
+    # 参与检测的显式色表（2026-11-02 新增）：refs 的值是纯 [h,s,v]，
+    # YAML 注释里的「实测/占位」字样不会进入值，无法按注释过滤
+    # （旧实现按注释子串判断，实际从未生效——占位色一直混在检测表里）。
+    use = det.get("use_colors")
+    if use is None:                      # 旧配置兼容：未声明则全开（原行为）
+        use = list(refs.keys())
+    use_refs = {k: refs[k] for k in use if k in refs}
     tol = tuple(det.get("hsv_tol", [12, 90, 90]))
     overrides = {k: tuple(v) for k, v in det.get("hsv_tol_overrides", {}).items()}
     cam = cfg.get("camera", {})
     hfov = float(cam.get("hfov_deg", 69.4))
     cam_h = float(cam.get("cam_h", 0.08))
-    measured = [k for k, v in refs.items() if "实测" in str(v)]
-    # 占位色（未实测）不参与检测，防止 false positive
-    use_refs = {k: v for k, v in refs.items() if k in measured or "占位" not in str(refs.get(k))}
     return refs, tol, overrides, hfov, cam_h, use_refs
 
 

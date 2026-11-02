@@ -18,7 +18,8 @@ import numpy as np
 
 from sim.env import calibrated_env, navigate_metrics, grid_value
 from sim.baselines import (RandomPolicy, OraclePolicy, RandomTargetPolicy,
-                           SweepDetectorPolicy, ExploreMemoryPolicy,
+                           SweepDetectorPolicy, SweepDetDock,
+                           ExploreMemoryPolicy,
                            HierRulePolicy, HierRuleDockWide)
 from sim.follow import (FollowEnv, OracleFollow, ReactiveFollow, FollowPolicyE4,
                         FollowPolicyStage, place_peds, crowding)
@@ -269,6 +270,75 @@ class VLAPolicy:
         return np.asarray(acts[0], np.float64)
 
 
+class HierVLAPolicy(SweepDetDock):
+    """**E20 分层混合（可部署）：可见即规划，不可见即模型。**
+
+    组合两个**都已在系统中部署**的既有臂，不改检测口径、不改成功判据：
+
+    - 检出（或 mem_ttl=25 记忆命中）→ `sweep_det` 逼近执行层（局部绕障
+      规划 + 激光末段停靠，即 `_act_hit`）——「看得见就走得到」；
+    - 单帧与记忆都未检出 → `VLAPolicy`（ft_detf）chunk 搜索，模型负责
+      把目标带进视野（替代 sweep_det 的自转扫描层 `_act_scan`）。
+
+    动机（E19 失败分层）：失败回合「从未检出」0%（记忆槽已消除），
+    65% min_dsurf>1.5 m ——「看得见但走不到」是剩余主要瓶颈，属执行层
+    而非感知层。规划器属**运行时**组件，不触碰训练数据，与 E18 确立的
+    示范-学生信息一致性原则不冲突；亦无真值目标位置（执行层目标来自
+    检测 + 单目/激光测距的世界坐标估计，同 sweep_det 口径）。
+    `live` 给网页状态栏显示当前模式（plan/search）。
+    """
+
+    name = "hier_vla"
+
+    def __init__(self, server="http://127.0.0.1:8000", **kw):
+        super().__init__(**kw)
+        self.vla = VLAPolicy(server)
+        self.live = {"mode": "search", "det": False}
+
+    @property
+    def stats(self):
+        return self.vla.stats        # 供 run_episode 汇总推理延迟/chunk 复用
+
+    def reset(self, env=None):
+        super().reset(env)
+        self.vla.reset(env)
+        self._mode = "search"
+        self.live = {"mode": "search", "det": False}
+
+    def act(self, obs, env):
+        lid = np.asarray(obs["lidar"], dtype=float)
+        n = len(lid)
+        ang = np.linspace(-np.pi, np.pi, n, endpoint=False) if n else np.zeros(0)
+        pose = env.robot_pose()
+
+        self._t += 1
+        if self._last is None or self._t % self.det_every == 1:
+            self._last = self._pick(obs, env)
+
+        if self._last is not None:
+            self._mode = "plan"
+            self.live = {"mode": "plan", "det": True}
+            v, w = self._act_hit(pose, lid, self._last)
+        else:
+            if self._mode != "search":
+                self.vla.queue = []   # 模式切换：丢弃跨模式的过期 chunk
+            self._mode = "search"
+            self.live = {"mode": "search", "det": False}
+            a = self.vla.act(obs, env)
+            v, w = float(a[0]), float(a[1])
+
+        # 与父类相同的公共尾部：前向急停 + 角速度限幅（跨模式共享安全网）
+        front = np.abs(ang) <= np.deg2rad(28.0)
+        d_front = float(lid[front].min()) if front.any() else LIDAR_MAX_RANGE
+        if d_front < self.emergency:
+            v = 0.0
+            w = self.scan_dir * self.w_max * 0.9
+        w = float(np.clip(w, self._pw - self.max_dw, self._pw + self.max_dw))
+        w = float(np.clip(w, -self.w_max, self.w_max))
+        self._pw = w
+        return np.array([float(np.clip(v, 0.0, self.v_max)), w], dtype=np.float32)
+
+
 class FieldFollower(GeodesicWindowPolicy):
     """**公寓/固定户型专用**的测地场跟随器（demo 用，不影响论文基线）。
 
@@ -423,6 +493,9 @@ def make_policy(name, env=None):
         # VLM 版分层基线：Qwen3-VL-4B zero-shot 子目标判定 + 同一套记忆测地执行层
         from sim.hier_vlm import HierVLMPolicy
         return HierVLMPolicy()
+    if name == "hier_vla":
+        # E20 分层混合：可见即规划（sweep_det 执行层），不可见即模型（ft_detf 搜索）
+        return HierVLAPolicy(use_plan=True)   # 逼近层开局部绕障（sweep_det 最优配置）
     if name == "oracle" and env is not None and \
             getattr(env.scene, "name", "") in LAYOUT_STEPS:
         # **固定户型**（公寓/窄走廊/S 形走廊/仓库）统一换测地场上界：
@@ -607,7 +680,8 @@ def run_episode(sim, policy_name, seed, level, collect_only=False,
                             sim.mem = mem_payload(pol, steps)
                     else:
                         sim.goal = [float(x) for x in env.task["goal"]]
-                        sim.live = None
+                        lv = getattr(pol, "live", None)
+                        sim.live = dict(lv) if lv else None
                     sim.target = None
                     sim.instruction = env.task["instruction"]
                     sim.level_str = str(env.task.get("level", "-"))
@@ -619,8 +693,8 @@ def run_episode(sim, policy_name, seed, level, collect_only=False,
     # ---- 工程侧指标：策略计算耗时（控制延迟）+ VLA 推理延迟/吞吐 ----
     eng = {"ctrl_ms_mean": round(float(np.mean(ctrl_ms)), 2) if ctrl_ms else 0.0,
            "ctrl_ms_p95": round(float(np.percentile(ctrl_ms, 95)), 2) if ctrl_ms else 0.0}
-    if isinstance(pol, VLAPolicy):
-        st = pol.stats
+    st = getattr(pol, "stats", None)
+    if isinstance(st, dict) and "lat" in st:
         lat = st["lat"]
         eng.update({
             "infer_ms_mean": round(float(np.mean(lat)), 1) if lat else 0.0,
@@ -845,6 +919,14 @@ def worker_batch(sim, policy_name, n, level, scene_name=None, scenario=None,
                                     / len(rows), 1)
             sim.batch["spl"] = round(sum(r.get("spl", 0) for r in rows) / len(rows), 3)
             sim.batch["ne"] = round(sum(r.get("ne", 0) for r in rows) / len(rows), 2)
+        # 逐回合结果落盘（预登记实验的离线配对分析用，如 E20 的跨臂 McNemar）
+        try:
+            with open("/tmp/web_batch_%s.json" % policy_name, "w") as f:
+                json.dump({"policy": policy_name, "n": n, "rows": rows,
+                           "ref_policy": ref_policy, "ref_rows": ref_rows},
+                          f, ensure_ascii=False, default=float)
+        except OSError:
+            pass
 
 
 class Handler(BaseHTTPRequestHandler):

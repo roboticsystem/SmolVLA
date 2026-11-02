@@ -70,13 +70,6 @@ class VLABridge(Node):
         self.chunk_execute = bool(self.get_parameter("chunk_execute").value)
         self.action_queue = []
 
-    def _voice_instr(self, msg):
-        if msg.data and msg.data != self.instr:
-            self.instr = msg.data
-            # 换目标后清空旧 chunk，避免用旧目标的动作继续走
-            self.action_queue = []
-            self.get_logger().info(f"[voice] 指令切换 → {self.instr!r}")
-
         self.last_img = None
         self.last_scan = None
         self.last_odom = None
@@ -90,6 +83,13 @@ class VLABridge(Node):
         self.pub = self.create_publisher(Twist, "/cmd_out", 10)
         self.create_timer(0.1, self.tick)          # 10 Hz 控制回路
         self.get_logger().info(f"vla_bridge 启动，服务器 {self.server}")
+
+    def _voice_instr(self, msg):
+        if msg.data and msg.data != self.instr:
+            self.instr = msg.data
+            # 换目标后清空旧 chunk，避免用旧目标的动作继续走
+            self.action_queue = []
+            self.get_logger().info(f"[voice] 指令切换 → {self.instr!r}")
 
     # ---- 传感器回调：只缓存最新一帧 ----
     def _img(self, msg: Image):

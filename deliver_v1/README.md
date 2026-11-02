@@ -29,11 +29,13 @@ deliver_v1/
 │   └── deploy_4x1/               ← 端侧蒸馏模型（ONNX，D1 路线原料）
 │       ├── prefix.onnx (338M) / denoise.onnx (55M) / expert.pt (48M) / meta.json
 ├── server/infer_server.py        ← 笔电侧推理服务（D2 路线，对齐 vla_bridge 契约）
+├── server/hier_policy.py         ← P18 分层混合策略「可见即规划，不可见即模型」（--policy hier）
 ├── tools/                        ← 真机五件套（见下）
 ├── ros2_ws/                      ← ROS2 骨架（5 节点 + launch，未联调）
 └── docs/
     ├── 部署可行性评估.md          ← D1/D2 路线与 RDK-X3 阻塞分析
     ├── E6_端侧可行性闸门实施手册.md
+    ├── P18_真机上板手册.md       ← ★ hier 部署 bring-up / mirror 核验 / 试次记录表
     └── 已知问题与告警.md          ← ★ 先读这个
 ```
 
@@ -79,13 +81,25 @@ RDK-X3 (ros2_ws)                      笔电 (GPU)
 笔电侧启动（需要 VLA 工作区 + `.venv_smolvla`）：
 
 ```bash
-.venv_smolvla/bin/python server/infer_server.py \
-    --project /path/to/VLA --ckpt <包路径>/models/ft_detf --port 8000
+# P18 分层混合（推荐，E20 仿真主分支命中）
+.venv_smolvla/bin/python -u server/infer_server.py \
+    --project /path/to/VLA --policy hier --detector real \
+    --ckpt <包路径>/models/ft_real_v2 --port 8000
+
+# 纯模型闭环（原行为，ft_real_v2 域差下闭环 SR=0，仅作同场对照）
+.venv_smolvla/bin/python -u server/infer_server.py \
+    --project /path/to/VLA --ckpt <包路径>/models/ft_real_v2 --port 8000
 ```
 
 契约：POST `{image_bgr(hex), h, w, scan[], state[5], instruction}` → `{action:[v,ω]}`。
 前向路径复用工作区代码（`build_state / prepare_images / sample_actions`），
 与训练评测**同一条路**，没有复制品。
+
+**hier 模式**（`--policy hier`）：服务端仲裁——检出/记忆命中 → plan 模式
+（LocalPlanner 绕障 + SweepDetDock 两段式停靠，参数读 robot.yaml `hier:` 段）；
+未检出 → search 模式（VLA chunk 服务端队列复用）。响应为**单步**
+`{action, mode, det_dist}`（无 `actions[]` 键，bridge 自动单步执行，仲裁可
+逐步打断）。上板第一步按手册 §2 核验 bearing/mirror 方向。
 
 ## 采数回流（第 4 步之后的路径）
 

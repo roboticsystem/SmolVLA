@@ -113,7 +113,8 @@ class DataShim:
                 enc["attention_mask"].to(self.device).bool())
 
 
-def make_handler(policy, data, meta, dev, project, detector="real", config=None):
+def make_handler(policy, data, meta, dev, project, detector="real", config=None,
+                 policy_mode="vla"):
     sys.path.insert(0, project)
     import torch
     from smolvla_finetune_sim import IMG_KEYS, STATE_KEY
@@ -137,6 +138,23 @@ def make_handler(policy, data, meta, dev, project, detector="real", config=None)
         real_det = True
     elif use_det:
         from sim.perception import target_features  # 仿真口径（仅评测用）
+
+    hier = None
+    hq = {"mode": None, "q": []}          # hier 搜索层 chunk 队列（服务端复用）
+    if policy_mode == "hier":
+        # P18 真机分层混合（E20-hybrid 移植）：检出→LocalPlanner 逼近 + 激光停靠；
+        # 未检出→VLA chunk 搜索。参数读 robot.yaml 的 hier: 段（缺省=仿真最优配置）。
+        import yaml as _yaml
+        _cfg = _yaml.safe_load(open(config)) or {}
+        _cam = (_cfg.get("camera") or {})
+        from hier_policy import HierRealPolicy
+        hier = HierRealPolicy(_cfg.get("hier") or {},
+                              mirror=bool(_cam.get("mirror", True)))
+        if not (use_det and detector == "real"):
+            print("[策略] ⚠ hier 模式需要 detector=real（真机 HSV 检测）——"
+                  "当前配置下无 blobs，将退化为纯 VLA 搜索层")
+        print(f"[策略] hier 分层混合（mirror={bool(_cam.get('mirror', True))}，"
+              f"参数={sorted((_cfg.get('hier') or {}).keys()) or '默认(仿真E20最优)'}）")
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *a):        # 静默逐请求日志
@@ -214,31 +232,60 @@ def make_handler(policy, data, meta, dev, project, detector="real", config=None)
                 st = np.concatenate([st_in, scan]) if meta["with_lidar"] else st_in
                 if dfeat is not None:
                     st = np.concatenate([st, dfeat])
-                t = torch.from_numpy(st.astype(np.float32)).to(dev)[None]
-                t = (t - data.st_mean) / data.st_std
-                t = torch.nn.functional.pad(t, (0, max_state_dim - t.shape[1]))
 
-                imgd = {IMG_KEYS[k]: torch.from_numpy(img.astype(np.float32) / 255.0)
-                        .permute(2, 0, 1)[None].to(dev) for k in range(n_frames)}
-                images, img_masks = policy.prepare_images(imgd)
-                state_p = policy.prepare_state({STATE_KEY: t})
-                lang_t, lang_m = data.tokenize([instr])
-                with LOCK, torch.no_grad():   # 推理必须 no_grad（否则 numpy() 报错）
-                    pred = policy.model.sample_actions(images, img_masks,
-                                                       lang_t, lang_m, state_p)
-                # 反归一化 → 物理量，取 chunk 前 K 步（与 chunk_execute_k 设计一致）：
-                # 车侧 10Hz 逐步执行 K 步（约 1s），期间不再请求，网络/推理压力降 K 倍
-                chunk = pred[0].float().cpu().numpy() * data.act_std + data.act_mean
-                k = int(min(CHUNK_OUT, chunk.shape[0]))
-                acts = np.clip(chunk[:k], ACT_MIN, ACT_MAX)
-                out = {"action": [float(acts[0, 0]), float(acts[0, 1])],
-                       "actions": [[float(x[0]), float(x[1])] for x in acts],
-                       "det_dist": det_dist,
-                       "latency_ms": round((time.time() - t0) * 1000, 1)}
-                # 每请求一行日志（远程排障用）：尺寸 / 耗时 / 目标检出
-                _hit = bool(use_det and dfeat is not None and float(dfeat[0]) > 0.5)
-                print(f"[req] {w}x{h} {out['latency_ms']}ms "
-                      f"det={'Y' if _hit else 'N'}", flush=True)
+                def _forward():
+                    t = torch.from_numpy(st.astype(np.float32)).to(dev)[None]
+                    t = (t - data.st_mean) / data.st_std
+                    t = torch.nn.functional.pad(t, (0, max_state_dim - t.shape[1]))
+
+                    imgd = {IMG_KEYS[k]: torch.from_numpy(img.astype(np.float32) / 255.0)
+                            .permute(2, 0, 1)[None].to(dev) for k in range(n_frames)}
+                    images, img_masks = policy.prepare_images(imgd)
+                    state_p = policy.prepare_state({STATE_KEY: t})
+                    lang_t, lang_m = data.tokenize([instr])
+                    with LOCK, torch.no_grad():   # 推理必须 no_grad（否则 numpy() 报错）
+                        pred = policy.model.sample_actions(images, img_masks,
+                                                           lang_t, lang_m, state_p)
+                    # 反归一化 → 物理量，取 chunk 前 K 步（与 chunk_execute_k 设计一致）：
+                    # 车侧 10Hz 逐步执行 K 步（约 1s），期间不再请求，网络/推理压力降 K 倍
+                    chunk = pred[0].float().cpu().numpy() * data.act_std + data.act_mean
+                    k = int(min(CHUNK_OUT, chunk.shape[0]))
+                    return np.clip(chunk[:k], ACT_MIN, ACT_MAX)
+
+                if hier is not None:
+                    # ---- P18 分层混合仲裁（E20-hybrid 真机移植）----
+                    # plan 模式不跑前向（LocalPlanner ~ms 级）；search 模式由
+                    # 服务端队列复用 chunk（同仿真 HierVLAPolicy.vla.queue）。
+                    _blobs = blobs if (use_det and real_det) else []
+                    if hier.wants_search(_blobs, instr, st_in):
+                        if hq["mode"] != "search":
+                            hq["mode"], hq["q"] = "search", []
+                        if hq["q"]:
+                            sa = hq["q"].pop(0)
+                        else:
+                            acts = _forward()
+                            sa = (float(acts[0, 0]), float(acts[0, 1]))
+                            hq["q"] = [(float(x[0]), float(x[1])) for x in acts[1:]]
+                        av, aw, hmode = hier.act(_blobs, scan, st_in, instr,
+                                                 search_action=sa)
+                    else:
+                        if hq["mode"] != "plan":
+                            hq["mode"], hq["q"] = "plan", []
+                        av, aw, hmode = hier.act(_blobs, scan, st_in, instr)
+                    out = {"action": [av, aw], "mode": hmode, "det_dist": det_dist,
+                           "latency_ms": round((time.time() - t0) * 1000, 1)}
+                    print(f"[req] {w}x{h} {out['latency_ms']}ms mode={hmode} "
+                          f"v={av:.2f} w={aw:.2f}", flush=True)
+                else:
+                    acts = _forward()
+                    out = {"action": [float(acts[0, 0]), float(acts[0, 1])],
+                           "actions": [[float(x[0]), float(x[1])] for x in acts],
+                           "det_dist": det_dist,
+                           "latency_ms": round((time.time() - t0) * 1000, 1)}
+                    # 每请求一行日志（远程排障用）：尺寸 / 耗时 / 目标检出
+                    _hit = bool(use_det and dfeat is not None and float(dfeat[0]) > 0.5)
+                    print(f"[req] {w}x{h} {out['latency_ms']}ms "
+                          f"det={'Y' if _hit else 'N'}", flush=True)
                 self.send_response(200)
             except Exception as e:                        # noqa: BLE001
                 out = {"error": f"{type(e).__name__}: {e}"}
@@ -263,6 +310,9 @@ def main():
     ap.add_argument("--detector", default="real", choices=["real", "sim"],
                     help="感知口径：real=robot.yaml HSV 检测（真机部署必须）；"
                          "sim=仿真调色板检测（仅离线评测）")
+    ap.add_argument("--policy", default="vla", choices=["vla", "hier"],
+                    help="vla=纯模型（原行为）；hier=P18 分层混合仲裁"
+                         "「可见即规划，不可见即模型」（需 detector=real）")
     ap.add_argument("--chunk-out", type=int, default=10,
                     help="每次推理返回并开环执行的动作步数 K（1=逐步重推理，"
                          "50=全chunk开环；用于复合误差 vs 请求压力的扫描实验）")
@@ -284,8 +334,9 @@ def main():
     policy, meta = _load_model(a.project, a.ckpt, dev)
     data = DataShim(a.stats, int(meta["tokenizer_max_length"] or 200), dev)
     srv = ThreadingHTTPServer((a.host, a.port), make_handler(
-        policy, data, meta, dev, a.project, detector=a.detector, config=a.config))
-    print(f"[服务] http://{a.host}:{a.port}/infer  设备={dev}")
+        policy, data, meta, dev, a.project, detector=a.detector, config=a.config,
+        policy_mode=a.policy))
+    print(f"[服务] http://{a.host}:{a.port}/infer  设备={dev}  策略={a.policy}")
     srv.serve_forever()
 
 
