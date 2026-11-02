@@ -47,8 +47,8 @@ import numpy as np
 
 from .baselines import make_policy
 from .env import SemanticNavEnv, calibrated_env, navigate_metrics
-from .perception import (PolarBEV, TargetMemory, detect, features_from_dets,
-                         target_features)
+from .perception import (DET_DIM, PolarBEV, TargetMemory, detect,
+                         features_from_dets, target_features)
 
 ARRAYS = ("images", "actions", "states", "lidar", "instr_ids", "ep_offset",
           "ep_success", "ep_spl", "ep_ne", "ep_level")
@@ -146,8 +146,8 @@ def collect(episodes, seed=0, obs_size=(160, 120), peds=2, max_steps=700, level=
         for ins in chosen:
             # **记忆必须逐表述独立重放**：记忆是「指令所指目标」的跨帧累积，
             # 而同一段轨迹要配多种表述，目标不同 → 记忆内容不同。
-            mem = ((TargetMemory(ttl=mem_ttl) if det_mode == "mem"
-                    else PolarBEV()) if (det_features and det_mode in ("mem", "bev"))
+            mem = ((TargetMemory(ttl=mem_ttl) if det_mode in ("mem", "homo")
+                    else PolarBEV()) if (det_features and det_mode in ("mem", "bev", "homo"))
                    else None)
             for j, (ob, av) in enumerate(rows):
                 img_buf.append(ob["image"])
@@ -393,47 +393,96 @@ def gen(episodes=300, seed=0, out="export/nav_demos.h5", obs_size=(160, 120),
     return _report(out, None, t0, success_only)
 
 
-def _det_worker(c):
-    """重算感知特征的分块工人（模块级，才能被 ProcessPoolExecutor pickle）。"""
-    path, lo, hi, td, idx = c
+def _repair_worker(c):
+    """重算感知特征的分块工人（模块级，才能被 ProcessPoolExecutor pickle）。
+
+    `mode` 为需要**记忆重放**的档位（mem/bev/homo）时，分块必须按**段**
+    （ep_offset 划分）切：记忆沿段内逐帧累积，跨段切断会截断历史。
+    每个段 = 一条指令表述（`collect` 每个表述副本各自成段），段内
+    `t` 从 0 计，与采集侧行为一致。
+    """
+    path, lo, hi, td, idx, mode, mem_ttl = c
+    from .perception import PolarBEV, TargetMemory
+
     with h5py.File(path, "r") as f:
         imgs = f["images"][lo:hi]
         ids = f["instr_ids"][lo:hi]
+        sts = f["states"][lo:hi]
+        offs = f["ep_offset"][()]
         vocab = [s.decode() if isinstance(s, bytes) else str(s)
                  for s in f["instr_vocab"][()]]
-    out = np.zeros((hi - lo, 4), dtype=np.float32)
-    for i in range(hi - lo):
-        out[i] = target_features(imgs[i], vocab[int(ids[i])])
+    w = DET_DIM[mode]
+    out = np.zeros((hi - lo, w), dtype=np.float32)
+    if mode in ("mem", "bev", "homo"):
+        # 段级重放：把全局行区间 [lo,hi) 内的段逐个重放
+        for s0, s1 in zip(offs[:-1], offs[1:]):
+            a, b = max(int(s0), lo), min(int(s1), hi)
+            if b <= a:
+                continue
+            mem = TargetMemory(ttl=mem_ttl) if mode in ("mem", "homo") else PolarBEV()
+            for j in range(a, b):
+                pose = np.asarray(sts[j - lo, :3], dtype=float)
+                ins = vocab[int(ids[j - lo])]
+                dets = detect(imgs[j - lo])
+                out[j - lo] = features_from_dets(dets, ins, pose=pose, mode=mode,
+                                                 memory=mem, t=j - a)
+    else:
+        for i in range(hi - lo):
+            out[i] = target_features(imgs[i], vocab[int(ids[i])])
     np.save(os.path.join(td, f"d{idx:05d}.npy"), out)
     return idx
 
 
-def repair_det_features(path, workers=16):
+def repair_det_features(path, workers=16, mode="none", mem_ttl=25):
     """**重算已有数据集的感知特征**（`det_feat`）。
 
     图像与指令都在 h5 里，所以**不需要重跑仿真** —— 直接对存好的帧重跑检测即可，
     比重新采集快一到两个数量级。用于修复 `merge_h5` 曾漏搬 `det_feat` 的历史数据。
+
+    `mode` ≠ `none` 时按该档位重提（`mem`/`bev`/`homo` 沿段内逐帧重放记忆，
+    E19 用它把 nav_gtSW.h5 同一轨迹库重提为 homo 20 维示范同源通道）。
+    `gt` 不支持：真值目标坐标未存库（E18 因此选择重生成而非重提）。
     """
     from concurrent.futures import ProcessPoolExecutor
 
+    if mode == "gt":
+        raise RuntimeError("repair 不支持 gt 档：h5 未存每回合 goal，请用重生成")
     with h5py.File(path, "r") as f:
         N = int(f["images"].shape[0])
+        n_seg = int(f["ep_offset"].shape[0]) - 1
     if N == 0:
         raise RuntimeError("数据集为空")
+    replay = mode in ("mem", "bev", "homo")
     tmp = tempfile.mkdtemp(prefix="detfix_")
-    step = max(1, N // (workers * 4))
-    chunks = [(path, lo, min(N, lo + step), tmp, i)
-              for i, lo in enumerate(range(0, N, step))]
-    print(f"重算感知特征：{N} 帧 / {len(chunks)} 分块 / {workers} 进程")
+    if replay:
+        # 段级分块：每块若干**完整段**（记忆重放不能跨段切断）。
+        # `segs` = ep_offset 原样（长度 n_seg+1），块 i 覆盖段 [i0, i0+unit)
+        # = 行 [segs[i0], segs[i0+unit])；不得再手工前置 0（ep_offset[0] 本就是 0，
+        # 重复前置会产生空块、静默丢段 —— 冒烟实测丢掉最后一整段）。
+        unit = max(1, n_seg // (workers * 4))
+        segs = [int(x) for x in h5py.File(path, "r")["ep_offset"][()]]
+        chunks = []
+        for i0 in range(0, n_seg, unit):
+            lo = segs[i0]
+            hi = segs[min(n_seg, i0 + unit)]
+            chunks.append((path, lo, hi, tmp, len(chunks), mode, mem_ttl))
+    else:
+        step = max(1, N // (workers * 4))
+        chunks = [(path, lo, min(N, lo + step), tmp, i, mode, mem_ttl)
+                  for i, lo in enumerate(range(0, N, step))]
+    print(f"重算感知特征：{N} 帧 / {len(chunks)} 分块 / {workers} 进程 / 档位 {mode}"
+          + ("（段级记忆重放）" if replay else ""))
     with ProcessPoolExecutor(max_workers=workers) as ex:
-        list(ex.map(_det_worker, chunks))
+        list(ex.map(_repair_worker, chunks))
     arr = np.concatenate([np.load(os.path.join(tmp, f"d{i:05d}.npy"))
                           for i in range(len(chunks))], axis=0)
     with h5py.File(path, "a") as f:
         if "det_feat" in f:
             del f["det_feat"]
         f.create_dataset("det_feat", data=arr)
-    print(f"  检出率 {100 * arr[:, 0].mean():.1f}%（已写回）")
+        f.attrs["det_mode"] = mode          # 溯源：重提后档位已变
+        f.attrs["det_repaired"] = True
+    print(f"  检出率 {100 * arr[:, 0].mean():.1f}% / 宽度 {arr.shape[1]}（已写回）")
     return arr
 
 
@@ -487,12 +536,14 @@ def main():
     ap.add_argument("--repair-det", action="store_true",
                     help="重算已有数据集的 det_feat（图像已在库里，无需重跑仿真）")
     ap.add_argument("--det-features-mode", default=None,
-                    choices=["none", "mem", "gt", "bev"],
+                    choices=["none", "mem", "gt", "bev", "homo"],
                     help="感知特征档位：`none`（4 维，单帧）/ `mem`（8 维，含跨帧记忆）/ "
                          "`gt`（4 维真值方位，E13 特权探针，exp_plan.yaml）。"
                          "`mem` 用于补齐「示范依赖记忆、模型却只看单帧」这一不对称"
                          "（关记忆使示范 33.0% → 16.0%，见报告 §4.23）；"
-                         "`bev`（52 维，自我中心极坐标证据图，E15，exp_plan.yaml）")
+                         "`bev`（52 维，自我中心极坐标证据图，E15，exp_plan.yaml）；"
+                         "`homo`（20 维，示范同源通道 tgt+mem+方位剖面，E19）。"
+                         "配 `--repair-det` 时为重提档位（mem/bev/homo 段级重放）")
     ap.add_argument("--mem-ttl", type=int, default=25,
                     help="记忆存活帧数，须与示范策略一致（其默认 mem_ttl=25）")
     ap.add_argument("--det-features", action="store_true",
@@ -512,7 +563,8 @@ def main():
     a = ap.parse_args()
 
     if a.repair_det:
-        repair_det_features(a.out, workers=max(1, a.workers))
+        repair_det_features(a.out, workers=max(1, a.workers),
+                            mode=(a.det_features_mode or "none"), mem_ttl=a.mem_ttl)
         return
 
     if a.merge:

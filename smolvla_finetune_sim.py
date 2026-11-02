@@ -316,7 +316,7 @@ def closed_loop_sr_batch(policy, data, episodes=200, seed=9000, max_steps=200,
                 "seed": ep_seed, "ep": ep,
                 "trace": [],          # 末段逐步轨迹（失败模式诊断用）
                 "ever_found": False, "min_dsurf": float("inf"),
-                "mem": (TargetMemory(ttl=mem_ttl) if det_mode == "mem"
+                "mem": (TargetMemory(ttl=mem_ttl) if det_mode in ("mem", "homo")
                         else (PolarBEV() if det_mode == "bev" else None))}
 
     slots, next_ep = [], 0
@@ -475,7 +475,7 @@ def closed_loop_sr(policy, data, episodes=12, seed=9000, max_steps=400, level=No
         if env.task is None:
             continue
         hist = []                                   # 帧历史（帧堆叠用）
-        _mem = (TargetMemory(ttl=mem_ttl) if det_mode == "mem"
+        _mem = (TargetMemory(ttl=mem_ttl) if det_mode in ("mem", "homo")
                 else (PolarBEV() if det_mode == "bev" else None))
         # 循环变量必须是 `step`：下面 `_slot_noise(..., ep_seed, step, ...)` 要用它
         # 按步定种。早先写成 `for _ in range(...)`，导致**最终评测一跑就 NameError**，
@@ -580,11 +580,13 @@ def main():
                          "探针显示「有无激光」值 22 pp 的闭环成功率（§4.7），"
                          "而 VLA 原本只吃 RGB、拿不到这个几何模态。"
                          "实现上只需重建 state_proj 的输入维，不动视觉塔")
-    ap.add_argument("--det-features-mode", default=None, choices=["none", "mem", "gt", "bev"],
+    ap.add_argument("--det-features-mode", default=None,
+                    choices=["none", "mem", "gt", "bev", "homo"],
                     help="感知特征档位（须与采集时一致）：`none`=4 维单帧；"
                          "`mem`=8 维（并列给出跨帧记忆的目标位置）；"
                          "`gt`=4 维真值方位（E13 特权探针）；"
-                         "`bev`=52 维自我中心极坐标证据图（E15）")
+                         "`bev`=52 维自我中心极坐标证据图（E15）；"
+                         "`homo`=20 维示范同源通道 tgt+mem+方位剖面（E19）")
     ap.add_argument("--mem-ttl", type=int, default=25,
                     help="记忆存活帧数，须与示范策略一致（默认 25）")
     ap.add_argument("--det-features", action="store_true",
@@ -620,7 +622,7 @@ def main():
         if _dm and str(_dm) != str(a.det_features_mode or "none"):
             print(f"  [提示] checkpoint 的感知档位={_dm}，已采用（必须与训练一致）")
             a.det_features_mode = str(_dm)
-            if a.det_features_mode in ("mem", "bev"):
+            if a.det_features_mode in ("mem", "bev", "homo"):
                 a.det_features = True
         if _ck.get("mem_ttl") and int(_ck["mem_ttl"]) != a.mem_ttl:
             print(f"  [提示] checkpoint 的 mem_ttl={_ck['mem_ttl']}，已采用")

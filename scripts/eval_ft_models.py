@@ -37,13 +37,15 @@ from smolvla_finetune_sim import (DEV, SmolVLAPolicy, SimDemoData,  # noqa: E402
 
 
 def detect_mode(h5_path):
-    """由演示数据的 `det_feat` 宽度推断特征档位：4 → `none`，8 → `mem`。"""
+    """由演示数据的 `det_feat` 宽度推断特征档位：4 → `none`，8 → `mem`，
+    20 → `homo`，52 → `bev`（E19 起多档位并存，宽度是唯一可靠线索）。"""
     import h5py
     with h5py.File(h5_path, "r") as f:
         for k in f.keys():
             if "det" in k.lower() or "feat" in k.lower():
                 w = int(f[k].shape[1])
-                return "mem" if w >= 8 else "none"
+                return ("homo" if w == 20 else "bev" if w == 52
+                        else "mem" if w >= 8 else "none")
     return "none"
 
 

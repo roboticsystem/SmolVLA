@@ -639,6 +639,46 @@ def gt_slot(goal_xy, pose, max_range=MAX_RANGE):
                      float(min(1.0, dist / max_range))], dtype=np.float32)
 
 
+def _homo_profile(dets, memory, want_color, want_cls, pose, t, max_range=MAX_RANGE,
+                  n_a=12):
+    """**稠密方位剖面**（E19 homo 通道第 3 段）：12×30° bins 的证据强度。
+
+    E15 的「分布 vs 单点」思想以**低维稠密**形式回归：不加距离维（避免
+    48 维稀疏网格的消费失败），只按方位展开。候选 = 当前帧匹配检测
+    （强度 1.0，与 tgt 槽同一路软匹配）∪ 记忆条目（强度 0.9·0.97^age，
+    颜色相等 + 软类别匹配，与 `_from_memory` 同判据）。
+    """
+    prof = np.zeros(n_a, np.float32)
+    if pose is None:
+        return prof
+    h = float(pose[2])
+    p0 = np.asarray(pose[:2], float)
+
+    def _bin(bearing, s):
+        ai = int(round((float(bearing) + np.pi) / (2 * np.pi) * n_a)) % n_a
+        prof[ai] = max(prof[ai], min(1.0, s))
+
+    for d in (dets or []):
+        if match([d], color=want_color, cls=want_cls) is not None:
+            _bin(d.bearing, 1.0)
+    for m in getattr(memory, "items", []):
+        if want_color is not None and m[1] != want_color:
+            continue
+        if want_cls is not None and m[2] != want_cls:
+            q = np.log(np.array([max(m[4], 1e-3), max(m[3], 1e-3)]))
+            tgt = _LOG_SHAPE[_CLASSES.index(want_cls)]
+            if float(np.linalg.norm(tgt - q)) > 0.5:      # 同 _from_memory 软匹配
+                continue
+        v = m[0] - p0
+        d = float(np.hypot(*v))
+        if d > max_range:
+            continue
+        a = float(np.arctan2(v[1], v[0]) - h)
+        a = (a + np.pi) % (2 * np.pi) - np.pi
+        _bin(a, 0.9 * 0.97 ** max(0, t - m[5]))
+    return prof
+
+
 def features_from_dets(dets, instruction, max_range=MAX_RANGE, pose=None, mode="none",
                        memory=None, t=0, target_xy=None):
     """`target_features` 的**复用版**：`dets` 由调用方预先算好。
@@ -702,6 +742,19 @@ def features_from_dets(dets, instruction, max_range=MAX_RANGE, pose=None, mode="
         g = memory.grid(want_color, want_cls, pose, t)
         return np.concatenate([tgt, g])
 
+    if mode == "homo":
+        # **示范同源通道**（E19）：tgt 4 维 + mem 4 维 + 稠密方位剖面 12 维
+        # = 20 维。覆盖 sweep_det 示范策略实际依赖的信息（当前帧检测 + 跨帧
+        # 记忆，mem_ttl=25 同参数），且特征沿示范自身轨迹重放 —— 一致性原则
+        # （E18）：示范使用的信息 ⊆ 学生通道。
+        if memory is None:
+            memory = TargetMemory(ttl=25)
+        memory.update(dets, pose, t)
+        q = memory.query(want_color, want_cls, pose)
+        mem = _obj_slot(q, max_range)
+        prof = _homo_profile(dets, memory, want_color, want_cls, pose, t, max_range)
+        return np.concatenate([tgt, mem, prof])
+
     if mode != "ref":
         return tgt
     # `ref` 档：并列给出参考物，使 L3 所需信息完整
@@ -710,7 +763,8 @@ def features_from_dets(dets, instruction, max_range=MAX_RANGE, pose=None, mode="
 
 
 # 各 mode 的感知特征维度（写数据集 / 建模型时都要用）
-DET_DIM = {"none": 4, "ref": 8, "resolve": 4, "mem": 8, "gt": 4, "bev": 52}
+DET_DIM = {"none": 4, "ref": 8, "resolve": 4, "mem": 8, "gt": 4, "bev": 52,
+           "homo": 20}
 
 
 def match(dets, color=None, cls=None, prefer_near=True, tol_deg=12.0):
